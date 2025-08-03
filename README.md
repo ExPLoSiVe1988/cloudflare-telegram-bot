@@ -46,7 +46,7 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 | `TELEGRAM_BOT_TOKEN` | توکن ربات تلگرام |
 | `TELEGRAM_ADMIN_ID` | آیدی عددی تلگرام ادمین (برای ارسال پیام‌ها) |
 
-### 1. ایجاد API Token در Cloudflare
+### ایجاد API Token در Cloudflare
 | گام | توضیحات |
 |:---|:---|
 | 1 | وارد حساب Cloudflare خود شوید: https://dash.cloudflare.com/profile/api-tokens |
