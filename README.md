@@ -5,7 +5,7 @@
 
 # Cloudflare Telegram Bot
 
-A powerful and professional tool for managing your Cloudflare DNS records directly through Telegram. With advanced features like instant search, bulk actions, and proxy status toggling, this bot evolves from a simple utility into a complete management assistant.
+A powerful and professional tool for managing your Cloudflare DNS records directly through Telegram. With advanced features like multi-language support, instant search, and bulk actions, this bot evolves from a simple utility into a complete management assistant.
 
 ---
 
@@ -17,7 +17,8 @@ A powerful and professional tool for managing your Cloudflare DNS records direct
 *   **Backup and Restore:** Create a `json` backup file of all your records and restore it when needed.
 *   **System Notifications:** Receive messages on Telegram after a successful installation or update.
 
-### ✨ Advanced Features (v1.1.0)
+### ✨ Advanced Features
+*   **🌐 Multi-Language Support:** The bot is fully bilingual, offering its entire interface in both **English** and **Persian (فارسی)**. Use the `/language` command to switch at any time.
 *   **🗂 Pagination:** Say goodbye to long lists! Records are now neatly organized into pages, easily navigable with "Next" and "Previous" buttons.
 *   **🔎 Instant Search:** Using the `/search` command, find any record in an instant just by typing a part of its name.
 *   **☁️ Proxy Status Toggle:** Toggle the Cloudflare proxy status (orange/grey cloud) for any record directly from the bot's menu with a single click.
@@ -44,6 +45,8 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 ### Bot Commands
 | Command | Description |
 |:---|:---|
+| `/start` | Starts the bot and shows the language selection menu |
+| `/language` | Select your preferred language (English/Persian) |
 | `/list` | Enters the main menu and displays the paginated list of records |
 | `/search`| Searches for a record by its name |
 | `/bulk` | Enters Bulk Actions mode for multiple selections |
