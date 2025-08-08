@@ -1,176 +1,192 @@
 #!/bin/bash
 
+# --- Configuration ---
+REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
 REPO_DIR="cloudflare-telegram-bot"
+VENV_DIR="venv"
+PM2_APP_NAME="cfbot"
 
-# Print header
+# --- Colors ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# --- Helper Functions ---
+
+# Print a formatted header
 print_header() {
   clear
-  echo "############################################################"
-  echo "##                                                        ##"
-  echo " ##           WELCOME TO Cloudflare-Telegram-Bot         ##"
-  echo "  ##             Script Executed Successfully           ##"
-  echo " ##         Powered by @H_ExPLoSiVe(ExPLoSiVe1988)       ##"
-  echo "##                                                        ##"
-  echo "############################################################"
+  echo -e "${GREEN}############################################################${NC}"
+  echo -e "${GREEN}##                                                        ##${NC}"
+  echo -e "${GREEN} ##           WELCOME TO Cloudflare-Telegram-Bot         ##${NC}"
+  echo -e "${GREEN}  ##                 Installation Script                ##${NC}"
+  echo -e "${GREEN} ##         Powered by @H_ExPLoSiVe(ExPLoSiVe1988)       ##${NC}"
+  echo -e "${GREEN}##                                                        ##${NC}"
+  echo -e "${GREEN}############################################################${NC}"
   echo ""
 }
 
-# Check and install requirements if missing
+# Check for essential system packages and install if missing
 check_requirements() {
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is not installed. Installing python3..."
+  echo -e "${YELLOW}>>> Checking system dependencies...${NC}"
+  local needs_install=0
+  for cmd in git python3 python3-pip npm; do
+    if ! command -v $cmd &> /dev/null; then
+      echo -e "${YELLOW}Dependency '$cmd' not found. Marking for installation.${NC}"
+      needs_install=1
+    fi
+  done
+
+  if [ $needs_install -eq 1 ]; then
+    echo -e "${YELLOW}Updating package lists and installing required packages...${NC}"
     sudo apt-get update
-    sudo apt-get install -y python3
+    sudo apt-get install -y git python3 python3-pip python3-venv nodejs npm
   fi
-  if ! command -v pip3 >/dev/null 2>&1; then
-    echo "pip3 is not installed. Installing pip3..."
-    sudo apt-get update
-    sudo apt-get install -y python3-pip
-  fi
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "npm is not installed. Installing nodejs and npm..."
-    sudo apt-get update
-    sudo apt-get install -y nodejs npm
-  fi
-  if ! command -v pm2 >/dev/null 2>&1; then
-    echo "pm2 is not installed. Installing pm2..."
+
+  if ! command -v pm2 &> /dev/null; then
+    echo -e "${YELLOW}PM2 not found. Installing globally via npm...${NC}"
     sudo npm install -g pm2
   fi
+  echo -e "${GREEN}System dependencies are satisfied.${NC}"
 }
 
-# Get user input and save to a specified .env file
+# Get user input for .env file
 get_user_input() {
   local env_file_path=$1
-  echo "Please enter the following information:"
+  echo -e "\n${YELLOW}Please provide the following information:${NC}"
   read -rp "Cloudflare API Token (CF_API_TOKEN): " CF_API_TOKEN
-  read -rp "Token Name (CF_TOKEN_NAME): " CF_TOKEN_NAME
   read -rp "Telegram Bot Token (TELEGRAM_BOT_TOKEN): " TELEGRAM_BOT_TOKEN
   read -rp "Telegram Admin ID (TELEGRAM_ADMIN_ID): " TELEGRAM_ADMIN_ID
 
-  echo
-  echo "Saving information to $env_file_path ..."
+  echo -e "\n${YELLOW}Saving information to $env_file_path...${NC}"
   cat > "$env_file_path" <<EOF
 CF_API_TOKEN=$CF_API_TOKEN
-CF_TOKEN_NAME=$CF_TOKEN_NAME
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TELEGRAM_ADMIN_ID=$TELEGRAM_ADMIN_ID
 EOF
-  echo ".env file created."
+  chmod 600 "$env_file_path"
+  echo -e "${GREEN}.env file created and secured.${NC}"
 }
 
-# Install bot
+# Send a notification message to Telegram
+send_telegram_notification() {
+  local message=$1
+  # Robustly read variables from .env file
+  if [ -f ".env" ]; then
+    local token=$(grep "TELEGRAM_BOT_TOKEN" .env | cut -d '=' -f2)
+    local admin_id=$(grep "TELEGRAM_ADMIN_ID" .env | cut -d '=' -f2)
+    if [ -n "$token" ] && [ -n "$admin_id" ]; then
+      curl -s -X POST "https://api.telegram.org/bot$token/sendMessage" \
+        -d chat_id="$admin_id" \
+        -d text="$message" > /dev/null
+      echo -e "\n${GREEN}Notification sent to Telegram.${NC}"
+    fi
+  fi
+}
+
+# --- Main Functions ---
+
+# Install the bot
 install_bot() {
   print_header
-  echo "Installing bot..."
-
+  echo -e "${YELLOW}Starting bot installation...${NC}"
   if [ -d "$REPO_DIR" ]; then
-    echo "Bot folder exists. Please use the 'Update' option or remove it first."
+    echo -e "${RED}❌ Bot folder already exists. Please use the 'Update' option or remove it first.${NC}"
     return
   fi
 
-  echo "Cloning bot from GitHub..."
-  git clone https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git
-  cd "$REPO_DIR" || exit
+  echo -e "${YELLOW}Cloning repository from GitHub...${NC}"
+  git clone "$REPO_URL"
+  cd "$REPO_DIR" || { echo -e "${RED}Failed to enter repository directory. Aborting.${NC}"; exit 1; }
 
-  # Create the .env file directly inside the bot directory
   get_user_input ".env"
 
-  echo "Installing dependencies..."
-  pip3 install -r requirements.txt
+  echo -e "${YELLOW}Creating Python virtual environment...${NC}"
+  python3 -m venv "$VENV_DIR"
 
-  chmod 600 .env
+  echo -e "${YELLOW}Installing dependencies from requirements.txt...${NC}"
+  "$VENV_DIR/bin/pip3" install -r requirements.txt
 
-  echo "Starting bot with pm2..."
-  pm2 start bot.py --interpreter python3 --watch --name cfbot --update-env
+  echo -e "${YELLOW}Starting bot with PM2...${NC}"
+  # Use the python interpreter from the virtual environment
+  pm2 start bot.py --interpreter "$VENV_DIR/bin/python3" --name "$PM2_APP_NAME" --update-env
 
-  echo "✅ Bot installed and started successfully."
-  echo "📜 View logs: pm2 logs cfbot"
+  echo -e "${YELLOW}Saving PM2 process list to run on startup...${NC}"
+  pm2 save
 
-  # Load .env variables for the notification
-  source .env
-  curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-    -d chat_id="$TELEGRAM_ADMIN_ID" \
-    -d text='🚀 Cloudflare bot installed and running successfully.'
+  echo -e "\n${GREEN}✅ Bot installed and started successfully!${NC}"
+  echo -e "${YELLOW}To make the bot run automatically after a reboot, please run the command that PM2 suggests below:${NC}"
+  pm2 startup
+
+  echo -e "\n📜 ${YELLOW}View logs:${NC} pm2 logs $PM2_APP_NAME"
+  send_telegram_notification "🚀 Cloudflare bot installed and running successfully."
 }
 
-# Update bot
+# Update the bot
 update_bot() {
   print_header
-  echo "Updating bot..."
-
+  echo -e "${YELLOW}Starting bot update...${NC}"
   if [ ! -d "$REPO_DIR" ]; then
-    echo "❌ Bot is not installed. Please install first."
+    echo -e "${RED}❌ Bot is not installed. Please use the 'Install' option first.${NC}"
     return
   fi
-
   cd "$REPO_DIR" || exit
-  echo "Pulling latest changes from GitHub..."
+
+  echo -e "${YELLOW}Pulling latest changes from GitHub...${NC}"
   git pull origin main
-  
-  echo "Installing/updating dependencies..."
-  pip3 install -r requirements.txt
 
-  echo -n "Do you want to update connection info? (y/n): "
-  read answer
+  echo -e "${YELLOW}Installing/updating dependencies...${NC}"
+  "$VENV_DIR/bin/pip3" install -r requirements.txt --upgrade
+
+  read -rp "Do you want to update your API tokens or Admin ID? (y/n): " answer
   if [[ $answer == [Yy]* ]]; then
-    # Update the .env file directly inside the bot directory
     get_user_input ".env"
-    chmod 600 .env
   fi
 
-  echo "Restarting bot with pm2..."
-  pm2 restart cfbot --update-env
+  echo -e "${YELLOW}Restarting bot with PM2...${NC}"
+  pm2 restart "$PM2_APP_NAME" --update-env
 
-  echo "✅ Bot updated successfully."
-
-  if [ -f ".env" ]; then
-    source .env
-    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-      -d chat_id="$TELEGRAM_ADMIN_ID" \
-      -d text='✅ Cloudflare bot updated to latest version. 🔄'
-  fi
+  echo -e "\n${GREEN}✅ Bot updated successfully.${NC}"
+  send_telegram_notification "✅ Cloudflare bot updated to the latest version. 🔄"
 }
 
-# Remove bot
+# Remove the bot
 remove_bot() {
   print_header
-  echo "Removing bot completely..."
-
-  pm2 delete cfbot 2>/dev/null || echo "⚠️ Bot was not running or already removed."
+  echo -e "${YELLOW}Removing bot completely...${NC}"
+  pm2 delete "$PM2_APP_NAME" &> /dev/null || echo -e "${YELLOW}⚠️ Bot was not running or already removed from PM2.${NC}"
+  pm2 save --force
 
   if [ -d "$REPO_DIR" ]; then
     rm -rf "$REPO_DIR"
-    echo "🗑 Bot folder ($REPO_DIR) removed."
+    echo -e "${GREEN}🗑️ Bot directory ($REPO_DIR) has been removed.${NC}"
   else
-    echo "⚠️ Bot folder does not exist."
+    echo -e "${YELLOW}⚠️ Bot directory does not exist.${NC}"
   fi
-
-  echo "✅ Bot removed successfully."
+  echo -e "\n${GREEN}✅ Bot removal process finished.${NC}"
 }
 
-# Main menu
-print_menu() {
-  echo
-  echo "Choose one option:"
-  echo "1) Install Bot"
-  echo "2) Update Bot"
-  echo "3) Delete Bot"
-  echo "4) Exit"
-  echo -n "Choice: "
+# Main menu loop
+main_menu() {
+  while true; do
+    echo -e "\n${YELLOW}Choose an option:${NC}"
+    echo "1) Install Bot"
+    echo "2) Update Bot"
+    echo "3) Delete Bot"
+    echo "4) Exit"
+    read -rp "Choice: " choice
+    case $choice in
+      1) install_bot; break ;;
+      2) update_bot; break ;;
+      3) remove_bot; break ;;
+      4) echo -e "${GREEN}👋 Exiting script.${NC}"; exit 0 ;;
+      *) echo -e "${RED}❌ Invalid option! Please enter a number between 1 and 4.${NC}" ;;
+    esac
+  done
 }
 
-# --- Main Program Logic ---
+# --- Script Execution ---
 print_header
 check_requirements
-
-while true; do
-  print_menu
-  read choice
-  case $choice in
-    1) install_bot ;;
-    2) update_bot ;;
-    3) remove_bot ;;
-    4) echo "👋 Exiting script."; exit 0 ;;
-    *) echo "❌ Invalid option! Please enter a number between 1 and 4." ;;
-  esac
-done
+main_menu
