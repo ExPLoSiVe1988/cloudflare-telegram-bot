@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # --- Configuration ---
-PROJECT_DIR="cloudflare-telegram-bot" 
-IMAGE_NAME="explosive1988/cfbot:latest" 
+REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
+PROJECT_DIR="cloudflare-telegram-bot"
+IMAGE_NAME="explosive1988/cfbot:latest"
 
 # --- Colors ---
 GREEN='\033[0;32m'
@@ -10,6 +11,9 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# --- Stop script on any error ---
+set -e
 
 # --- Helper Functions ---
 print_header() {
@@ -84,16 +88,6 @@ services:
       - .env
     volumes:
       - ./backups:/app/backups
-      - ./config.json:/app/config.json
-EOF
-
-    echo -e "${YELLOW}Creating default config.json file...${NC}"
-    cat > "config.json" <<EOF
-{
-  "monitoring_interval_seconds": 60,
-  "failover_targets": [],
-  "rotation_targets": []
-}
 EOF
 
     get_user_input
