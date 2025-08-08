@@ -1,6 +1,6 @@
 import os
 import json
-import requests
+import httpx 
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
