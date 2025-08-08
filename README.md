@@ -5,102 +5,112 @@
 
 # Cloudflare Telegram Bot
 
-A powerful and professional Telegram bot that acts as a complete control panel for managing your Cloudflare DNS records. With advanced features like multi-zone support, instant search, and bulk actions, this bot transforms DNS management into a fast and intuitive experience.
+A powerful and professional Telegram bot that acts as a complete control panel for managing your Cloudflare DNS records. Now fully containerized with Docker for easy, fast, and isolated deployment.
 
 ---
 
 ## ✨ Features
-
-### Core Functionality
-*   **Multi-Zone Support:** The bot automatically detects all zones in your Cloudflare account, allowing you to switch and manage multiple domains seamlessly.
-*   **Full Record Management:** View, edit, create, and delete all types of DNS records.
-*   **Action Confirmation:** A final confirmation step for critical operations like deleting or editing prevents accidental mistakes.
-*   **Backup and Restore:** Create a `.json` backup of all records for a specific zone and restore them later, intelligently skipping duplicates.
-*   **Installation Script Notifications:** Receive messages on Telegram after a successful installation or update via the provided script.
-
-### 🚀 Advanced & User-Friendly Features
-*   **🌐 Multi-Language Support:** The bot is fully bilingual, offering its entire interface in both **English** and **Persian (فارسی)**. Use the `/language` command to switch at any time.
-*   **🗂 Pagination:** Say goodbye to endless scrolling! Records are neatly organized into pages, easily navigable with "Next" and "Previous" buttons.
-*   **🔎 Instant Search:** Using the `/search` command, find any record in an instant just by typing a part of its name.
-*   **☁️ Proxy Status Toggle:** Toggle the Cloudflare proxy status (orange/grey cloud) for any A or AAAA record directly from the bot's menu with a single tap.
-*   **👥 Bulk Actions:** Enter `/bulk` mode to select multiple records (`✅`) and perform an operation (like delete or change IP) on all of them at once.
-*   **🕹 Smooth Navigation:** With "Back" buttons in all sub-menus, quickly return to the previous screen without retyping commands.
-
-
-## ⚙️ Installation and Setup
-
-### Prerequisites
-*   A Linux server (Ubuntu, Debian, CentOS, etc.)
-*   `curl` and `bash` (usually pre-installed)
-*   `python3` and `pip`
-*   `pm2` for process management (the script will try to install it)
-
-### 1. Run the Installation Script
-Execute the following command in your server's terminal:
-```bash
-bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/main/install.sh)
-```
-The script will guide you through the installation, update, or removal process.
-
-### 2. Script Options
-| Action | Option |
-|:---|:---|
-| Full bot installation | `Install Bot` |
-| Update the bot from GitHub | `Update Bot` |
-| Completely remove the bot | `Delete Bot` |
-| Exit the script | `Exit` |
-
-### 3. Required Information
-During installation, the script will ask for the following variables, which will be saved in a `.env` file:
-
-| Variable | Description |
-|:---|:---|
-| `CF_API_TOKEN` | Cloudflare API Token (with DNS edit permissions). |
-| `TELEGRAM_BOT_TOKEN` | Your Telegram Bot Token (from @BotFather). |
-| `TELEGRAM_ADMIN_ID` | The numerical Telegram ID of the admin account (you). |
-> **Note:** You do **not** need to provide a domain name. The bot will fetch all available zones from your account.
+*   **🐳 Easy Docker Deployment:** Get the bot running in minutes with a fully automated installation script.
+*   **🌐 Multi-Zone Support:** Automatically detects all zones in your account, allowing you to manage multiple domains.
+*   **🚀 Fully Asynchronous:** Built with `httpx` for a fast and non-blocking interface.
+*   **👥 Bulk Actions:** Select multiple records to delete or change their IP address all at once.
+*   **🔎 Instant Search & Pagination:** Quickly find any record and navigate through long lists with ease.
+*   **☁️ Proxy Toggle:** Change the Cloudflare proxy status (orange/grey cloud) with a single tap.
+*   **🔄 Refresh Button:** Instantly reload the record list from Cloudflare to see external changes.
+*   **💾 Backup & Restore:** Create and restore `.json` backups for any of your zones.
+*   **🌍 Multi-Language:** Full support for English and Persian (فارسی).
 
 ---
 
-## 🤖 Bot Usage
+## 🚀 Installation
 
-### Bot Commands
-| Command | Description |
-|:---|:---|
-| `/start` | Starts the bot and shows the language selection menu. |
-| `/language` | Changes the bot's language (English/Persian). |
-| `/list` | The main command to select a zone and view its DNS records. |
-| `/search`| Searches for records within the currently selected zone. |
-| `/bulk` | Enters Bulk Actions mode for the selected zone. |
-| `/add` | Starts the process of adding a new DNS record to the selected zone. |
-| `/backup` | Creates a backup of all DNS records for the selected zone. |
-| `/restore`| Restores records from a backup file to the selected zone. |
+This bot is designed to run with Docker. The provided script automates the entire setup process.
 
+### Prerequisites
+*   A Linux server (Ubuntu/Debian recommended).
+*   `git` and `curl` (usually pre-installed).
 
-### Creating a Cloudflare API Token
-| Step | Instructions |
-|:---|:---|
-| **1** | Log in to your Cloudflare account and go to: https://dash.cloudflare.com/profile/api-tokens |
-| **2** | Click `Create Token`. |
-| **3** | Use the `Edit zone DNS` template, or create a custom token with these permissions: <br> • **Permissions:** `Zone` > `DNS` > `Edit` <br> • **Zone Resources:** `Include` > `All zones` |
-| **4** | Copy the generated API Token and save it. You'll need it during installation. |
+### Automated Installation
+Run the following command in your server's terminal. The script will handle everything, including installing Docker if it's not present.
 
-### Managing with PM2
-The installation script uses PM2 to keep the bot running.
-| Command | Usage |
-|:---|:---|
-| `pm2 logs cfbot` | View live logs of the bot for debugging. |
-| `pm2 restart cfbot`| Manually restart the bot after changes. |
+```bash
+bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/main/install.sh)
+```
 
+The script provides a menu to:
+*   **Install Bot:** Clones the repository, asks for your API tokens, and starts the bot using Docker Compose.
+*   **Update Bot:** Pulls the latest code from GitHub and rebuilds the Docker image.
+*   **View Live Logs:** Shows the real-time output of the bot for monitoring.
+*   **Remove Bot Completely:** Stops the container and removes all associated data, containers, and images.
 
------
+---
 
-### 👨‍💻 Developer
+##  migrating from the previous version?
+
+➡️ **Please see the migration guide at the bottom of this file.**
+
+---
+
+## 🤖 Bot Management
+
+If you prefer to use commands directly, `cd` into the project directory (`cloudflare-telegram-bot`) and use these `docker-compose` commands:
+
+| Action | Command |
+| :--- | :--- |
+| **View Live Logs** | `docker-compose logs -f` |
+| **Stop the Bot** | `docker-compose stop` |
+| **Start the Bot** | `docker-compose start` |
+| **Update (after `git pull`)** | `docker-compose up --build -d` |
+| **Stop and Remove Container** | `docker-compose down` |
+
+---
+
+### Cloudflare API Token Permissions
+For the bot to function correctly, your API token needs the following permissions:
+
+| Type | Resource | Access |
+| :--- | :--- | :--- |
+| **Zone** | **DNS** | `Edit` |
+| **Zone** | **Zone** | `Read` |
+
+Go to [API Tokens](https://dash.cloudflare.com/profile/api-tokens) and create a custom token with these two permissions applied to `All zones`.
+
+---
+
+## 🔄 Migration Guide for Existing Users (from PM2 version)
+
+This version introduces a complete shift from a PM2-based setup to a much more stable **Docker-based deployment**. The old "Update Bot" option is not compatible.
+
+To upgrade, you must perform a clean installation. Please follow these simple steps:
+
+**Step 1: Completely Remove the Old Version**
+
+First, run your old installation script to completely remove the PM2 version.
+```bash
+# Navigate to your old bot's directory
+cd cloudflare-telegram-bot 
+# Run the old script
+bash install.sh
+# Choose the "Delete Bot" option from the menu.
+```
+If you don't have the old script, you can manually remove it with these commands:
+```bash
+pm2 delete cfbot && pm2 save && cd ~ && rm -rf cloudflare-telegram-bot
+```
+
+**Step 2: Install the New Docker Version**
+
+Now, simply run the new universal installation command from your home directory (`~`):
+```bash
+bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/main/install.sh)
+```
+The new script will guide you through the fresh installation process. Thank you for upgrading!
+
+---
+### 👨‍💻 Developer & Support
 *   GitHub: [@ExPLoSiVe1988](https://github.com/ExPLoSiVe1988)
 *   Telegram: [t.me/H_ExPLoSiVe](https://t.me/H_ExPLoSiVe)
-
------
-
+---
 ### 💖 Support / Donate
 If you find this project useful, please consider supporting its development:
 
