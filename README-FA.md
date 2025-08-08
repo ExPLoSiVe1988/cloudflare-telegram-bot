@@ -68,9 +68,7 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 | عملکرد | دستور |
 | :--- | :--- |
 | **مشاهده لاگ زنده** | `docker-compose logs -f` |
-| **متوقف کردن ربات** | `docker-compose stop` |
-| **شروع مجدد ربات** | `docker-compose start` |
-| **آپدیت (بعد از `git pull`)** | `docker-compose up --build -d` |
+| **آپدیت** | `docker-compose up -d` |
 | **توقف و حذف کانتینر** | `docker-compose down` |
 
 ---
