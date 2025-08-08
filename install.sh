@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- Configuration ---
-PROJECT_DIR="cfbot-docker" 
+PROJECT_DIR="cloudflare-telegram-bot" 
 IMAGE_NAME="explosive1988/cfbot:latest" 
 
 # --- Colors ---
