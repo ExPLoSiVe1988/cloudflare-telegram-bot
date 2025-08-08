@@ -1,0 +1,9 @@
+services:
+  cfbot:
+    build: .
+    container_name: cfbot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./backups:/app/backups
