@@ -1,17 +1,1 @@
-# .gitignore
 .env
-venv/
-env/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.json.bak
-*.log
-dns_backup.json
-*_backup.json
-.idea/
-.vscode/
-*.swp
-.DS_Store
-Thumbs.db
