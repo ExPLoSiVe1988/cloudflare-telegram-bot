@@ -15,6 +15,7 @@ load_dotenv()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID"))
+BACKUP_DIR = "backups" # <--- CHANGE: Added backup directory constant
 
 HEADERS = { "Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json" }
 DNS_RECORD_TYPES = [
@@ -188,6 +189,7 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton(get_text('buttons.search', lang), callback_data="search_start"),
             InlineKeyboardButton(get_text('buttons.bulk_actions', lang), callback_data="bulk_start")
         ])
+        buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data="refresh_list")])
     buttons.append([InlineKeyboardButton(get_text('buttons.back_to_zones', lang), callback_data="list")])
     reply_markup = InlineKeyboardMarkup(buttons)
     try:
@@ -211,6 +213,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     lang = get_user_lang(context)
     text = update.message.text.strip()
+
     if context.user_data.get('is_bulk_ip_change'):
         selected_ids = context.user_data.get('selected_records', [])
         context.user_data.pop('is_bulk_ip_change')
@@ -245,7 +248,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [[InlineKeyboardButton("DNS Only", callback_data="add_proxied|false")], [InlineKeyboardButton("Proxied", callback_data="add_proxied|true")]]
             await update.message.reply_text(get_text('prompts.choose_proxy', lang), reply_markup=InlineKeyboardMarkup(kb))
 
-# --- Callback Handlers (ادامه کد بدون تغییر) ...
+# --- Callback Handlers ---
+async def refresh_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    context.user_data.pop('all_records', None)
+    await update.callback_query.answer(text=get_text('messages.list_refreshed', lang))
+    await display_records_list(update, context, page=0)
+
 async def list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE): await list_records_command(update, context, from_callback=True)
 async def select_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -255,7 +264,7 @@ async def select_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not zone:
         await query.edit_message_text("Error: Zone not found.")
         return
-    clear_state(context, full_reset=False)
+    clear_state(context)
     context.user_data['selected_zone_id'] = zone_id
     context.user_data['selected_zone_name'] = zone['name']
     await display_records_list(update, context, page=0)
@@ -515,20 +524,27 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not zone_id:
         await update.message.reply_text(get_text('messages.no_zone_selected', lang))
         return
+    
     await update.message.reply_text(get_text('messages.backup_in_progress', lang))
     records = await get_dns_records(zone_id)
     if not records:
         await update.message.reply_text(get_text('messages.no_records_found', lang))
         return
-    backup_file = f"{context.user_data['selected_zone_name']}_backup.json"
+    
+    # <--- CHANGE: Ensure backup directory exists and save file inside it
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    backup_file_name = f"{context.user_data['selected_zone_name']}_backup.json"
+    backup_file_path = os.path.join(BACKUP_DIR, backup_file_name)
+    
     try:
-        with open(backup_file, "w", encoding='utf-8') as f:
+        with open(backup_file_path, "w", encoding='utf-8') as f:
             json.dump(records, f, indent=2)
-        with open(backup_file, "rb") as f:
-            await update.message.reply_document(f, filename=backup_file)
+        with open(backup_file_path, "rb") as f:
+            await update.message.reply_document(f, filename=backup_file_name)
     finally:
-        if os.path.exists(backup_file):
-            os.remove(backup_file)
+        if os.path.exists(backup_file_path):
+            os.remove(backup_file_path)
+
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     lang = get_user_lang(context)
@@ -581,7 +597,6 @@ async def shutdown_client(app: Application):
 def main():
     load_translations()
     
-    # --- Correct way to build the application with shutdown hook ---
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
