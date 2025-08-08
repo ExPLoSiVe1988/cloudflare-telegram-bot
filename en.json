@@ -11,8 +11,10 @@
   "messages": {
     "welcome": "Welcome to the Cloudflare Management Bot!\nUse /list or /language to get started.",
     "access_denied": "❌ You do not have permission to use this bot.",
-    "zone_id_not_found": "❌ Zone ID not found.",
-    "no_records_found": "No records found to display.",
+    "no_zone_selected": "❌ No zone is selected. Please use /list first.",
+    "no_zone_selected_for_restore": "❌ No zone selected for restore. Please use /list and select a zone first.",
+    "no_records_found": "No records found in this zone.",
+    "no_records_found_search": "No records found matching your search.",
     "all_records_list": "📄 List of records for `{zone_name}`:",
     "search_results": "📄 Search results for \"{query}\" in `{zone_name}`:",
     "record_details": "📛 `{type}` {name}\n📝 Value: {content}\n☁️ Proxy: `{proxy_status}`",
@@ -39,7 +41,7 @@
     "choose_language": "Please choose your language:",
     "language_changed": "✅ Language has been set to English.",
     "backup_in_progress": "⏳ Creating backup...",
-    "restore_prompt": "To restore, please send the `dns_backup.json` file.",
+    "restore_prompt": "To restore, please send the `.json` backup file.",
     "restore_in_progress": "⏳ Processing backup file and restoring records...",
     "restore_report": "🔁 Restore operation finished:\n✅ Added: {restored}\n⏭ Skipped (duplicates): {skipped}\n❌ Failed: {failed}",
     "invalid_file_format": "❌ The sent file must be in .json format.",
@@ -52,7 +54,7 @@
       "enter_ip": "📥 Please enter the new IP for {name}:",
       "enter_content": "📥 Please enter the new content for {name}:",
       "choose_record_type": "🆕 Please choose the record type:",
-      "enter_subdomain": "📛 Please enter only the subdomain name:",
+      "enter_subdomain": "📛 Please enter the subdomain name (or @ for root):",
       "choose_proxy": "🌐 Choose the proxy status:",
       "enter_search_query": "🔎 Please enter a part of the record name you are looking for:"
   }
