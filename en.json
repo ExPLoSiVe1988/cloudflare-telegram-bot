@@ -1,6 +1,6 @@
 {
   "buttons": {
-    "next": "Next ▶️", "previous": "◀️ Previous", "add_record": "➕ Add", "search": "🔎 Search",
+    "next": "Next ▶️", "previous": "◀️ Previous", "refresh": "🔄 Refresh", "add_record": "➕ Add", "search": "🔎 Search",
     "bulk_actions": "👥 Bulk", "delete_selected": "🗑 Delete Selected ({count})",
     "change_ip_selected": "📝 Change IP of Selected ({count})", "cancel": "❌ Cancel",
     "back_to_list": "↩️ Back to Records", "back_to_zones": "↩️ Back to Zones", "edit_value": "📝 Change Value",
@@ -15,6 +15,7 @@
     "no_zone_selected_for_restore": "❌ No zone selected for restore. Please use /list and select a zone first.",
     "no_records_found": "No records found in this zone.",
     "no_records_found_search": "No records found matching your search.",
+    "list_refreshed": "Record list has been refreshed.",
     "all_records_list": "📄 List of records for `{zone_name}`:",
     "search_results": "📄 Search results for \"{query}\" in `{zone_name}`:",
     "record_details": "📛 `{type}` {name}\n📝 Value: {content}\n☁️ Proxy: `{proxy_status}`",
@@ -24,6 +25,8 @@
     "record_deleted_successfully": "✅ Record {record_name} was successfully deleted.",
     "record_updated_successfully": "✅ Record {record_name} was successfully updated.",
     "record_added_successfully": "✅ Record `{rtype}` {name} was successfully added.",
+    "zone_added_successfully": "✅ Zone `{zone_name}` was successfully added!\n\n⚠️ **IMPORTANT:**\nGo to your domain registrar and change your nameservers to:\n\n`{ns1}`\n`{ns2}`",
+    "error_adding_zone": "❌ Error adding zone: {error}",
     "error_deleting_record": "❌ Error deleting the record.",
     "error_updating_record": "❌ Error updating record: {error}",
     "error_creating_record": "❌ Error creating record: {error}",
@@ -56,6 +59,7 @@
       "choose_record_type": "🆕 Please choose the record type:",
       "enter_subdomain": "📛 Please enter the subdomain name (or @ for root):",
       "choose_proxy": "🌐 Choose the proxy status:",
-      "enter_search_query": "🔎 Please enter a part of the record name you are looking for:"
+      "enter_search_query": "🔎 Please enter a part of the record name you are looking for:",
+      "enter_new_zone_name": "Enter the domain name you want to add to Cloudflare (e.g., mydomain.com):"
   }
 }
