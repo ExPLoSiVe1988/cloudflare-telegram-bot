@@ -68,9 +68,7 @@ If you prefer to use commands directly, `cd` into the project directory (`cloudf
 | Action | Command |
 | :--- | :--- |
 | **View Live Logs** | `docker-compose logs -f` |
-| **Stop the Bot** | `docker-compose stop` |
-| **Start the Bot** | `docker-compose start` |
-| **Update (after `git pull`)** | `docker-compose up --build -d` |
+| **Update** | `docker-compose up -d` |
 | **Stop and Remove Container** | `docker-compose down` |
 
 ---
