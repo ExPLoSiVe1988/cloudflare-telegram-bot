@@ -44,7 +44,17 @@ The script provides a menu to:
 *   **Remove Bot Completely:** Stops the container and removes all associated data, containers, and images.
 
 ---
-
+### Bot Commands
+| Command | Description |
+|:---|:---|
+| `/start` | Starts the bot and shows the language selection menu |
+| `/language` | Select your preferred language (English/Persian) |
+| `/list` | Enters the main menu and displays the paginated list of records |
+| `/search`| Searches for a record by its name |
+| `/bulk` | Enters Bulk Actions mode for multiple selections |
+| `/add` | Starts the process of adding a new subdomain |
+| `/backup` | Backs up all DNS records |
+| `/restore`| Restores records from a backup file |
 ##  migrating from the previous version?
 
 ➡️ **Please see the migration guide at the bottom of this file.**
