@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # --- Configuration ---
-REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
-PROJECT_DIR="cloudflare-telegram-bot"
-ENV_FILE=".env"
+PROJECT_DIR="cfbot-docker" 
+IMAGE_NAME="explosive1988/cfbot:latest" 
 
 # --- Colors ---
 GREEN='\033[0;32m'
@@ -24,19 +23,15 @@ print_header() {
     echo ""
 }
 
-# Check for Docker and Docker Compose and install if missing
 check_docker() {
     echo -e "${YELLOW}>>> Checking for Docker and Docker Compose...${NC}"
     if ! command -v docker &> /dev/null; then
         echo "Docker not found. Attempting to install..."
-        sudo apt-get update
-        sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+        sudo apt-get update -y && sudo apt-get install -y curl
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
         sudo usermod -aG docker $USER
-        echo -e "${GREEN}Docker installed successfully. You might need to log out and log back in for group changes to take effect.${NC}"
+        echo -e "${GREEN}Docker installed successfully. You might need to log out and log back in.${NC}"
     else
         echo -e "${GREEN}Docker is already installed.${NC}"
     fi
@@ -58,7 +53,7 @@ get_user_input() {
     read -rp "Telegram Admin ID (TELEGRAM_ADMIN_ID): " TELEGRAM_ADMIN_ID
     
     echo -e "\n${YELLOW}Creating .env file...${NC}"
-    cat > "$ENV_FILE" <<EOF
+    cat > ".env" <<EOF
 CF_API_TOKEN=$CF_API_TOKEN
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TELEGRAM_ADMIN_ID=$TELEGRAM_ADMIN_ID
@@ -73,52 +68,84 @@ install_bot() {
         echo -e "${RED}❌ Project directory '$PROJECT_DIR' already exists. Please use the update or remove options.${NC}"
         return
     fi
-    echo -e "${YELLOW}Cloning repository...${NC}"
-    git clone "$REPO_URL"
-    cd "$PROJECT_DIR" || exit
+    
+    echo -e "${YELLOW}Creating project directory at ~/$PROJECT_DIR...${NC}"
+    mkdir -p "$HOME/$PROJECT_DIR"
+    cd "$HOME/$PROJECT_DIR" || exit
+
+    echo -e "${YELLOW}Creating docker-compose.yml file...${NC}"
+    cat > "docker-compose.yml" <<EOF
+services:
+  cfbot:
+    image: ${IMAGE_NAME}
+    container_name: cfbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./backups:/app/backups
+      - ./config.json:/app/config.json
+EOF
+
+    echo -e "${YELLOW}Creating default config.json file...${NC}"
+    cat > "config.json" <<EOF
+{
+  "monitoring_interval_seconds": 60,
+  "failover_targets": [],
+  "rotation_targets": []
+}
+EOF
+
     get_user_input
-    echo -e "${YELLOW}Building and starting the bot with Docker Compose... This may take a few minutes.${NC}"
-    docker-compose up --build -d
+
+    echo -e "${YELLOW}Pulling the latest bot image from Docker Hub and starting...${NC}"
+    docker-compose up -d
+    
     echo -e "\n${GREEN}✅ Bot installed and started successfully!${NC}"
-    echo -e "${BLUE}Use the 'View Logs' option in the menu to check the status.${NC}"
+    echo -e "${BLUE}Use 'View Logs' from the main script to check the status.${NC}"
 }
 
 update_bot() {
     print_header
-    if [ ! -d "$PROJECT_DIR" ]; then
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then
         echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"
         return
     fi
-    cd "$PROJECT_DIR" || exit
-    echo -e "${YELLOW}Pulling latest changes from GitHub...${NC}"
-    git pull origin main
-    echo -e "${YELLOW}Re-building the Docker image and restarting the bot...${NC}"
-    docker-compose up --build -d
+    cd "$HOME/$PROJECT_DIR" || exit
+    
+    echo -e "${YELLOW}Pulling the latest bot image from Docker Hub...${NC}"
+    docker-compose pull
+    
+    echo -e "${YELLOW}Restarting the bot with the new image...${NC}"
+    docker-compose up -d
+    
     echo -e "\n${GREEN}✅ Bot updated successfully!${NC}"
 }
 
 remove_bot() {
     print_header
-    if [ ! -d "$PROJECT_DIR" ]; then
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then
         echo -e "${RED}❌ Bot is not installed.${NC}"
         return
     fi
-    cd "$PROJECT_DIR" || exit
-    echo -e "${YELLOW}Stopping and removing Docker containers, images, and volumes...${NC}"
+    cd "$HOME/$PROJECT_DIR" || exit
+    
+    echo -e "${YELLOW}Stopping and removing Docker containers and images...${NC}"
     docker-compose down --rmi all -v
-    cd ..
+    
+    cd ~
     rm -rf "$PROJECT_DIR"
     echo -e "\n${GREEN}✅ Bot and all associated data have been completely removed.${NC}"
 }
 
 view_logs() {
     print_header
-    if [ ! -d "$PROJECT_DIR" ]; then
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then
         echo -e "${RED}❌ Bot is not installed.${NC}"
         return
     fi
     echo -e "${YELLOW}Showing live logs... (Press Ctrl+C to exit)${NC}"
-    cd "$PROJECT_DIR" || exit
+    cd "$HOME/$PROJECT_DIR" || exit
     docker-compose logs -f
 }
 
