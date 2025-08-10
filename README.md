@@ -3,7 +3,7 @@
   <a href="README-FA.md">🇮🇷 نسخه فارسی</a>
 </div>
 
-# Management Cloudflare Bot 🐳
+# Cloudflare Management Bot 🐳
 
 A powerful, multi-user, multi-account Telegram bot for managing your Cloudflare DNS records. Fully containerized with Docker for an incredibly simple and fast deployment.
 
