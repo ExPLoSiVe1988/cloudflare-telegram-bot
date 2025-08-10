@@ -187,7 +187,7 @@ view_logs() {
 
 manage_admins() {
     local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
-    echo "Current Admins: ${YELLOW}${current_admins:-None}${NC}"
+    echo -e "Current Admins: ${YELLOW}${current_admins:-None}${NC}" # <--- اصلاح شد
     read -rp "1) Add Admin, 2) Remove Admin, 3) Back: " choice
     case $choice in
         1)
@@ -212,7 +212,7 @@ manage_admins() {
 manage_cf_accounts() {
     local current_accounts=$(read_env_var "CF_ACCOUNTS")
     echo "Current Cloudflare Accounts:"
-    echo "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n'
+    echo -e "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n' # <--- اصلاح شد
     read -rp "1) Add Account, 2) Remove Account (by nickname), 3) Back: " choice
     case $choice in
         1)
