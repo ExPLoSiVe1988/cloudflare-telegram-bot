@@ -152,16 +152,21 @@ EOF
 
 update_bot() {
     print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"; return; fi
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed.${NC}"; return; fi
     cd "$HOME/$PROJECT_DIR" || exit
     
     echo -e "${YELLOW}Pulling the latest bot image from Docker Hub...${NC}"
     docker-compose pull
     
-    echo -e "${YELLOW}Restarting the bot with the new image...${NC}"
-    docker-compose up -d
+    echo -e "${YELLOW}Recreating the container with the new image...${NC}"
+    docker-compose up -d --force-recreate
     
     echo -e "\n${GREEN}✅ Bot code updated successfully!${NC}"
+    
+    read -rp "Do you want to edit your Admins or Cloudflare Accounts now? (y/n): " edit_now
+    if [[ $edit_now == [Yy]* ]]; then
+        edit_config
+    fi
 }
 
 remove_bot() {
@@ -187,7 +192,7 @@ view_logs() {
 
 manage_admins() {
     local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
-    echo -e "Current Admins: ${YELLOW}${current_admins:-None}${NC}" # <--- اصلاح شد
+    echo -e "Current Admins: ${YELLOW}${current_admins:-None}${NC}"
     read -rp "1) Add Admin, 2) Remove Admin, 3) Back: " choice
     case $choice in
         1)
@@ -212,7 +217,7 @@ manage_admins() {
 manage_cf_accounts() {
     local current_accounts=$(read_env_var "CF_ACCOUNTS")
     echo "Current Cloudflare Accounts:"
-    echo -e "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n' # <--- اصلاح شد
+    echo -e "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n'
     read -rp "1) Add Account, 2) Remove Account (by nickname), 3) Back: " choice
     case $choice in
         1)
@@ -241,21 +246,23 @@ edit_config() {
     if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}Bot is not installed.${NC}"; return; fi
     cd "$HOME/$PROJECT_DIR" || exit
 
+    local config_changed=0
     while true; do
         echo -e "\n${BLUE}--- Edit Configuration ---${NC}"
         echo "1) Manage Admins"
         echo "2) Manage Cloudflare Accounts"
         echo "3) Edit Telegram Bot Token"
-        echo "4) Back to Main Menu"
+        echo "4) Done - Apply Changes and Restart"
         read -rp "Choose an option: " choice
         case $choice in
-            1) manage_admins;;
-            2) manage_cf_accounts;;
+            1) manage_admins; config_changed=1;;
+            2) manage_cf_accounts; config_changed=1;;
             3)
                 read -rp "Enter the new Telegram Bot Token: " new_bot_token
                 if [ -n "$new_bot_token" ]; then
                     write_env_var "TELEGRAM_BOT_TOKEN" "$new_bot_token"
                     echo -e "${GREEN}Bot Token updated.${NC}"
+                    config_changed=1
                 else
                     echo -e "${RED}Bot Token cannot be empty.${NC}"
                 fi
@@ -264,9 +271,15 @@ edit_config() {
             *) echo -e "${RED}Invalid option.${NC}";;
         esac
     done
-    echo -e "${YELLOW}Restarting the bot to apply changes...${NC}"
-    docker-compose restart
-    echo -e "\n${GREEN}✅ Configuration updated and bot restarted!${NC}"
+    
+    if [ "$config_changed" -eq 1 ]; then
+        echo -e "${YELLOW}Recreating the container to apply changes...${NC}"
+        docker-compose down
+        docker-compose up -d
+        echo -e "\n${GREEN}✅ Configuration updated and bot restarted!${NC}"
+    else
+        echo -e "${BLUE}No changes made. Bot was not restarted.${NC}"
+    fi
 }
 
 # --- Main Menu ---
