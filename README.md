@@ -22,6 +22,16 @@ A powerful, multi-user, multi-account Telegram bot for managing your Cloudflare 
 
 ---
 
+<div align="center">
+  <h3>💖 Show Your Support</h3>
+  <p>If this project has been helpful, please give it a star on GitHub to show your appreciation!</p>
+  <a href="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot/stargazers">
+    <img src="https://img.shields.io/github/stars/ExPLoSiVe1988/cloudflare-telegram-bot?style=for-the-badge&logo=github&color=FFDD00&logoColor=black" alt="Star the project on GitHub">
+  </a>
+</div>
+
+---
+
 ## 🚀 Installation
 
 This bot is designed to run with Docker. The provided script automates the entire setup process.
