@@ -107,6 +107,7 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 ### 👨‍💻 توسعه‌دهنده و حمایت مالی
 *   گیت‌هاب: [@ExPLoSiVe1988](https://www.google.com/url?sa=E&q=https%3A%2F%2Fgithub.com%2FExPLoSiVe1988%2Fcloudflare-telegram-bot)
 *   تلگرام: [@H_ExPLoSiVe](https://t.me/H_ExPLoSiVe)
+*   کانال تلگرام: [@Botgineer](https://t.me/Botgineer)
 ---
 ### 💖 حمایت مالی (Donate)
 اگر این پروژه برای شما مفید بوده است، با حمایت مالی خود به توسعه آن کمک کنید:
