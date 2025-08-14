@@ -8,8 +8,12 @@
 A powerful, multi-user, multi-account Telegram bot for managing your Cloudflare DNS records. Fully containerized with Docker for an incredibly simple and fast deployment.
 
 ---
-🎥 [Watch the full installation and setup video on YouTube.](https://www.youtube.com/watch?v=OOQ9rtHqeFQ)
----
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=OOQ9rtHqeFQ" target="_blank">
+    <img src="https://img.youtube.com/vi/OOQ9rtHqeFQ/hqdefault.jpg" alt="Watch the video tutorial" width="320">
+  </a>
+  <p><strong>Click the image above to watch the full video tutorial on YouTube</strong></p>
+</div>
 
 ## ✨ Features
 *   **👥 Multi-Admin Support:** Authorize multiple Telegram users to manage the bot.
