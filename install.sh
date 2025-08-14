@@ -73,7 +73,8 @@ get_user_input() {
     echo -e "\n${YELLOW}--- Admin Configuration ---${NC}"
     local admin_ids=""
     while true; do
-        read -rp "Enter a Telegram Admin ID (leave empty to finish): " admin_id
+        echo -e -n "Enter a Telegram Admin ID (leave empty to finish): "
+        read admin_id
         if [ -z "$admin_id" ]; then break; fi
         if [[ ! "$admin_id" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Please enter numbers only.${NC}"; continue; fi
         if [ -z "$admin_ids" ]; then admin_ids="$admin_id"; else admin_ids="$admin_ids,$admin_id"; fi
@@ -85,19 +86,21 @@ get_user_input() {
     local count=1
     while true; do
         echo -e "${BLUE}Configuring Cloudflare Account #$count...${NC}"
-        while true; do read -rp "Enter a nickname for this account (e.g., Personal, Work): " nickname; if [ -n "$nickname" ]; then break; fi; echo -e "${RED}Nickname cannot be empty.${NC}"; done
-        while true; do read -rp "Enter the API Token for '$nickname': " token; if [ -n "$token" ]; then break; fi; echo -e "${RED}Token cannot be empty.${NC}"; done
+        while true; do echo -e -n "Enter a nickname for this account (e.g., Personal, Work): "; read nickname; if [ -n "$nickname" ]; then break; fi; echo -e "${RED}Nickname cannot be empty.${NC}"; done
+        while true; do echo -e -n "Enter the API Token for '$nickname': "; read token; if [ -n "$token" ]; then break; fi; echo -e "${RED}Token cannot be empty.${NC}"; done
         
         if [ -z "$cf_accounts" ]; then cf_accounts="$nickname:$token"; else cf_accounts="$cf_accounts,$nickname:$token"; fi
         
-        read -rp "Add another Cloudflare account? (y/n): " add_another
+        echo -e -n "Add another Cloudflare account? (y/n): "
+        read add_another
         if [[ $add_another != [Yy]* ]]; then break; fi
         count=$((count + 1))
     done
     if [ -z "$cf_accounts" ]; then echo -e "${RED}❌ Error: At least one Cloudflare Account is required. Aborting.${NC}"; exit 1; fi
     
     echo -e "\n${YELLOW}Creating .env file...${NC}"
-    read -rp "Enter your Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+    echo -e -n "Enter your Telegram Bot Token: "
+    read TELEGRAM_BOT_TOKEN
     if [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo -e "${RED}❌ Error: Telegram Bot Token is required. Aborting.${NC}"; exit 1; fi
 
     cat > ".env" <<EOF
@@ -115,7 +118,8 @@ EOF
 install_bot() {
     print_header
     if [ -d "$HOME/$PROJECT_DIR" ]; then
-        read -rp "${YELLOW}⚠️ Project directory already exists. Do you want to remove it and re-install? (y/n): ${NC}" re_install
+        echo -e -n "${YELLOW}⚠️ Project directory already exists. Do you want to remove it and re-install? (y/n): ${NC}"
+        read re_install
         if [[ $re_install == [Yy]* ]]; then
             remove_bot
         else
@@ -152,7 +156,7 @@ EOF
 
 update_bot() {
     print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed.${NC}"; return; fi
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"; return; fi
     cd "$HOME/$PROJECT_DIR" || exit
     
     echo -e "${YELLOW}Pulling the latest bot image from Docker Hub...${NC}"
@@ -163,7 +167,8 @@ update_bot() {
     
     echo -e "\n${GREEN}✅ Bot code updated successfully!${NC}"
     
-    read -rp "Do you want to edit your Admins or Cloudflare Accounts now? (y/n): " edit_now
+    echo -e -n "Do you want to edit your Admins or Cloudflare Accounts now? (y/n): "
+    read edit_now
     if [[ $edit_now == [Yy]* ]]; then
         edit_config
     fi
@@ -175,6 +180,9 @@ remove_bot() {
     cd "$HOME/$PROJECT_DIR" || exit
     
     echo -e "${YELLOW}Stopping and removing Docker containers and images...${NC}"
+    if [ ! -f ".env" ]; then
+        touch .env
+    fi
     docker-compose down --rmi all -v
     
     cd ~
@@ -193,17 +201,20 @@ view_logs() {
 manage_admins() {
     local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
     echo -e "Current Admins: ${YELLOW}${current_admins:-None}${NC}"
-    read -rp "1) Add Admin, 2) Remove Admin, 3) Back: " choice
+    echo -e -n "1) Add Admin, 2) Remove Admin, 3) Back: "
+    read choice
     case $choice in
         1)
-            read -rp "Enter new Admin ID to add: " new_admin
+            echo -e -n "Enter new Admin ID to add: "
+            read new_admin
             if ! [[ "$new_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID.${NC}"; return; fi
             if [ -z "$current_admins" ]; then new_list="$new_admin"; else new_list="$current_admins,$new_admin"; fi
             write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
             echo -e "${GREEN}Admin added.${NC}"
             ;;
         2)
-            read -rp "Enter Admin ID to remove: " remove_admin
+            echo -e -n "Enter Admin ID to remove: "
+            read remove_admin
             if ! [[ "$remove_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID.${NC}"; return; fi
             new_list=$(echo "$current_admins" | tr ',' '\n' | grep -v "^$remove_admin$" | tr '\n' ',' | sed 's/,$//')
             write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
@@ -218,11 +229,14 @@ manage_cf_accounts() {
     local current_accounts=$(read_env_var "CF_ACCOUNTS")
     echo "Current Cloudflare Accounts:"
     echo -e "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n'
-    read -rp "1) Add Account, 2) Remove Account (by nickname), 3) Back: " choice
+    echo -e -n "1) Add Account, 2) Remove Account (by nickname), 3) Back: "
+    read choice
     case $choice in
         1)
-            read -rp "Enter a nickname for the new account: " new_nickname
-            read -rp "Enter the API Token for '$new_nickname': " new_token
+            echo -e -n "Enter a nickname for the new account: "
+            read new_nickname
+            echo -e -n "Enter the API Token for '$new_nickname': "
+            read new_token
             if [ -z "$new_nickname" ] || [ -z "$new_token" ]; then echo -e "${RED}Nickname and Token cannot be empty.${NC}"; return; fi
             new_entry="$new_nickname:$new_token"
             if [ -z "$current_accounts" ]; then new_list="$new_entry"; else new_list="$current_accounts,$new_entry"; fi
@@ -230,7 +244,8 @@ manage_cf_accounts() {
             echo -e "${GREEN}Account added.${NC}"
             ;;
         2)
-            read -rp "Enter the nickname of the account to remove: " remove_nickname
+            echo -e -n "Enter the nickname of the account to remove: "
+            read remove_nickname
             if [ -z "$remove_nickname" ]; then echo -e "${RED}Nickname cannot be empty.${NC}"; return; fi
             new_list=$(echo "$current_accounts" | tr ',' '\n' | grep -v "^$remove_nickname:" | tr '\n' ',' | sed 's/,$//')
             write_env_var "CF_ACCOUNTS" "$new_list"
@@ -253,12 +268,14 @@ edit_config() {
         echo "2) Manage Cloudflare Accounts"
         echo "3) Edit Telegram Bot Token"
         echo "4) Done - Apply Changes and Restart"
-        read -rp "Choose an option: " choice
+        echo -e -n "Choose an option: "
+        read choice
         case $choice in
             1) manage_admins; config_changed=1;;
             2) manage_cf_accounts; config_changed=1;;
             3)
-                read -rp "Enter the new Telegram Bot Token: " new_bot_token
+                echo -e -n "Enter the new Telegram Bot Token: "
+                read new_bot_token
                 if [ -n "$new_bot_token" ]; then
                     write_env_var "TELEGRAM_BOT_TOKEN" "$new_bot_token"
                     echo -e "${GREEN}Bot Token updated.${NC}"
@@ -292,7 +309,8 @@ main_menu() {
         echo "4) View Live Logs"
         echo "5) Remove Bot Completely"
         echo "6) Exit"
-        read -rp "Choose an option: " choice
+        echo -e -n "Choose an option: "
+        read choice
         case $choice in
             1) install_bot; break ;;
             2) update_bot; break ;;
