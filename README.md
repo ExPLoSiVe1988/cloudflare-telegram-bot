@@ -25,8 +25,9 @@ A powerful, multi-user, multi-account Telegram bot for managing your Cloudflare 
 *   **🏢 Multi-Account Support:** Manage DNS records across multiple Cloudflare accounts, each with its own API token.
 *   **🐳 Easy Docker Deployment:** Get the bot running in minutes with a fully automated installation script.
 *   **🌐 Multi-Zone Support:** Automatically detects all zones within the selected Cloudflare account.
+*   **🔎 Advanced Search:** Instantly find any DNS record via the search menu. Supports searching by partial record name or by exact IP address.
 *   **👥 Bulk Actions:** Select multiple records to delete or change their IP address all at once.
-*   **💾 Backup & Restore:** Create and restore `.json` backups for any of your zones.
+*   **💾 Backup & Restore:** Create and restore .json backups for any of your zones.
 *   **🌍 Multi-Language:** Full support for English and Persian (فارسی).
 
 ---
