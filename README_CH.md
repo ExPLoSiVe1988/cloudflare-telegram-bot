@@ -1,6 +1,6 @@
-<!-- Chinese README link -->
-<div align="right">
-  <a href="README-CH.md">🇨🇳 中文版</a>
+<!-- English README link -->
+<div align="left">
+  <a href="README.md">🇬🇧 English Version</a>
 </div>
 
 # Cloudflare 管理机器人 🐳
