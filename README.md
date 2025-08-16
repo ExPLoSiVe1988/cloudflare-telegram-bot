@@ -1,6 +1,11 @@
 <!-- Persian README link -->
 <div align="right">
   <a href="README-FA.md">🇮🇷 نسخه فارسی</a>
+</div> <br>
+<!-- Chinese README link -->
+
+<div align="right">
+  <a href="README-CH.md">🇨🇳 中文版</a>
 </div>
 
 # Cloudflare Management Bot 🐳
