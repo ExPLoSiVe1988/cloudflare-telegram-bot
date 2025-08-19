@@ -1,5 +1,6 @@
 services:
   cfbot:
+    build: .
     image: explosive1988/cfbot:latest 
     container_name: cfbot
     env_file:
