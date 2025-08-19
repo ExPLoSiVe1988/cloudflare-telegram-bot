@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # --- Configuration ---
+REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
 PROJECT_DIR="cloudflare-telegram-bot"
 IMAGE_NAME="explosive1988/cfbot:latest"
 
@@ -128,14 +129,15 @@ install_bot() {
         fi
     fi
     
-    echo -e "${YELLOW}Creating project directory at ~/$PROJECT_DIR...${NC}"
-    mkdir -p "$HOME/$PROJECT_DIR"
+    echo -e "${YELLOW}Cloning repository from GitHub...${NC}"
+    git clone "$REPO_URL" "$HOME/$PROJECT_DIR"
     cd "$HOME/$PROJECT_DIR" || exit
 
-    echo -e "${YELLOW}Creating docker-compose.yml file...${NC}"
+    echo -e "${YELLOW}Ensuring docker-compose is set to build locally...${NC}"
     cat > "docker-compose.yml" <<EOF
 services:
   cfbot:
+    build: .
     image: ${IMAGE_NAME}
     container_name: cfbot
     restart: unless-stopped
@@ -147,27 +149,38 @@ EOF
 
     get_user_input
 
-    echo -e "${YELLOW}Pulling the latest bot image from Docker Hub and starting...${NC}"
-    docker-compose up -d
+    echo -e "${YELLOW}Building the Docker image locally and starting... This may take a few minutes.${NC}"
+    docker-compose up --build -d
     
     echo -e "\n${GREEN}✅ Bot installed and started successfully!${NC}"
-    echo -e "${BLUE}Use 'View Logs' from the main script to check the status.${NC}"
 }
 
 update_bot() {
     print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"; return; fi
+    if [ ! -d "$HOME/$PROJECT_DIR" ]; then 
+        echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"
+        return
+    fi
     cd "$HOME/$PROJECT_DIR" || exit
     
-    echo -e "${YELLOW}Pulling the latest bot image from Docker Hub...${NC}"
-    docker-compose pull
+    # --- >> NEW: Check for .env file before proceeding << ---
+    if [ ! -f ".env" ]; then
+        echo -e "${RED}❌ Error: .env file not found! Configuration is missing.${NC}"
+        echo -e "${YELLOW}Please run the 'Edit Configuration' option from the main menu to create it.${NC}"
+        return
+    fi
     
-    echo -e "${YELLOW}Recreating the container with the new image...${NC}"
-    docker-compose up -d --force-recreate
+    echo -e "${YELLOW}Pulling latest changes from GitHub...${NC}"
+    # A safer way to pull changes without affecting local files like .env
+    git config pull.rebase false # Use merge strategy
+    git pull origin main
     
-    echo -e "\n${GREEN}✅ Bot code updated successfully!${NC}"
+    echo -e "${YELLOW}Re-building the Docker image with new code...${NC}"
+    docker-compose up --build -d
     
-    echo -e -n "Do you want to edit your Admins or Cloudflare Accounts now? (y/n): "
+    echo -e "\n${GREEN}✅ Bot updated successfully!${NC}"
+    
+    echo -e -n "Do you want to edit your configuration now? (y/n): "
     read edit_now
     if [[ $edit_now == [Yy]* ]]; then
         edit_config
