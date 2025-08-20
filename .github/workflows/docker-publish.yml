@@ -30,6 +30,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Set Docker tags
+        id: set-tags
+        run: |
+          echo "LATEST_TAG=explosive1988/cfbot:latest" >> $GITHUB_ENV
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            echo "VERSION_TAG=explosive1988/cfbot:${VERSION}" >> $GITHUB_ENV
+          else
+            echo "VERSION_TAG=" >> $GITHUB_ENV
+          fi
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -37,5 +48,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            explosive1988/cfbot:latest
-            ${{ startsWith(github.ref, 'refs/tags/v') && 'explosive1988/cfbot:' + github.ref_name || '' }}
+            ${{ env.LATEST_TAG }}
+            ${{ env.VERSION_TAG }}
