@@ -89,16 +89,16 @@ get_user_input() {
         echo -e "${BLUE}Configuring Cloudflare Account #$count...${NC}"
         while true; do echo -e -n "Enter a nickname for this account (e.g., Personal, Work): "; read nickname; if [ -n "$nickname" ]; then break; fi; echo -e "${RED}Nickname cannot be empty.${NC}"; done
         while true; do echo -e -n "Enter the API Token for '$nickname': "; read token; if [ -n "$token" ]; then break; fi; echo -e "${RED}Token cannot be empty.${NC}"; done
-        
+
         if [ -z "$cf_accounts" ]; then cf_accounts="$nickname:$token"; else cf_accounts="$cf_accounts,$nickname:$token"; fi
-        
+
         echo -e -n "Add another Cloudflare account? (y/n): "
         read add_another
         if [[ $add_another != [Yy]* ]]; then break; fi
         count=$((count + 1))
     done
     if [ -z "$cf_accounts" ]; then echo -e "${RED}❌ Error: At least one Cloudflare Account is required. Aborting.${NC}"; exit 1; fi
-    
+
     echo -e "\n${YELLOW}Creating .env file...${NC}"
     echo -e -n "Enter your Telegram Bot Token: "
     read TELEGRAM_BOT_TOKEN
@@ -128,16 +128,15 @@ install_bot() {
             return
         fi
     fi
-    
+
     echo -e "${YELLOW}Cloning repository from GitHub...${NC}"
     git clone "$REPO_URL" "$HOME/$PROJECT_DIR"
     cd "$HOME/$PROJECT_DIR" || exit
 
-    echo -e "${YELLOW}Ensuring docker-compose is set to build locally...${NC}"
+    echo -e "${YELLOW}Creating docker-compose.yml to use pre-built Docker image...${NC}"
     cat > "docker-compose.yml" <<EOF
 services:
   cfbot:
-    build: .
     image: ${IMAGE_NAME}
     container_name: cfbot
     restart: unless-stopped
@@ -149,10 +148,11 @@ EOF
 
     get_user_input
 
-    echo -e "${YELLOW}Building the Docker image locally and starting... This may take a few minutes.${NC}"
-    docker-compose up --build -d
-    
-    echo -e "\n${GREEN}✅ Bot installed and started successfully!${NC}"
+    echo -e "${YELLOW}Pulling the latest Docker image and starting the container...${NC}"
+    docker-compose pull
+    docker-compose up -d
+
+    echo -e "\n${GREEN}✅ Bot installed and started successfully using the pre-built image!${NC}"
 }
 
 update_bot() {
@@ -162,24 +162,19 @@ update_bot() {
         return
     fi
     cd "$HOME/$PROJECT_DIR" || exit
-    
-    # --- >> NEW: Check for .env file before proceeding << ---
+
     if [ ! -f ".env" ]; then
         echo -e "${RED}❌ Error: .env file not found! Configuration is missing.${NC}"
         echo -e "${YELLOW}Please run the 'Edit Configuration' option from the main menu to create it.${NC}"
         return
     fi
-    
-    echo -e "${YELLOW}Pulling latest changes from GitHub...${NC}"
-    # A safer way to pull changes without affecting local files like .env
-    git config pull.rebase false # Use merge strategy
-    git pull origin main
-    
-    echo -e "${YELLOW}Re-building the Docker image with new code...${NC}"
-    docker-compose up --build -d
-    
+
+    echo -e "${YELLOW}Pulling latest Docker image...${NC}"
+    docker-compose pull
+    docker-compose up -d
+
     echo -e "\n${GREEN}✅ Bot updated successfully!${NC}"
-    
+
     echo -e -n "Do you want to edit your configuration now? (y/n): "
     read edit_now
     if [[ $edit_now == [Yy]* ]]; then
@@ -191,13 +186,10 @@ remove_bot() {
     print_header
     if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed.${NC}"; return; fi
     cd "$HOME/$PROJECT_DIR" || exit
-    
-    echo -e "${YELLOW}Stopping and removing Docker containers and images...${NC}"
-    if [ ! -f ".env" ]; then
-        touch .env
-    fi
-    docker-compose down --rmi all -v
-    
+
+    echo -e "${YELLOW}Stopping and removing Docker containers...${NC}"
+    docker-compose down -v
+
     cd ~
     rm -rf "$PROJECT_DIR"
     echo -e "\n${GREEN}✅ Bot and all associated data have been completely removed.${NC}"
@@ -301,7 +293,7 @@ edit_config() {
             *) echo -e "${RED}Invalid option.${NC}";;
         esac
     done
-    
+
     if [ "$config_changed" -eq 1 ]; then
         echo -e "${YELLOW}Recreating the container to apply changes...${NC}"
         docker-compose down
