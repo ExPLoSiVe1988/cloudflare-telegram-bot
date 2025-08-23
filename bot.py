@@ -996,9 +996,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == 'check_port':
             if not text.isdigit() or not (1 <= int(text) <= 65535): await update.message.reply_text(get_text('messages.invalid_port', lang)); return
             data['check_port'] = int(text)
+            context.user_data['add_policy_step'] = 'failover_minutes'
+            await update.message.reply_text(get_text('prompts.enter_failover_minutes', lang))
+        
+        elif step == 'failover_minutes':
+            if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
+                await update.message.reply_text("Please enter a valid positive number for minutes."); return
+            data['failover_minutes'] = float(text)
             context.user_data['add_policy_step'] = 'account_nickname'
             buttons = [[InlineKeyboardButton(nickname, callback_data=f"policy_set_account|{nickname}")] for nickname in CF_ACCOUNTS.keys()]
             await update.message.reply_text(get_text('prompts.choose_cf_account', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
         elif step == 'failback_minutes':
             if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
                 await update.message.reply_text("Please enter a valid positive number for minutes."); return
