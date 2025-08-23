@@ -1,334 +1,290 @@
 #!/bin/bash
 
-# --- Configuration ---
-REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
-PROJECT_DIR="cloudflare-telegram-bot"
-IMAGE_NAME="explosive1988/cfbot:latest"
-
-# --- Colors ---
+# --- Colors for better output ---
 GREEN='\033[0;32m'
-RED='\033[0;31m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+RED='\033[0;31m'
 NC='\033[0m'
 
-# --- Stop script on any error ---
-set -e
+# --- Core Variables ---
+REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
+PROJECT_DIR="cloudflare-telegram-bot"
+ENV_FILE="$PROJECT_DIR/.env"
+CONFIG_FILE="$PROJECT_DIR/config.json"
 
-# --- Helper Functions ---
+# Function to display a header
 print_header() {
     clear
     echo -e "${GREEN}############################################################${NC}"
     echo -e "${GREEN}##                                                        ##${NC}"
     echo -e "${GREEN} ##              Cloudflare-Telegram-Bot                 ##${NC}"
-    echo -e "${GREEN}  ##             Multi-Account Installer                ##${NC}"
+    echo -e "${GREEN}  ##        Intelligent Failover & DNS Manager          ##${NC}"
     echo -e "${GREEN} ##       Powered by @H_ExPLoSiVe (ExPLoSiVe1988)        ##${NC}"
-    echo -e "${GREEN}##                                                         ##${NC}"
+    echo -e "${GREEN}##                                                        ##${NC}"
     echo -e "${GREEN}############################################################${NC}"
     echo ""
 }
 
-check_docker() {
-    echo -e "${YELLOW}>>> Checking for Docker and Docker Compose...${NC}"
-    if ! command -v docker &> /dev/null; then
-        echo "Docker not found. Attempting to install..."
-        sudo apt-get update -y && sudo apt-get install -y curl
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sudo sh get-docker.sh
-        sudo usermod -aG docker "$USER"
-        echo -e "${GREEN}Docker installed successfully. You might need to log out and log back in for group changes to take effect.${NC}"
-    else
-        echo -e "${GREEN}Docker is already installed.${NC}"
-    fi
-
-    if ! command -v docker-compose &> /dev/null; then
-        echo "Docker Compose not found. Attempting to install..."
-        sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        sudo chmod +x /usr/local/bin/docker-compose
-        echo -e "${GREEN}Docker Compose installed successfully.${NC}"
-    else
-        echo -e "${GREEN}Docker Compose is already installed.${NC}"
-    fi
-}
-
 read_env_var() {
-    local var_name=$1
-    if [ -f ".env" ]; then
-        grep "^${var_name}=" ".env" | cut -d '=' -f2-
-    fi
+    grep "^${1}=" "$ENV_FILE" | cut -d'=' -f2-
 }
 
 write_env_var() {
-    local var_name=$1
-    local new_value=$2
-    if [ -f ".env" ]; then
-        if grep -q "^${var_name}=" ".env"; then
-            sed -i "/^${var_name}=/c\\${var_name}=${new_value}" ".env"
-        else
-            echo "${var_name}=${new_value}" >> ".env"
-        fi
+    if grep -q "^${1}=" "$ENV_FILE"; then
+        sed -i "s|^${1}=.*|${1}=${2}|" "$ENV_FILE"
+    else
+        echo "${1}=${2}" >> "$ENV_FILE"
     fi
 }
 
-get_user_input() {
-    echo -e "\n${YELLOW}--- Admin Configuration ---${NC}"
-    local admin_ids=""
-    while true; do
-        echo -e -n "Enter a Telegram Admin ID (leave empty to finish): "
-        read admin_id
-        if [ -z "$admin_id" ]; then break; fi
-        if [[ ! "$admin_id" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Please enter numbers only.${NC}"; continue; fi
-        if [ -z "$admin_ids" ]; then admin_ids="$admin_id"; else admin_ids="$admin_ids,$admin_id"; fi
-    done
-    if [ -z "$admin_ids" ]; then echo -e "${RED}❌ Error: At least one Admin ID is required. Aborting.${NC}"; exit 1; fi
-
-    echo -e "\n${YELLOW}--- Cloudflare Account Configuration ---${NC}"
-    local cf_accounts=""
-    local count=1
-    while true; do
-        echo -e "${BLUE}Configuring Cloudflare Account #$count...${NC}"
-        while true; do echo -e -n "Enter a nickname for this account (e.g., Personal, Work): "; read nickname; if [ -n "$nickname" ]; then break; fi; echo -e "${RED}Nickname cannot be empty.${NC}"; done
-        while true; do echo -e -n "Enter the API Token for '$nickname': "; read token; if [ -n "$token" ]; then break; fi; echo -e "${RED}Token cannot be empty.${NC}"; done
-
-        if [ -z "$cf_accounts" ]; then cf_accounts="$nickname:$token"; else cf_accounts="$cf_accounts,$nickname:$token"; fi
-
-        echo -e -n "Add another Cloudflare account? (y/n): "
-        read add_another
-        if [[ $add_another != [Yy]* ]]; then break; fi
-        count=$((count + 1))
-    done
-    if [ -z "$cf_accounts" ]; then echo -e "${RED}❌ Error: At least one Cloudflare Account is required. Aborting.${NC}"; exit 1; fi
-
-    echo -e "\n${YELLOW}Creating .env file...${NC}"
-    echo -e -n "Enter your Telegram Bot Token: "
-    read TELEGRAM_BOT_TOKEN
-    if [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo -e "${RED}❌ Error: Telegram Bot Token is required. Aborting.${NC}"; exit 1; fi
-
-    cat > ".env" <<EOF
-# Comma-separated list of Telegram Admin IDs
-TELEGRAM_ADMIN_IDS=${admin_ids}
-# Comma-separated list of Cloudflare accounts in format: Nickname1:Token1,Nickname2:Token2
-CF_ACCOUNTS=${cf_accounts}
-# The main bot token
-TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-EOF
-    echo -e "${GREEN}.env file created successfully.${NC}"
-}
-
-# --- Main Functions ---
-install_bot() {
-    print_header
-    if [ -d "$HOME/$PROJECT_DIR" ]; then
-        echo -e -n "${YELLOW}⚠️ Project directory already exists. Do you want to remove it and re-install? (y/n): ${NC}"
-        read re_install
-        if [[ $re_install == [Yy]* ]]; then
-            remove_bot
-        else
-            echo -e "${BLUE}Installation cancelled.${NC}"
-            return
-        fi
-    fi
-
-    echo -e "${YELLOW}Cloning repository from GitHub...${NC}"
-    git clone "$REPO_URL" "$HOME/$PROJECT_DIR"
-    cd "$HOME/$PROJECT_DIR" || exit
-
-    echo -e "${YELLOW}Creating docker-compose.yml to use pre-built Docker image...${NC}"
-    cat > "docker-compose.yml" <<EOF
-services:
-  cfbot:
-    image: ${IMAGE_NAME}
-    container_name: cfbot
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./backups:/app/backups
-EOF
-
-    get_user_input
-
-    echo -e "${YELLOW}Pulling the latest Docker image and starting the container...${NC}"
-    docker-compose pull
-    docker-compose up -d
-
-    echo -e "\n${GREEN}✅ Bot installed and started successfully using the pre-built image!${NC}"
-}
-
-update_bot() {
-    print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then 
-        echo -e "${RED}❌ Bot is not installed. Please use the install option first.${NC}"
-        return
-    fi
-    cd "$HOME/$PROJECT_DIR" || exit
-
-    if [ ! -f ".env" ]; then
-        echo -e "${RED}❌ Error: .env file not found! Configuration is missing.${NC}"
-        echo -e "${YELLOW}Please run the 'Edit Configuration' option from the main menu to create it.${NC}"
-        return
-    fi
-
-    echo -e "${YELLOW}Pulling latest Docker image...${NC}"
-    docker-compose pull
-    docker-compose up -d
-
-    echo -e "\n${GREEN}✅ Bot updated successfully!${NC}"
-
-    echo -e -n "Do you want to edit your configuration now? (y/n): "
-    read edit_now
-    if [[ $edit_now == [Yy]* ]]; then
-        edit_config
+prompt_for_changes() {
+    read -p "Apply these changes and restart the bot? (y/n): " confirm_restart
+    if [[ "$confirm_restart" == "y" || "$confirm_restart" == "Y" ]]; then
+        echo -e "${GREEN}Restarting the bot to apply changes...${NC}"
+        cd "$PROJECT_DIR" && docker-compose restart && cd ..
+        echo -e "${GREEN}Bot restarted successfully.${NC}"
+    else
+        echo -e "${YELLOW}Changes saved, but bot was not restarted. Please restart manually to apply.${NC}"
     fi
 }
 
-remove_bot() {
-    print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed.${NC}"; return; fi
-    cd "$HOME/$PROJECT_DIR" || exit
-
-    echo -e "${YELLOW}Stopping and removing Docker containers...${NC}"
-    docker-compose down -v
-
-    cd ~
-    rm -rf "$PROJECT_DIR"
-    echo -e "\n${GREEN}✅ Bot and all associated data have been completely removed.${NC}"
-}
-
-view_logs() {
-    print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}❌ Bot is not installed.${NC}"; return; fi
-    echo -e "${YELLOW}Showing live logs... (Press Ctrl+C to exit)${NC}"
-    cd "$HOME/$PROJECT_DIR" || exit
-    docker-compose logs -f
-}
+# --- Configuration Management Functions ---
 
 manage_admins() {
     local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
-    echo -e "Current Admins: ${YELLOW}${current_admins:-None}${NC}"
-    echo -e -n "1) Add Admin, 2) Remove Admin, 3) Back: "
-    read choice
+    echo -e "\nCurrent Admins: ${YELLOW}${current_admins:-None}${NC}"
+    echo "1) Add Admin ID"
+    echo "2) Remove Admin ID"
+    echo "3) Back"
+    read -p "Choose an option: " choice
     case $choice in
         1)
-            echo -e -n "Enter new Admin ID to add: "
-            read new_admin
-            if ! [[ "$new_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID.${NC}"; return; fi
-            if [ -z "$current_admins" ]; then new_list="$new_admin"; else new_list="$current_admins,$new_admin"; fi
-            write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
-            echo -e "${GREEN}Admin added.${NC}"
+            read -p "Enter new Admin ID to add: " new_admin
+            if ! [[ "$new_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Must be a number.${NC}"; return; fi
+            if [[ ",$current_admins," == *",$new_admin,"* ]]; then
+                echo -e "${YELLOW}Admin ID $new_admin already exists.${NC}"
+            else
+                if [ -z "$current_admins" ]; then new_list="$new_admin"; else new_list="$current_admins,$new_admin"; fi
+                write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
+                echo -e "${GREEN}Admin $new_admin added.${NC}"
+            fi
             ;;
         2)
-            echo -e -n "Enter Admin ID to remove: "
-            read remove_admin
-            if ! [[ "$remove_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID.${NC}"; return; fi
-            new_list=$(echo "$current_admins" | tr ',' '\n' | grep -v "^$remove_admin$" | tr '\n' ',' | sed 's/,$//')
-            write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
-            echo -e "${GREEN}Admin removed.${NC}"
+            read -p "Enter Admin ID to remove: " remove_admin
+            if ! [[ "$remove_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Must be a number.${NC}"; return; fi
+            new_list=$(echo ",$current_admins," | sed "s/,$remove_admin,/,/" | sed 's/^,//;s/,$//')
+            if [ "$new_list" == "$current_admins" ]; then
+                echo -e "${RED}Admin ID $remove_admin not found.${NC}"
+            else
+                write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
+                echo -e "${GREEN}Admin $remove_admin removed.${NC}"
+            fi
             ;;
         3) return;;
         *) echo -e "${RED}Invalid option.${NC}";;
     esac
+    read -p "Press Enter to continue..."
 }
 
 manage_cf_accounts() {
     local current_accounts=$(read_env_var "CF_ACCOUNTS")
-    echo "Current Cloudflare Accounts:"
-    echo -e "${YELLOW}${current_accounts:-None}${NC}" | tr ',' '\n'
-    echo -e -n "1) Add Account, 2) Remove Account (by nickname), 3) Back: "
-    read choice
+    echo -e "\nCurrent Cloudflare Accounts:"
+    if [ -z "$current_accounts" ]; then
+        echo -e "${YELLOW}None${NC}"
+    else
+        echo -e "${YELLOW}${current_accounts}${NC}" | tr ',' '\n'
+    fi
+    echo ""
+    echo "1) Add Account"
+    echo "2) Remove Account (by nickname)"
+    echo "3) Back"
+    read -p "Choose an option: " choice
     case $choice in
         1)
-            echo -e -n "Enter a nickname for the new account: "
-            read new_nickname
-            echo -e -n "Enter the API Token for '$new_nickname': "
-            read new_token
+            read -p "Enter a nickname for the new account: " new_nickname
+            read -p "Enter the API Token for '$new_nickname': " new_token
             if [ -z "$new_nickname" ] || [ -z "$new_token" ]; then echo -e "${RED}Nickname and Token cannot be empty.${NC}"; return; fi
             new_entry="$new_nickname:$new_token"
             if [ -z "$current_accounts" ]; then new_list="$new_entry"; else new_list="$current_accounts,$new_entry"; fi
             write_env_var "CF_ACCOUNTS" "$new_list"
-            echo -e "${GREEN}Account added.${NC}"
+            echo -e "${GREEN}Account '$new_nickname' added.${NC}"
             ;;
         2)
-            echo -e -n "Enter the nickname of the account to remove: "
-            read remove_nickname
+            read -p "Enter the nickname of the account to remove: " remove_nickname
             if [ -z "$remove_nickname" ]; then echo -e "${RED}Nickname cannot be empty.${NC}"; return; fi
-            new_list=$(echo "$current_accounts" | tr ',' '\n' | grep -v "^$remove_nickname:" | tr '\n' ',' | sed 's/,$//')
-            write_env_var "CF_ACCOUNTS" "$new_list"
-            echo -e "${GREEN}Account removed.${NC}"
+            new_list=$(echo ",$current_accounts," | sed "s/,$remove_nickname:[^,]*,/,/" | sed 's/^,//;s/,$//')
+            if [ "$new_list" == "$current_accounts" ]; then
+                echo -e "${RED}Account with nickname '$remove_nickname' not found.${NC}"
+            else
+                write_env_var "CF_ACCOUNTS" "$new_list"
+                echo -e "${GREEN}Account '$remove_nickname' removed.${NC}"
+            fi
             ;;
         3) return;;
         *) echo -e "${RED}Invalid option.${NC}";;
     esac
+    read -p "Press Enter to continue..."
 }
 
 edit_config() {
-    print_header
-    if [ ! -d "$HOME/$PROJECT_DIR" ]; then echo -e "${RED}Bot is not installed.${NC}"; return; fi
-    cd "$HOME/$PROJECT_DIR" || exit
+    if [ ! -f "$ENV_FILE" ]; then
+        echo -e "${RED}No .env file found. Please install the bot first.${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
 
-    local config_changed=0
+    local config_changed=false
     while true; do
-        echo -e "\n${BLUE}--- Edit Configuration ---${NC}"
+        print_header
+        echo -e "${YELLOW}--- Edit Core Configuration (.env) ---${NC}"
         echo "1) Manage Admins"
         echo "2) Manage Cloudflare Accounts"
         echo "3) Edit Telegram Bot Token"
-        echo "4) Done - Apply Changes and Restart"
-        echo -e -n "Choose an option: "
-        read choice
+        echo "4) Back to Main Menu"
+        read -p "Choose an option: " choice
+        
         case $choice in
-            1) manage_admins; config_changed=1;;
-            2) manage_cf_accounts; config_changed=1;;
+            1) manage_admins; config_changed=true;;
+            2) manage_cf_accounts; config_changed=true;;
             3)
-                echo -e -n "Enter the new Telegram Bot Token: "
-                read new_bot_token
+                current_token=$(read_env_var "TELEGRAM_BOT_TOKEN")
+                echo "Current Token: $current_token"
+                read -p "Enter the new Telegram Bot Token (leave empty to cancel): " new_bot_token
                 if [ -n "$new_bot_token" ]; then
                     write_env_var "TELEGRAM_BOT_TOKEN" "$new_bot_token"
                     echo -e "${GREEN}Bot Token updated.${NC}"
-                    config_changed=1
+                    config_changed=true
                 else
-                    echo -e "${RED}Bot Token cannot be empty.${NC}"
+                    echo -e "${YELLOW}No changes made.${NC}"
                 fi
+                read -p "Press Enter to continue..."
                 ;;
             4) break;;
             *) echo -e "${RED}Invalid option.${NC}";;
         esac
     done
 
-    if [ "$config_changed" -eq 1 ]; then
-        echo -e "${YELLOW}Recreating the container to apply changes...${NC}"
-        docker-compose down
-        docker-compose up -d
-        echo -e "\n${GREEN}✅ Configuration updated and bot restarted!${NC}"
-    else
-        echo -e "${BLUE}No changes made. Bot was not restarted.${NC}"
+    if [ "$config_changed" = true ]; then
+        prompt_for_changes
     fi
 }
 
-# --- Main Menu ---
+
+# --- Main Menu Functions ---
+
+install_bot() {
+    print_header
+    echo -e "${GREEN}Starting Bot Installation...${NC}"
+
+    if ! command -v git &> /dev/null || ! command -v curl &> /dev/null; then
+        echo "Git or Curl not found. Installing required packages..."
+        if command -v apt-get &> /dev/null; then sudo apt-get update && sudo apt-get install -y git curl; elif command -v yum &> /dev/null; then sudo yum install -y git curl; else echo -e "${RED}Error: Could not install Git/Curl.${NC}"; exit 1; fi
+    fi
+
+    if ! command -v docker &> /dev/null; then
+        echo "Docker not found. Installing Docker..."; curl -fsSL https://get.docker.com -o get-docker.sh; sudo sh get-docker.sh; rm get-docker.sh;
+    fi
+    if ! command -v docker-compose &> /dev/null; then
+        echo "Docker Compose not found. Installing..."; sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose; sudo chmod +x /usr/local/bin/docker-compose;
+    fi
+
+    if [ -d "$PROJECT_DIR" ]; then
+        echo -e "${YELLOW}Project directory already exists. Skipping clone.${NC}";
+    else
+        git clone "$REPO_URL";
+    fi
+    cd "$PROJECT_DIR" || exit
+
+    echo -e "${YELLOW}--- Core Configuration (.env) ---${NC}"
+    read -p "Enter your Telegram Bot Token: " bot_token
+    read -p "Enter your Telegram Admin User ID(s) (comma-separated): " admin_ids
+    
+    cf_accounts_list=""
+    while true; do
+        read -p "Add a Cloudflare account? (y/n): " add_account
+        if [[ "$add_account" != "y" && "$add_account" != "Y" ]]; then break; fi
+        read -p "  Enter a Nickname for this account: " cf_nickname
+        read -p "  Enter the Cloudflare API Token for this account: " cf_token
+        if [ -z "$cf_accounts_list" ]; then cf_accounts_list="$cf_nickname:$cf_token"; else cf_accounts_list="$cf_accounts_list,$cf_nickname:$cf_token"; fi
+    done
+
+    echo "TELEGRAM_BOT_TOKEN=$bot_token" > .env
+    echo "TELEGRAM_ADMIN_IDS=$admin_ids" >> .env
+    echo "CF_ACCOUNTS=$cf_accounts_list" >> .env
+    echo -e "${GREEN}.env file created successfully.${NC}"
+
+    if [ ! -f "config.json" ]; then
+        echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[]}' > config.json
+        echo -e "${GREEN}Initial config.json created.${NC}"
+    fi
+    
+    echo -e "${GREEN}Building and starting the bot...${NC}"
+    docker-compose up -d --build
+    echo -e "${GREEN}Bot is running in the background!${NC}"
+    echo -e "${YELLOW}Please start a chat with your bot and use the /settings command to configure everything else.${NC}"
+    cd ..
+}
+
 main_menu() {
     while true; do
-        echo -e "\n${BLUE}--- Cloudflare Bot Docker Manager ---${NC}"
-        echo "1) Install or Re-Install Bot"
-        echo "2) Update Bot"
-        echo "3) Edit Configuration"
+        print_header
+        echo "1) Install or Reinstall Bot"
+        echo "2) Update Bot from GitHub"
+        echo "3) Edit Core Configuration (.env)"
         echo "4) View Live Logs"
-        echo "5) Remove Bot Completely"
-        echo "6) Exit"
-        echo -e -n "Choose an option: "
-        read choice
+        echo "5) Stop Bot"
+        echo "6) Start Bot"
+        echo "7) Remove Bot Completely"
+        echo "8) Exit"
+        read -p "Choose an option [1-8]: " choice
+
         case $choice in
-            1) install_bot; break ;;
-            2) update_bot; break ;;
-            3) edit_config; break ;;
-            4) view_logs; break ;;
-            5) remove_bot; break ;;
-            6) echo -e "${GREEN}👋 Exiting.${NC}"; exit 0 ;;
-            *) echo -e "${RED}Invalid option. Please try again.${NC}" ;;
+            1)
+                install_bot
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            2)
+                cd "$PROJECT_DIR" && git pull && docker-compose pull && docker-compose up -d --build && cd ..
+                echo -e "${GREEN}Bot updated and restarted!${NC}"
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            3)
+                edit_config
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            4)
+                cd "$PROJECT_DIR" && docker-compose logs -f && cd ..
+                ;;
+            5)
+                cd "$PROJECT_DIR" && docker-compose stop && cd ..
+                echo -e "${YELLOW}Bot stopped.${NC}"
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            6)
+                cd "$PROJECT_DIR" && docker-compose start && cd ..
+                echo -e "${GREEN}Bot started.${NC}"
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            7)
+                read -p "Are you sure you want to remove the bot completely? This cannot be undone. (y/n): " confirm_remove
+                if [[ "$confirm_remove" == "y" || "$confirm_remove" == "Y" ]]; then
+                    cd "$PROJECT_DIR" && docker-compose down -v --rmi all && cd .. && rm -rf "$PROJECT_DIR"
+                    echo -e "${RED}Bot completely removed.${NC}"
+                else
+                    echo -e "${YELLOW}Removal cancelled.${NC}"
+                fi
+                read -p "Press Enter to return to the main menu..."
+                ;;
+            8)
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option. Please try again.${NC}"
+                read -p "Press Enter to continue..."
+                ;;
         esac
+        echo ""
     done
 }
 
-# --- Script Execution ---
-print_header
-check_docker
 main_menu
