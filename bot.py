@@ -247,22 +247,29 @@ async def check_ip_health(ip: str, port: int, timeout: int = 5) -> bool:
         return False
 
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, message_key: str, **kwargs):
-    """Sends a localized notification message to all configured admin chat IDs."""
+    """
+    Sends a localized notification message to all configured admin chat IDs.
+    It automatically includes the main admins from the .env file.
+    """
     config = load_config()
     if config is None or not config.get("notifications", {}).get("enabled", False):
         return
 
-    notification_chat_ids = config.get("notifications", {}).get("chat_ids", [])
-    if not notification_chat_ids:
+    config_chat_ids = set(config.get("notifications", {}).get("chat_ids", []))
+    
+    env_admin_ids = ADMIN_IDS
+    
+    all_notification_ids = config_chat_ids.union(env_admin_ids)
+    
+    if not all_notification_ids:
+        logger.warning("No recipients for notification (neither in config.json nor .env).")
         return
 
     user_data = await context.application.persistence.get_user_data()
     
-    for chat_id in notification_chat_ids:
+    for chat_id in all_notification_ids:
         lang = user_data.get(chat_id, {}).get('language', 'fa')
-        
         message = get_text(message_key, lang, **kwargs)
-        
         try:
             await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
         except Exception as e:
