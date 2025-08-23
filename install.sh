@@ -25,10 +25,12 @@ print_header() {
     echo ""
 }
 
+# Reads a specific variable from the .env file
 read_env_var() {
     grep "^${1}=" "$ENV_FILE" | cut -d'=' -f2-
 }
 
+# Writes or updates a variable in the .env file
 write_env_var() {
     if grep -q "^${1}=" "$ENV_FILE"; then
         sed -i "s|^${1}=.*|${1}=${2}|" "$ENV_FILE"
@@ -37,6 +39,7 @@ write_env_var() {
     fi
 }
 
+# Asks user if they want to apply changes and restart
 prompt_for_changes() {
     read -p "Apply these changes and restart the bot? (y/n): " confirm_restart
     if [[ "$confirm_restart" == "y" || "$confirm_restart" == "Y" ]]; then
@@ -138,6 +141,7 @@ manage_cf_accounts() {
                 ;;
             3)
                 break
+                ;;
             *)
                 echo -e "${RED}Invalid option.${NC}"
                 read -p "Press Enter to continue..."
@@ -188,7 +192,6 @@ edit_config() {
         prompt_for_changes
     fi
 }
-
 
 # --- Main Menu Functions ---
 
@@ -265,15 +268,17 @@ main_menu() {
                 ;;
             2)
                 echo -e "${YELLOW}Attempting to update the bot to the latest version from GitHub...${NC}"
-                cd "$PROJECT_DIR" || { echo -e "${RED}Project directory not found.${NC}"; read -p "Press Enter..."; return; }
-                git checkout main
-                git fetch origin
-                git reset --hard origin/main
-                echo -e "${GREEN}Local repository has been successfully synced with GitHub.${NC}"
-                docker-compose pull
-                docker-compose up -d --build
-                cd ..
-                echo -e "${GREEN}Bot has been updated and restarted successfully!${NC}"
+                if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please install first.${NC}"; else
+                    cd "$PROJECT_DIR"
+                    git checkout main
+                    git fetch origin
+                    git reset --hard origin/main
+                    echo -e "${GREEN}Local repository has been successfully synced with GitHub.${NC}"
+                    docker-compose pull
+                    docker-compose up -d --build
+                    cd ..
+                    echo -e "${GREEN}Bot has been updated and restarted successfully!${NC}"
+                fi
                 read -p "Press Enter to return to the main menu..."
                 ;;
             3)
@@ -315,4 +320,5 @@ main_menu() {
     done
 }
 
+# --- Script Execution ---
 main_menu
