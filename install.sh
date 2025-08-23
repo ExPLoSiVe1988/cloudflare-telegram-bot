@@ -43,8 +43,8 @@ write_env_var() {
 prompt_for_changes() {
     read -p "Apply these changes and restart the bot? (y/n): " confirm_restart
     if [[ "$confirm_restart" == "y" || "$confirm_restart" == "Y" ]]; then
-        echo -e "${GREEN}Restarting the bot to apply changes...${NC}"
-        cd "$PROJECT_DIR" && docker-compose restart && cd ..
+        echo -e "${GREEN}Recreating the container to apply changes...${NC}"
+        (cd "$PROJECT_DIR" && docker-compose down && docker-compose up -d)
         echo -e "${GREEN}Bot restarted successfully.${NC}"
     else
         echo -e "${YELLOW}Changes saved, but bot was not restarted. Please restart manually to apply.${NC}"
