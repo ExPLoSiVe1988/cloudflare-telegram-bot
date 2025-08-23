@@ -152,6 +152,7 @@
       "admin_id_already_exists": "⚠️ This admin ID is already in the list.",
       "select_admin_to_remove": "Please select an admin to remove from the notification list:",
       "admin_id_removed": "✅ Admin with ID {admin_id} has been successfully removed from the list.",
-      "no_admins_to_remove": "There are no admins in the notification list to remove."
+      "no_admins_to_remove": "There are no admins in the notification list to remove.",
+      "enter_failover_minutes": "⏱️ After how many minutes of the primary server being down should the failover occur? (e.g., 2)"
   }
 }
