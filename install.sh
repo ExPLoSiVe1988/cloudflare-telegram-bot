@@ -110,16 +110,24 @@ manage_cf_accounts() {
             echo -e "${GREEN}Account '$new_nickname' added.${NC}"
             ;;
         2)
-            read -p "Enter the nickname of the account to remove: " remove_nickname
-            if [ -z "$remove_nickname" ]; then echo -e "${RED}Nickname cannot be empty.${NC}"; return; fi
-            new_list=$(echo ",$current_accounts," | sed "s/,$remove_nickname:[^,]*,/,/" | sed 's/^,//;s/,$//')
-            if [ "$new_list" == "$current_accounts" ]; then
-                echo -e "${RED}Account with nickname '$remove_nickname' not found.${NC}"
-            else
-                write_env_var "CF_ACCOUNTS" "$new_list"
-                echo -e "${GREEN}Account '$remove_nickname' removed.${NC}"
-            fi
-            ;;
+                echo -e "${YELLOW}Fetching latest version from GitHub...${NC}"
+                cd "$PROJECT_DIR" || exit
+                
+                # ابتدا مطمئن شو که در شاخه اصلی هستیم
+                git checkout main
+                # تمام تغییرات محلی را نادیده بگیر و ریپازیتوری را دقیقاً مانند گیت‌هاب کن
+                git fetch origin
+                git reset --hard origin/main
+                
+                echo -e "${GREEN}Local repository has been synced with GitHub.${NC}"
+                
+                # حالا ایمیج جدید را بیلد و اجرا کن
+                docker-compose pull
+                docker-compose up -d --build
+                cd ..
+                echo -e "${GREEN}Bot updated and restarted successfully!${NC}"
+                read -p "Press Enter to return to the main menu..."
+                ;;
         3) return;;
         *) echo -e "${RED}Invalid option.${NC}";;
     esac
