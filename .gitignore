@@ -1,1 +1,6 @@
 .env
+config.json
+bot_data.pickle
+__pycache__/
+*.pyc
+.dockerignore
