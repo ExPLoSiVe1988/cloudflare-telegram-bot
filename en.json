@@ -14,7 +14,7 @@
     "deselect_all": "Deselect All",
     "try_another_name": "📝 Try Another Name",
     "settings": "⚙️ Settings",
-    "manage_rules": "Auto-Failover & Monitoring",
+    "manage_policies": "Auto-Failover & Monitoring",
     "manage_notifications": "Notification Settings",
     "add_policy": "➕ Add New Rule",
     "edit_policy": "📝 Edit",
