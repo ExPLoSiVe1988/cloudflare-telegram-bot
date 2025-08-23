@@ -8,6 +8,7 @@ on:
       - 'v*.*.*'
     paths:
       - "README.md"
+  workflow_dispatch:
 
 jobs:
   build-and-push:
