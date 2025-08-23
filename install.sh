@@ -87,51 +87,63 @@ manage_admins() {
 }
 
 manage_cf_accounts() {
-    local current_accounts=$(read_env_var "CF_ACCOUNTS")
-    echo -e "\nCurrent Cloudflare Accounts:"
-    if [ -z "$current_accounts" ]; then
-        echo -e "${YELLOW}None${NC}"
-    else
-        echo -e "${YELLOW}${current_accounts}${NC}" | tr ',' '\n'
-    fi
-    echo ""
-    echo "1) Add Account"
-    echo "2) Remove Account (by nickname)"
-    echo "3) Back"
-    read -p "Choose an option: " choice
-    case $choice in
-        1)
-            read -p "Enter a nickname for the new account: " new_nickname
-            read -p "Enter the API Token for '$new_nickname': " new_token
-            if [ -z "$new_nickname" ] || [ -z "$new_token" ]; then echo -e "${RED}Nickname and Token cannot be empty.${NC}"; return; fi
-            new_entry="$new_nickname:$new_token"
-            if [ -z "$current_accounts" ]; then new_list="$new_entry"; else new_list="$current_accounts,$new_entry"; fi
-            write_env_var "CF_ACCOUNTS" "$new_list"
-            echo -e "${GREEN}Account '$new_nickname' added.${NC}"
-            ;;
-        2)
-                echo -e "${YELLOW}Fetching latest version from GitHub...${NC}"
-                cd "$PROJECT_DIR" || exit
-                
-                # ابتدا مطمئن شو که در شاخه اصلی هستیم
-                git checkout main
-                # تمام تغییرات محلی را نادیده بگیر و ریپازیتوری را دقیقاً مانند گیت‌هاب کن
-                git fetch origin
-                git reset --hard origin/main
-                
-                echo -e "${GREEN}Local repository has been synced with GitHub.${NC}"
-                
-                # حالا ایمیج جدید را بیلد و اجرا کن
-                docker-compose pull
-                docker-compose up -d --build
-                cd ..
-                echo -e "${GREEN}Bot updated and restarted successfully!${NC}"
-                read -p "Press Enter to return to the main menu..."
+    while true; do
+        print_header
+        echo -e "${YELLOW}--- Manage Cloudflare Accounts ---${NC}"
+        
+        current_cf_accounts=$(read_env_var "CF_ACCOUNTS")
+        echo "Current Accounts: $current_cf_accounts"
+        echo ""
+        echo "1) Add a new Cloudflare account"
+        echo "2) Remove an existing Cloudflare account"
+        echo "3) Back to previous menu"
+        read -p "Choose an option: " cf_choice
+
+        case $cf_choice in
+            1)
+                read -p "  Enter a Nickname for the new account: " cf_nickname
+                read -p "  Enter the Cloudflare API Token for this account: " cf_token
+                new_entry="$cf_nickname:$cf_token"
+                if [ -z "$current_cf_accounts" ]; then
+                    sed -i "s|^CF_ACCOUNTS=.*|CF_ACCOUNTS=$new_entry|" "$ENV_FILE"
+                else
+                    sed -i "s|^CF_ACCOUNTS=.*|CF_ACCOUNTS=$current_cf_accounts,$new_entry|" "$ENV_FILE"
+                fi
+                echo -e "${GREEN}Account '$cf_nickname' added.${NC}"
+                read -p "Press Enter to continue..."
                 ;;
-        3) return;;
-        *) echo -e "${RED}Invalid option.${NC}";;
-    esac
-    read -p "Press Enter to continue..."
+            2)
+                if [ -z "$current_cf_accounts" ]; then
+                    echo -e "${YELLOW}No accounts to remove.${NC}"
+                else
+                    mapfile -t accounts < <(echo "$current_cf_accounts" | tr ',' '\n')
+                    echo "Select an account to remove:"
+                    i=1
+                    for acc in "${accounts[@]}"; do
+                        nickname=$(echo "$acc" | cut -d':' -f1)
+                        echo "  $i) $nickname"
+                        i=$((i+1))
+                    done
+                    read -p "Enter the number of the account to remove (or 0 to cancel): " del_choice
+                    if [[ "$del_choice" -gt 0 && "$del_choice" -le ${#accounts[@]} ]]; then
+                        unset "accounts[$((del_choice-1))]"
+                        new_accounts_list=$(IFS=,; echo "${accounts[*]}")
+                        sed -i "s|^CF_ACCOUNTS=.*|CF_ACCOUNTS=$new_accounts_list|" "$ENV_FILE"
+                        echo -e "${GREEN}Account removed.${NC}"
+                    else
+                        echo "Removal cancelled."
+                    fi
+                fi
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                break
+            *)
+                echo -e "${RED}Invalid option.${NC}"
+                read -p "Press Enter to continue..."
+                ;;
+        esac
+    done
 }
 
 edit_config() {
