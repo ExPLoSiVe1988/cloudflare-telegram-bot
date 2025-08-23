@@ -275,6 +275,7 @@ main_menu() {
                 cd ..
                 echo -e "${GREEN}Bot has been updated and restarted successfully!${NC}"
                 read -p "Press Enter to return to the main menu..."
+                ;;
             3)
                 edit_config
                 read -p "Press Enter to return to the main menu..."
