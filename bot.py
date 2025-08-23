@@ -1750,16 +1750,18 @@ async def sync_dns_with_config(application: Application):
                     error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
                     logger.error(f"Sync failed: Could not update record '{record['name']}'. Reason: {error_msg}")
                     sync_results[policy_name]['errors'] += 1
-    
-    notification_chat_ids = config.get("notifications", {}).get("chat_ids", [])
-    if not notification_chat_ids:
-        logger.info("No notification admins configured. Skipping sync summary.")
-        logger.info("--- DNS Sync with Config Finished ---")
-        return
 
-    user_data = await application.persistence.get_user_data()
+    if config.get("notifications", {}).get("enabled", False):
+        config_chat_ids = set(config.get("notifications", {}).get("chat_ids", []))
+        env_admin_ids = ADMIN_IDS
+        all_notification_ids = config_chat_ids.union(env_admin_ids)
 
-    for chat_id in notification_chat_ids:
+        if not all_notification_ids:
+            logger.info("No notification recipients found. Skipping sync summary.")
+        else:
+            user_data = await application.persistence.get_user_data()
+
+    for chat_id in all_notification_ids:
         lang = user_data.get(chat_id, {}).get('language', 'fa')
         
         summary_message = get_text('messages.sync_summary_header', lang)
