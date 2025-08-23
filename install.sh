@@ -252,10 +252,17 @@ main_menu() {
                 read -p "Press Enter to return to the main menu..."
                 ;;
             2)
-                cd "$PROJECT_DIR" && git pull && docker-compose pull && docker-compose up -d --build && cd ..
-                echo -e "${GREEN}Bot updated and restarted!${NC}"
+                echo -e "${YELLOW}Attempting to update the bot to the latest version from GitHub...${NC}"
+                cd "$PROJECT_DIR" || { echo -e "${RED}Project directory not found.${NC}"; read -p "Press Enter..."; return; }
+                git checkout main
+                git fetch origin
+                git reset --hard origin/main
+                echo -e "${GREEN}Local repository has been successfully synced with GitHub.${NC}"
+                docker-compose pull
+                docker-compose up -d --build
+                cd ..
+                echo -e "${GREEN}Bot has been updated and restarted successfully!${NC}"
                 read -p "Press Enter to return to the main menu..."
-                ;;
             3)
                 edit_config
                 read -p "Press Enter to return to the main menu..."
