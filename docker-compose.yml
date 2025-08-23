@@ -7,4 +7,4 @@ services:
       - .env
     restart: unless-stopped
     volumes:
-      - ./backups:/app/backups
+      - .:/app
