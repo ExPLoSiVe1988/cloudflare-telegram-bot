@@ -1,9 +1,8 @@
-# docker-compose.yml (برای پوشه تستی)
 services:
   cfbot:
     build: .
-    # image: explosive1988/cfbot:latest-test 
-    container_name: cfbot-test 
+    image: explosive1988/cfbot:latest-test 
+    container_name: cfbot
     env_file:
       - .env
     restart: unless-stopped
