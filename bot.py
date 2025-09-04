@@ -87,6 +87,13 @@ def get_flag_emoji(country_code: str) -> str:
 # --- Helper Functions ---
 CONFIG_FILE = "config.json"
 
+def escape_markdown_v2(text: str) -> str:
+    """Escapes characters for Telegram's MarkdownV2 parser."""
+    if not isinstance(text, str):
+        text = str(text)
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
+
 def is_valid_ip(ip: str) -> bool:
     try:
         ipaddress.ip_address(ip)
@@ -539,7 +546,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
             ping_cache = {}
             records_under_failover_control = set()
             
-            # === STAGE 1: PROCESS FAILOVER POLICIES ===
+                                    # === STAGE 1: PROCESS FAILOVER POLICIES (FINAL CORRECTED LOGIC) ===
             failover_policies = [p for p in config.get("failover_policies", []) if p.get('enabled', True)]
             
             for policy in failover_policies:
@@ -554,7 +561,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Skipping failover policy '{policy_name}' due to incomplete configuration.")
                     continue
 
-                policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None})
+                policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
 
                 actual_ip_on_cf = None
                 token = CF_ACCOUNTS.get(policy.get('account_nickname'))
@@ -572,58 +579,75 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                 primary_nodes = policy.get('primary_monitoring_nodes')
                 primary_threshold = policy.get('primary_threshold')
-                is_primary_online = await get_ip_health_with_cache(context, primary_ip, port_to_check, primary_nodes, primary_threshold, ping_cache)
+                backup_nodes = policy.get('backup_monitoring_nodes', primary_nodes)
+                backup_threshold = policy.get('backup_threshold', primary_threshold)
                 
-                if not is_primary_online:
-                    logger.warning(f"Primary IP for '{policy_name}' is DOWN. Entering Failover mode.")
-                    policy_status.pop('uptime_start', None)
-                    for rec in record_names: records_under_failover_control.add((zone_name, rec))
+                nodes_to_use = primary_nodes if actual_ip_on_cf == primary_ip else backup_nodes
+                threshold_to_use = primary_threshold if actual_ip_on_cf == primary_ip else backup_threshold
 
-                    backup_nodes = policy.get('backup_monitoring_nodes', primary_nodes)
-                    backup_threshold = policy.get('backup_threshold', primary_threshold)
-                    is_current_ip_healthy = await get_ip_health_with_cache(context, actual_ip_on_cf, port_to_check, backup_nodes, backup_threshold, ping_cache) if actual_ip_on_cf in backup_ips else False
+                is_current_ip_online = await get_ip_health_with_cache(context, actual_ip_on_cf, port_to_check, nodes_to_use, threshold_to_use, ping_cache)
+
+                if not is_current_ip_online:
+                    if not policy_status.get('downtime_start'):
+                        policy_status['downtime_start'] = datetime.now().isoformat()
+                        await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
+                        continue 
                     
-                    if not is_current_ip_healthy:
-                        logger.warning(f"Current IP {actual_ip_on_cf} is also down or is the primary. Searching for a healthy backup.")
-                        next_healthy_backup = None
-                        for backup_ip in backup_ips:
-                            if backup_ip == actual_ip_on_cf: continue
-                            
-                            if await get_ip_health_with_cache(context, backup_ip, port_to_check, backup_nodes, backup_threshold, ping_cache):
-                                next_healthy_backup = backup_ip
-                                break
+                    downtime_dt = datetime.fromisoformat(policy_status['downtime_start'])
+                    failover_minutes = policy.get("failover_minutes", 2.0)
+                    
+                    if (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
+                        logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
+                        continue
+
+                    logger.warning(f"FAILOVER TRIGGERED for '{policy_name}' on IP '{actual_ip_on_cf}'. Searching for backup.")
+                    
+                    next_healthy_backup = None
+                    all_possible_ips = [primary_ip] + backup_ips
+                    
+                    for backup_ip in all_possible_ips:
+                        if backup_ip == actual_ip_on_cf: continue
                         
-                        if next_healthy_backup:
-                            await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
-                            await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
-                        elif not policy_status.get('critical_alert_sent', False):
-                            await send_notification(context, 'messages.failover_notification_all_down', policy_name=policy_name, primary_ip=primary_ip, backup_ips=", ".join(backup_ips), add_settings_button=True)
-                            policy_status['critical_alert_sent'] = True
-                
-                else: 
-                    if policy_status.get('critical_alert_sent'): 
+                        nodes_for_backup = primary_nodes if backup_ip == primary_ip else backup_nodes
+                        threshold_for_backup = primary_threshold if backup_ip == primary_ip else backup_threshold
+                        
+                        if await get_ip_health_with_cache(context, backup_ip, port_to_check, nodes_for_backup, threshold_for_backup, ping_cache):
+                            next_healthy_backup = backup_ip
+                            break
+                    
+                    if next_healthy_backup:
+                        await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
+                        await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
+                        policy_status['downtime_start'] = None
+                    elif not policy_status.get('critical_alert_sent', False):
+                        await send_notification(context, 'messages.failover_notification_all_down', policy_name=policy_name, primary_ip=primary_ip, backup_ips=", ".join(backup_ips), add_settings_button=True)
+                        policy_status['critical_alert_sent'] = True
+                else:
+                    if policy_status.get('downtime_start'):
+                        await send_notification(context, 'messages.server_recovered_notification', policy_name=policy_name, ip=actual_ip_on_cf)
+                    policy_status['downtime_start'] = None
+                    if policy_status.get('critical_alert_sent'):
                         policy_status['critical_alert_sent'] = False
+
+                is_primary_online = await get_ip_health_with_cache(context, primary_ip, port_to_check, primary_nodes, primary_threshold, ping_cache)
+                if is_primary_online and actual_ip_on_cf != primary_ip:
+                    for rec in record_names: records_under_failover_control.add((zone_name, rec))
                     
-                    if actual_ip_on_cf != primary_ip:
-                        for rec in record_names: records_under_failover_control.add((zone_name, rec))
-                        
-                        if not policy_status.get('uptime_start'):
-                            policy_status['uptime_start'] = datetime.now().isoformat()
-                            await send_notification(context, 'messages.server_recovered_notification', policy_name=policy_name, ip=primary_ip)
-                            if policy.get('auto_failback', True):
-                                failback_minutes = policy.get('failback_minutes', 5.0)
-                                await send_notification(context, 'messages.failback_alert_notification', policy_name=policy_name, primary_ip=primary_ip, failback_minutes=failback_minutes)
-                        
-                        elif policy.get('auto_failback', True):
-                            uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
+                    if not policy_status.get('uptime_start'):
+                        policy_status['uptime_start'] = datetime.now().isoformat()
+                        if policy.get('auto_failback', True):
                             failback_minutes = policy.get('failback_minutes', 5.0)
-                            if (datetime.now() - uptime_dt) >= timedelta(minutes=failback_minutes):
-                                await switch_dns_ip(context, policy, to_ip=primary_ip)
-                                await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
-                                policy_status.pop('uptime_start', None)
-                    else:
-                        policy_status.pop('uptime_start', None)
-                        logger.info(f"System for '{policy_name}' is stable and on primary IP.")
+                            await send_notification(context, 'messages.failback_alert_notification', policy_name=policy_name, primary_ip=primary_ip, failback_minutes=failback_minutes)
+                    
+                    elif policy.get('auto_failback', True):
+                        uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
+                        failback_minutes = policy.get('failback_minutes', 5.0)
+                        if (datetime.now() - uptime_dt) >= timedelta(minutes=failback_minutes):
+                            await switch_dns_ip(context, policy, to_ip=primary_ip)
+                            await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
+                            policy_status.pop('uptime_start', None)
+                elif not is_primary_online:
+                     policy_status.pop('uptime_start', None)
 
             # === STAGE 2: PROCESS LOAD BALANCER POLICIES ===
             logger.info("--- [HEALTH CHECK] Stage 2: Processing Load Balancer Policies ---")
@@ -3173,12 +3197,11 @@ def main():
         logger.warning(
             f"'{persistence_file}' is empty. Initializing with a valid empty structure."
         )
-        # Create the complete base structure that the library expects
         initial_data = {
             "user_data": {},
             "chat_data": {},
             "bot_data": {},
-            "conversations": {}, # <--- این کلید حیاتی بود که جا افتاده بود
+            "conversations": {},
         }
         with open(persistence_file, "wb") as f:
             pickle.dump(initial_data, f)

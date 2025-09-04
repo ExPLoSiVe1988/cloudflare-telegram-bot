@@ -249,16 +249,34 @@ install_bot() {
 
 update_bot() {
     print_header
-    if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please install first.${NC}"; else
-        echo "Fetching latest changes from GitHub..."
-        (cd "$PROJECT_DIR" && git pull origin main)
-        echo -e "${GREEN}Local repository updated.${NC}"
-        
-        echo "Pulling latest Docker image and restarting bot..."
-        $COMPOSE_CMD pull
-        $COMPOSE_CMD up -d --build --remove-orphans
-        echo -e "${GREEN}Bot has been updated and restarted!${NC}"
+    if [ ! -d "$PROJECT_DIR" ]; then 
+        echo -e "${RED}Project directory not found. Please install first.${NC}"
+        read -p "Press Enter..."
+        return
     fi
+
+    echo -e "${YELLOW}Fetching latest changes from GitHub...${NC}"
+    (cd "$PROJECT_DIR" && git pull origin main)
+    echo -e "${GREEN}Local repository updated successfully.${NC}"
+
+    echo -e "\n${YELLOW}This is a major update. Preparing for a clean restart...${NC}"
+    
+    echo "Stopping the current bot instance..."
+    $COMPOSE_CMD down
+
+    echo "Cleaning up incompatible old data files and ensuring correct file structure..."
+    rm -rf "$PROJECT_DIR/bot_data.pickle"
+    rm -rf "$PROJECT_DIR/nodes_cache.json"  
+    touch "$PROJECT_DIR/bot_data.pickle"
+    touch "$PROJECT_DIR/nodes_cache.json"
+    echo -e "${GREEN}Cleanup complete.${NC}"
+
+    echo -e "\n${YELLOW}Pulling latest Docker image, rebuilding, and restarting bot...${NC}"
+    $COMPOSE_CMD pull
+    $COMPOSE_CMD up -d --build --remove-orphans
+    
+    echo -e "\n${GREEN}--- Bot has been updated and restarted successfully! ---${NC}"
+    echo -e "NOTE: Due to major changes, you may need to re-configure some rules in the bot's settings menu."
 }
 
 # --- Main Menu ---
