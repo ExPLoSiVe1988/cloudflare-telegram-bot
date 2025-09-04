@@ -1,10 +1,12 @@
 services:
   cfbot:
     build: .
-    image: explosive1988/cfbot:latest 
+    image: explosive1988/cfbot:latest
     container_name: cfbot
     env_file:
       - .env
     restart: unless-stopped
     volumes:
-      - .:/app
+      - ./config.json:/app/config.json
+      - ./bot_data.pickle:/app/bot_data.pickle
+      - ./nodes_cache.json:/app/nodes_cache.json

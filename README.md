@@ -4,7 +4,7 @@
 <br>
 
 # Cloudflare Management Bot 🐳
-A powerful Telegram bot for complete DNS record management, equipped with an **intelligent monitoring and Automatic Failover system**. This bot monitors your servers 24/7 and intelligently redirects traffic to backup servers in case of an outage, ensuring maximum uptime. Fully containerized with Docker for an incredibly simple and fast deployment.
+A powerful Telegram bot for complete DNS record management, equipped with two fully independent systems: **intelligent Monitoring & Automatic Failover** and **Smart Load Balancing**. This bot monitors your servers 24/7, redirecting traffic to backup servers in case of an outage or distributing it among healthy servers to ensure maximum uptime and performance.
 
 ---
 <div align="center">
@@ -16,10 +16,12 @@ A powerful Telegram bot for complete DNS record management, equipped with an **i
 
 ## ✨ Features
 
-### 🚀 Intelligent Monitoring & High Availability
-*   🛡️ **Automatic Failover**: Continuously monitors your primary servers and automatically switches DNS records to backup IPs upon detecting downtime.
+### 🚀 Advanced Monitoring & High Availability
+*   🛡️ **Automatic Failover (High Availability)**: Continuously monitors your primary servers from multiple locations worldwide. If downtime is detected (based on a configurable failure threshold), it automatically switches DNS records to your backup IPs.
+*   🚦 **Smart Load Balancing (Performance & Redundancy)**: Periodically rotates traffic among a pool of healthy servers. The system automatically removes unhealthy servers from the rotation, using only available options.
 *   🔄 **Automatic Failback**: Once the primary server is back online and stable for a configurable period, the bot automatically switches traffic back.
-*   ⚙️ **Full In-Bot Management**: All Failover policies (add, edit, delete, enable/disable) are fully manageable through the settings menu inside the bot.
+*   ⚙️ **Complete & Separated In-Bot Management**: All Failover and Load Balancing policies are fully independent and manageable (add, edit, delete) through the settings menu inside the bot.
+*   🧠 **Smart Settings Copy**: To simplify configuration, you can easily copy monitoring settings (cities and threshold) from the primary IP to the backup IPs.
 
 ### ⚙️ General DNS Management
 *   **👥 Multi-Admin Support**: Authorize multiple Telegram users to manage the bot.
