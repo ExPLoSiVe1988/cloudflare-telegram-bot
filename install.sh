@@ -6,13 +6,20 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# --- Core Variables ---
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+PROJECT_DIR_NAME="cloudflare-telegram-bot"
+PROJECT_DIR="$SCRIPT_DIR/$PROJECT_DIR_NAME"
+
+if [ ! -d "$PROJECT_DIR" ]; then
+    PROJECT_DIR="$PROJECT_DIR_NAME"
+fi
+
 REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
-PROJECT_DIR="cloudflare-telegram-bot"
 ENV_FILE="$PROJECT_DIR/.env"
+COMPOSE_CMD="docker-compose -f $PROJECT_DIR/docker-compose.yml --project-directory $PROJECT_DIR"
+
 
 # --- Functions ---
-
 print_header() {
     clear
     echo -e "${GREEN}############################################################${NC}"
@@ -44,15 +51,15 @@ prompt_for_restart() {
     read -p "Apply these changes and restart the bot? (y/n): " confirm_restart
     if [[ "$confirm_restart" == "y" || "$confirm_restart" == "Y" ]]; then
         echo -e "${GREEN}Recreating the container to apply changes...${NC}"
-        (cd "$PROJECT_DIR" && docker-compose down && docker-compose up -d --build --remove-orphans)
+        $COMPOSE_CMD down
+        $COMPOSE_CMD up -d --build --remove-orphans
         echo -e "${GREEN}Bot restarted successfully.${NC}"
     else
         echo -e "${YELLOW}Changes saved, but bot was not restarted. Please restart manually to apply.${NC}"
     fi
 }
 
-# --- Configuration Management Functions (Your original functions) ---
-
+# --- Configuration Management Functions ---
 manage_admins() {
     local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
     echo -e "\nCurrent Admins: ${YELLOW}${current_admins:-None}${NC}"
@@ -96,7 +103,6 @@ manage_cf_accounts() {
         
         current_cf_accounts=$(read_env_var "CF_ACCOUNTS")
         echo "Current Accounts: $current_cf_accounts"
-        echo ""
         echo "1) Add a new Cloudflare account"
         echo "2) Remove an existing Cloudflare account"
         echo "3) Back to previous menu"
@@ -152,8 +158,7 @@ manage_cf_accounts() {
 
 edit_config() {
     if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please run Install first.${NC}"; read -p "Press Enter..."; return; fi
-    cd "$PROJECT_DIR" || return
-
+    
     local config_changed=false
     while true; do
         print_header
@@ -186,30 +191,26 @@ edit_config() {
     if [ "$config_changed" = true ]; then
         prompt_for_restart
     fi
-    cd ..
 }
 
 # --- Installation and Update Functions ---
-
 install_bot() {
     print_header
     echo -e "${GREEN}Starting Bot Installation/Reinstallation...${NC}"
 
     if ! command -v git &> /dev/null || ! command -v docker-compose &> /dev/null; then
-        echo -e "${RED}Error: git and docker-compose are required. Please install them.${NC}"
-        exit 1
+        echo -e "${RED}Error: git and docker-compose are required. Please install them.${NC}"; exit 1;
     fi
 
     if [ ! -d "$PROJECT_DIR" ]; then
-        echo -e "${YELLOW}Cloning repository...${NC}"
-        git clone "$REPO_URL"
+        echo -e "${YELLOW}Cloning repository...${NC}"; git clone "$REPO_URL";
     fi
-    cd "$PROJECT_DIR" || { echo -e "${RED}Failed to enter project directory. Aborting.${NC}"; exit 1; }
-    echo -e "${GREEN}Operating inside directory: $(pwd)${NC}"
-
+    
     echo -e "\n${YELLOW}Stopping any existing bot instance...${NC}"
-    docker-compose down
+    $COMPOSE_CMD down
 
+    cd "$PROJECT_DIR" || { echo -e "${RED}Failed to enter project directory. Aborting.${NC}"; exit 1; }
+    
     echo -e "\n${YELLOW}--- Core Configuration ---${NC}"
     read -p "Enter your Telegram Bot Token: " bot_token
     read -p "Enter your Telegram Admin User ID(s) (comma-separated): " admin_ids
@@ -228,35 +229,34 @@ install_bot() {
     echo "TELEGRAM_BOT_TOKEN=${bot_token}" >> .env
     echo "TELEGRAM_ADMIN_IDS=${admin_ids}" >> .env
     echo "CF_ACCOUNTS=${cf_accounts_list}" >> .env
-    echo -e "${GREEN}.env file created successfully inside '$PROJECT_DIR'.${NC}"
+    echo -e "${GREEN}.env file created successfully.${NC}"
 
     echo -e "\n${YELLOW}Preparing data files...${NC}"
     rm -rf config.json nodes_cache.json bot_data.pickle
     touch config.json nodes_cache.json bot_data.pickle
     echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[]}' > config.json
     echo -e "${GREEN}Data files are now clean and ready.${NC}"
+    
+    cd ..
 
-    echo -e "\n${GREEN}Pulling the latest image, building, and starting the bot...${NC}"
-    docker-compose pull
-    docker-compose up -d --build --remove-orphans
+    echo -e "\n${GREEN}Pulling, building, and starting the bot...${NC}"
+    $COMPOSE_CMD pull
+    $COMPOSE_CMD up -d --build --remove-orphans
     
     echo -e "\n${GREEN}--- Installation Complete! ---${NC}"
     echo "The bot is now running in the background."
-    cd ..
 }
 
 update_bot() {
     print_header
     if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please install first.${NC}"; else
-        cd "$PROJECT_DIR"
         echo "Fetching latest changes from GitHub..."
-        git pull origin main
+        (cd "$PROJECT_DIR" && git pull origin main)
         echo -e "${GREEN}Local repository updated.${NC}"
         
         echo "Pulling latest Docker image and restarting bot..."
-        docker-compose pull
-        docker-compose up -d --build --remove-orphans
-        cd ..
+        $COMPOSE_CMD pull
+        $COMPOSE_CMD up -d --build --remove-orphans
         echo -e "${GREEN}Bot has been updated and restarted!${NC}"
     fi
 }
@@ -279,13 +279,13 @@ main_menu() {
             1) install_bot; read -p "Press Enter...";;
             2) update_bot; read -p "Press Enter...";;
             3) edit_config;;
-            4) if [ -d "$PROJECT_DIR" ]; then (cd "$PROJECT_DIR" && docker-compose logs -f); else echo -e "${RED}Project not found.${NC}"; read -p "Press Enter..."; fi;;
-            5) if [ -d "$PROJECT_DIR" ]; then (cd "$PROJECT_DIR" && docker-compose stop); echo -e "${YELLOW}Bot stopped.${NC}"; fi; read -p "Press Enter...";;
-            6) if [ -d "$PROJECT_DIR" ]; then (cd "$PROJECT_DIR" && docker-compose start); echo -e "${GREEN}Bot started.${NC}"; fi; read -p "Press Enter...";;
+            4) if [ -d "$PROJECT_DIR" ]; then $COMPOSE_CMD logs -f; else echo -e "${RED}Project not found.${NC}"; read -p "Press Enter..."; fi;;
+            5) if [ -d "$PROJECT_DIR" ]; then $COMPOSE_CMD stop; echo -e "${YELLOW}Bot stopped.${NC}"; fi; read -p "Press Enter...";;
+            6) if [ -d "$PROJECT_DIR" ]; then $COMPOSE_CMD start; echo -e "${GREEN}Bot started.${NC}"; fi; read -p "Press Enter...";;
             7)
                 read -p "Are you sure you want to remove the bot completely? (y/n): " confirm_remove
                 if [[ "$confirm_remove" == "y" || "$confirm_remove" == "Y" ]]; then
-                    if [ -d "$PROJECT_DIR" ]; then (cd "$PROJECT_DIR" && docker-compose down -v --rmi all); fi
+                    if [ -d "$PROJECT_DIR" ]; then $COMPOSE_CMD down -v --rmi all; fi
                     rm -rf "$PROJECT_DIR"
                     echo -e "${RED}Bot completely removed.${NC}"
                 else
