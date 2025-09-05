@@ -198,9 +198,18 @@ install_bot() {
     print_header
     echo -e "${GREEN}Starting Bot Installation/Reinstallation...${NC}"
 
-    if ! command -v git &> /dev/null || ! command -v docker-compose &> /dev/null; then
-        echo -e "${RED}Error: git and docker-compose are required. Please install them.${NC}"; exit 1;
+    if ! command -v git &> /dev/null; then
+    echo -e "${YELLOW}git not found. Installing git...${NC}"
+    sudo apt update -y && sudo apt install git -y
     fi
+
+    if ! command -v docker-compose &> /dev/null; then
+    echo -e "${YELLOW}docker-compose not found. Installing docker & docker-compose...${NC}"
+    sudo apt update -y && sudo apt install docker.io docker-compose -y
+    sudo systemctl enable docker
+    sudo systemctl start docker
+    fi
+
 
     if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${YELLOW}Cloning repository...${NC}"; git clone "$REPO_URL";
