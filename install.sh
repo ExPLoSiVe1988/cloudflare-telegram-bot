@@ -8,18 +8,30 @@ NC='\033[0m'
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_DIR_NAME="cloudflare-telegram-bot"
-PROJECT_DIR="$SCRIPT_DIR/$PROJECT_DIR_NAME"
+PROJECT_DIR="$SCRIPT_DIR"
 
-if [ ! -d "$PROJECT_DIR" ]; then
-    PROJECT_DIR="$PROJECT_DIR_NAME"
+if [[ "$SCRIPT_DIR" != *"$PROJECT_DIR_NAME"* ]]; then
+    PROJECT_DIR="$HOME/$PROJECT_DIR_NAME"
 fi
 
 REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
 ENV_FILE="$PROJECT_DIR/.env"
-COMPOSE_CMD="docker-compose -f $PROJECT_DIR/docker-compose.yml --project-directory $PROJECT_DIR"
-
+COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+COMPOSE_CMD=""
 
 # --- Functions ---
+detect_compose_command() {
+    if command -v docker &> /dev/null && sudo docker compose version &> /dev/null; then
+        COMPOSE_CMD="sudo docker compose -f $COMPOSE_FILE --project-directory $PROJECT_DIR"
+        echo -e "${GREEN}Detected modern Docker Compose plugin (V2). Using 'docker compose'.${NC}"
+    elif command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="sudo docker-compose -f $COMPOSE_FILE --project-directory $PROJECT_DIR"
+        echo -e "${YELLOW}Modern Docker Compose not found. Falling back to legacy 'docker-compose'.${NC}"
+    else
+        COMPOSE_CMD=""
+    fi
+}
+
 print_header() {
     clear
     echo -e "${GREEN}############################################################${NC}"
@@ -159,6 +171,9 @@ manage_cf_accounts() {
 edit_config() {
     if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please run Install first.${NC}"; read -p "Press Enter..."; return; fi
     
+    local original_dir=$(pwd)
+    cd "$PROJECT_DIR" || return
+    
     local config_changed=false
     while true; do
         print_header
@@ -188,6 +203,8 @@ edit_config() {
         esac
     done
 
+    cd "$original_dir"
+
     if [ "$config_changed" = true ]; then
         prompt_for_restart
     fi
@@ -198,26 +215,34 @@ install_bot() {
     print_header
     echo -e "${GREEN}Starting Bot Installation/Reinstallation...${NC}"
 
-    if ! command -v git &> /dev/null; then
-    echo -e "${YELLOW}git not found. Installing git...${NC}"
-    sudo apt update -y && sudo apt install git -y
+    if ! command -v git &> /dev/null || ! command -v curl &> /dev/null; then
+        echo -e "${YELLOW}git/curl not found. Installing...${NC}"
+        sudo apt-get update -y && sudo apt-get install -y git curl
     fi
 
-    if ! command -v docker-compose &> /dev/null; then
-    echo -e "${YELLOW}docker-compose not found. Installing docker & docker-compose...${NC}"
-    sudo apt update -y && sudo apt install docker.io docker-compose -y
-    sudo systemctl enable docker
-    sudo systemctl start docker
+    if ! command -v docker &> /dev/null; then
+        echo -e "${YELLOW}Docker not found. Installing using the official script...${NC}"
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
+        rm get-docker.sh
+        echo -e "${GREEN}Docker installed successfully.${NC}"
+        echo -e "${YELLOW}You may need to log out and log back in to run docker without sudo.${NC}"
     fi
-
+    
+    detect_compose_command
+    if [ -z "$COMPOSE_CMD" ]; then
+        echo -e "${RED}Docker Compose could not be found. Please check your Docker installation.${NC}"
+        exit 1
+    fi
 
     if [ ! -d "$PROJECT_DIR" ]; then
-        echo -e "${YELLOW}Cloning repository...${NC}"; git clone "$REPO_URL";
+        echo -e "${YELLOW}Cloning repository into $PROJECT_DIR...${NC}"; git clone "$REPO_URL" "$PROJECT_DIR";
     fi
     
     echo -e "\n${YELLOW}Stopping any existing bot instance...${NC}"
-    $COMPOSE_CMD down
+    $COMPOSE_CMD down --remove-orphans
 
+    local original_dir=$(pwd)
     cd "$PROJECT_DIR" || { echo -e "${RED}Failed to enter project directory. Aborting.${NC}"; exit 1; }
     
     echo -e "\n${YELLOW}--- Core Configuration ---${NC}"
@@ -234,19 +259,19 @@ install_bot() {
     done
 
     echo -e "\n${YELLOW}Creating .env file...${NC}"
-    > .env
-    echo "TELEGRAM_BOT_TOKEN=${bot_token}" >> .env
-    echo "TELEGRAM_ADMIN_IDS=${admin_ids}" >> .env
-    echo "CF_ACCOUNTS=${cf_accounts_list}" >> .env
+    > "$ENV_FILE"
+    echo "TELEGRAM_BOT_TOKEN=${bot_token}" >> "$ENV_FILE"
+    echo "TELEGRAM_ADMIN_IDS=${admin_ids}" >> "$ENV_FILE"
+    echo "CF_ACCOUNTS=${cf_accounts_list}" >> "$ENV_FILE"
     echo -e "${GREEN}.env file created successfully.${NC}"
 
     echo -e "\n${YELLOW}Preparing data files...${NC}"
-    rm -rf config.json nodes_cache.json bot_data.pickle
-    touch config.json nodes_cache.json bot_data.pickle
-    echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[]}' > config.json
+    rm -rf "$PROJECT_DIR/config.json" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
+    touch "$PROJECT_DIR/config.json" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
+    echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[]}' > "$PROJECT_DIR/config.json"
     echo -e "${GREEN}Data files are now clean and ready.${NC}"
     
-    cd ..
+    cd "$original_dir"
 
     echo -e "\n${GREEN}Pulling, building, and starting the bot...${NC}"
     $COMPOSE_CMD pull
@@ -268,16 +293,14 @@ update_bot() {
     (cd "$PROJECT_DIR" && git pull origin main)
     echo -e "${GREEN}Local repository updated successfully.${NC}"
 
-    echo -e "\n${YELLOW}This is a major update. Preparing for a clean restart...${NC}"
+    echo -e "\n${YELLOW}Preparing for a clean restart...${NC}"
     
     echo "Stopping the current bot instance..."
     $COMPOSE_CMD down
 
-    echo "Cleaning up incompatible old data files and ensuring correct file structure..."
-    rm -rf "$PROJECT_DIR/bot_data.pickle"
-    rm -rf "$PROJECT_DIR/nodes_cache.json"  
-    touch "$PROJECT_DIR/bot_data.pickle"
-    touch "$PROJECT_DIR/nodes_cache.json"
+    echo "Cleaning up incompatible old data files (your rules in config.json will be preserved)..."
+    rm -rf "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"  
+    touch "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"
     echo -e "${GREEN}Cleanup complete.${NC}"
 
     echo -e "\n${YELLOW}Pulling latest Docker image, rebuilding, and restarting bot...${NC}"
@@ -285,11 +308,13 @@ update_bot() {
     $COMPOSE_CMD up -d --build --remove-orphans
     
     echo -e "\n${GREEN}--- Bot has been updated and restarted successfully! ---${NC}"
-    echo -e "NOTE: Due to major changes, you may need to re-configure some rules in the bot's settings menu."
+    echo -e "Your settings and rules have been preserved and migrated to the new version."
 }
 
 # --- Main Menu ---
 main_menu() {
+    detect_compose_command
+
     while true; do
         print_header
         echo "1) Install or Reinstall Bot"
