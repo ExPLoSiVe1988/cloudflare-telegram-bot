@@ -531,126 +531,26 @@ async def get_ip_health_with_cache(context: ContextTypes.DEFAULT_TYPE, ip: str, 
 
 async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
     if health_check_lock.locked():
-        logger.warning("Health check job is already running. Skipping this execution."); return
+        logger.warning("Health check job is already running. Skipping this execution.")
+        return
         
     async with health_check_lock:
         try:
-            logger.info("--- [HEALTH CHECK] Job Started (with Caching) ---")
+            logger.info("--- [HEALTH CHECK] Job Started (Integrated Hybrid Mode v2) ---")
             config = load_config()
             if config is None:
-                logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted."); return
+                logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted.")
+                return
 
-            if 'health_status' not in context.bot_data: context.bot_data['health_status'] = {}
+            if 'health_status' not in context.bot_data:
+                context.bot_data['health_status'] = {}
             status_data = context.bot_data['health_status']
             
             ping_cache = {}
-            records_under_failover_control = set()
-            
-                                    # === STAGE 1: PROCESS FAILOVER POLICIES (FINAL CORRECTED LOGIC) ===
-            failover_policies = [p for p in config.get("failover_policies", []) if p.get('enabled', True)]
-            
-            for policy in failover_policies:
-                policy_name = policy.get('policy_name', 'Unnamed')
-                primary_ip = policy.get('primary_ip')
-                backup_ips = policy.get('backup_ips', [])
-                port_to_check = policy.get('check_port', 443)
-                record_names = policy.get('record_names', [])
-                zone_name = policy.get('zone_name')
+            lb_active_ips_map = {}
 
-                if not all([primary_ip, backup_ips, record_names, zone_name]):
-                    logger.warning(f"Skipping failover policy '{policy_name}' due to incomplete configuration.")
-                    continue
-
-                policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
-
-                actual_ip_on_cf = None
-                token = CF_ACCOUNTS.get(policy.get('account_nickname'))
-                if token:
-                    zones = await get_all_zones(token)
-                    zone_id = next((z['id'] for z in zones if z['name'] == zone_name), None)
-                    if zone_id:
-                        all_dns_records = await get_dns_records(token, zone_id)
-                        actual_record = next((r for r in all_dns_records if get_short_name(r['name'], zone_name) == record_names[0]), None)
-                        if actual_record: actual_ip_on_cf = actual_record['content']
-                
-                if not actual_ip_on_cf:
-                    logger.warning(f"Could not determine current IP for Failover policy '{policy_name}'. Skipping.")
-                    continue
-
-                primary_nodes = policy.get('primary_monitoring_nodes')
-                primary_threshold = policy.get('primary_threshold')
-                backup_nodes = policy.get('backup_monitoring_nodes', primary_nodes)
-                backup_threshold = policy.get('backup_threshold', primary_threshold)
-                
-                nodes_to_use = primary_nodes if actual_ip_on_cf == primary_ip else backup_nodes
-                threshold_to_use = primary_threshold if actual_ip_on_cf == primary_ip else backup_threshold
-
-                is_current_ip_online = await get_ip_health_with_cache(context, actual_ip_on_cf, port_to_check, nodes_to_use, threshold_to_use, ping_cache)
-
-                if not is_current_ip_online:
-                    if not policy_status.get('downtime_start'):
-                        policy_status['downtime_start'] = datetime.now().isoformat()
-                        await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
-                        continue 
-                    
-                    downtime_dt = datetime.fromisoformat(policy_status['downtime_start'])
-                    failover_minutes = policy.get("failover_minutes", 2.0)
-                    
-                    if (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
-                        logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
-                        continue
-
-                    logger.warning(f"FAILOVER TRIGGERED for '{policy_name}' on IP '{actual_ip_on_cf}'. Searching for backup.")
-                    
-                    next_healthy_backup = None
-                    all_possible_ips = [primary_ip] + backup_ips
-                    
-                    for backup_ip in all_possible_ips:
-                        if backup_ip == actual_ip_on_cf: continue
-                        
-                        nodes_for_backup = primary_nodes if backup_ip == primary_ip else backup_nodes
-                        threshold_for_backup = primary_threshold if backup_ip == primary_ip else backup_threshold
-                        
-                        if await get_ip_health_with_cache(context, backup_ip, port_to_check, nodes_for_backup, threshold_for_backup, ping_cache):
-                            next_healthy_backup = backup_ip
-                            break
-                    
-                    if next_healthy_backup:
-                        await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
-                        await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
-                        policy_status['downtime_start'] = None
-                    elif not policy_status.get('critical_alert_sent', False):
-                        await send_notification(context, 'messages.failover_notification_all_down', policy_name=policy_name, primary_ip=primary_ip, backup_ips=", ".join(backup_ips), add_settings_button=True)
-                        policy_status['critical_alert_sent'] = True
-                else:
-                    if policy_status.get('downtime_start'):
-                        await send_notification(context, 'messages.server_recovered_notification', policy_name=policy_name, ip=actual_ip_on_cf)
-                    policy_status['downtime_start'] = None
-                    if policy_status.get('critical_alert_sent'):
-                        policy_status['critical_alert_sent'] = False
-
-                is_primary_online = await get_ip_health_with_cache(context, primary_ip, port_to_check, primary_nodes, primary_threshold, ping_cache)
-                if is_primary_online and actual_ip_on_cf != primary_ip:
-                    for rec in record_names: records_under_failover_control.add((zone_name, rec))
-                    
-                    if not policy_status.get('uptime_start'):
-                        policy_status['uptime_start'] = datetime.now().isoformat()
-                        if policy.get('auto_failback', True):
-                            failback_minutes = policy.get('failback_minutes', 5.0)
-                            await send_notification(context, 'messages.failback_alert_notification', policy_name=policy_name, primary_ip=primary_ip, failback_minutes=failback_minutes)
-                    
-                    elif policy.get('auto_failback', True):
-                        uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
-                        failback_minutes = policy.get('failback_minutes', 5.0)
-                        if (datetime.now() - uptime_dt) >= timedelta(minutes=failback_minutes):
-                            await switch_dns_ip(context, policy, to_ip=primary_ip)
-                            await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
-                            policy_status.pop('uptime_start', None)
-                elif not is_primary_online:
-                     policy_status.pop('uptime_start', None)
-
-            # === STAGE 2: PROCESS LOAD BALANCER POLICIES ===
-            logger.info("--- [HEALTH CHECK] Stage 2: Processing Load Balancer Policies ---")
+            # === STAGE 1: PROCESS LOAD BALANCER POLICIES (MASTER SYSTEM) ===
+            logger.info("--- [HEALTH CHECK] Stage 1: Processing Load Balancer Policies ---")
             lb_policies = [p for p in config.get("load_balancer_policies", []) if p.get('enabled', True)]
             
             for policy in lb_policies:
@@ -658,10 +558,6 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 record_names = policy.get('record_names', [])
                 zone_name = policy.get('zone_name')
                 
-                if any((zone_name, rec) in records_under_failover_control for rec in record_names):
-                    logger.info(f"Skipping LB policy '{policy_name}' because its records are controlled by an active failover.")
-                    continue
-
                 policy_status = status_data.setdefault(policy_name, {'lb_next_rotation_time': None})
                 
                 healthy_lb_ips = []
@@ -694,32 +590,29 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                 now = datetime.now()
                 time_to_rotate = False
-
                 if policy_status.get('lb_next_rotation_time'):
                     try:
                         next_rotation_time = datetime.fromisoformat(policy_status['lb_next_rotation_time'])
-                        if now >= next_rotation_time:
-                            time_to_rotate = True
-                    except ValueError:
-                        time_to_rotate = True
-                else:
-                    time_to_rotate = True
+                        if now >= next_rotation_time: time_to_rotate = True
+                    except ValueError: time_to_rotate = True
+                else: time_to_rotate = True
                 
                 if actual_ip_on_cf not in healthy_lb_ips:
                     logger.warning(f"Current IP {actual_ip_on_cf} for LB '{policy_name}' is unhealthy. Forcing switch.")
                     time_to_rotate = True
 
+                ip_to_set = actual_ip_on_cf
                 if time_to_rotate:
                     logger.info(f"Rotation triggered for LB '{policy_name}'.")
                     try:
                         current_index = healthy_lb_ips.index(actual_ip_on_cf)
                         next_index = (current_index + 1) % len(healthy_lb_ips)
-                    except ValueError:
-                        next_index = 0
+                    except ValueError: next_index = 0
                     
                     next_ip = healthy_lb_ips[next_index]
                     if actual_ip_on_cf != next_ip:
                          await switch_dns_ip(context, policy, to_ip=next_ip)
+                         ip_to_set = next_ip
                     
                     min_h = policy.get('rotation_min_hours', 1.0)
                     max_h = policy.get('rotation_max_hours', min_h)
@@ -727,6 +620,133 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     next_rotation_time = now + timedelta(seconds=random_delay_seconds)
                     policy_status['lb_next_rotation_time'] = next_rotation_time.isoformat()
                     logger.info(f"Next rotation for '{policy_name}' is scheduled for {next_rotation_time.strftime('%Y-%m-%d %H:%M:%S')}.")
+                
+                for rec_name in record_names:
+                    lb_active_ips_map[(zone_name, rec_name)] = ip_to_set
+
+            # === STAGE 2: PROCESS FAILOVER POLICIES (SAFETY NET SYSTEM) ===
+            logger.info("--- [HEALTH CHECK] Stage 2: Processing Failover Policies ---")
+            failover_policies = [p for p in config.get("failover_policies", []) if p.get('enabled', True)]
+            
+            for policy in failover_policies:
+                policy_name = policy.get('policy_name', 'Unnamed')
+                record_names = policy.get('record_names', [])
+                zone_name = policy.get('zone_name')
+                
+                record_key = (zone_name, record_names[0]) if record_names else None
+                is_hybrid_mode = record_key in lb_active_ips_map
+
+                if is_hybrid_mode:
+                    logger.info(f"Policy '{policy_name}' is in HYBRID mode.")
+                    effective_primary_ip = lb_active_ips_map[record_key]
+                    
+                    lb_policy_ref = next((p for p in lb_policies if p.get('zone_name') == zone_name and record_names[0] in p.get('record_names', [])), None)
+                    if not lb_policy_ref: continue
+
+                    is_lb_ip_online = await get_ip_health_with_cache(
+                        context, effective_primary_ip, lb_policy_ref.get('check_port', 443),
+                        lb_policy_ref.get('monitoring_nodes', []), lb_policy_ref.get('threshold', 1), ping_cache
+                    )
+
+                    if not is_lb_ip_online:
+                        logger.warning(f"HYBRID FAILOVER: Active LB IP '{effective_primary_ip}' for '{policy_name}' is DOWN. Switching to Failover backups.")
+                        
+                        backup_ips = policy.get('backup_ips', [])
+                        backup_nodes = policy.get('backup_monitoring_nodes', [])
+                        backup_threshold = policy.get('backup_threshold', 1)
+                        port_to_check = policy.get('check_port', 443)
+                        next_healthy_backup = None
+
+                        for backup_ip in backup_ips:
+                            if await get_ip_health_with_cache(context, backup_ip, port_to_check, backup_nodes, backup_threshold, ping_cache):
+                                next_healthy_backup = backup_ip
+                                break
+                        
+                        if next_healthy_backup:
+                            await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
+                            await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=effective_primary_ip, to_ip=next_healthy_backup, add_settings_button=True)
+
+                else:
+                    primary_ip = policy.get('primary_ip')
+                    backup_ips = policy.get('backup_ips', [])
+                    port_to_check = policy.get('check_port', 443)
+                    
+                    if not all([primary_ip, backup_ips, record_names, zone_name]): continue
+
+                    policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
+
+                    actual_ip_on_cf = None
+                    token = CF_ACCOUNTS.get(policy.get('account_nickname'))
+                    if token:
+                        zones = await get_all_zones(token)
+                        zone_id = next((z['id'] for z in zones if z['name'] == zone_name), None)
+                        if zone_id:
+                            all_dns_records = await get_dns_records(token, zone_id)
+                            actual_record = next((r for r in all_dns_records if get_short_name(r['name'], zone_name) == record_names[0]), None)
+                            if actual_record: actual_ip_on_cf = actual_record['content']
+                    
+                    if not actual_ip_on_cf: continue
+
+                    primary_nodes = policy.get('primary_monitoring_nodes')
+                    primary_threshold = policy.get('primary_threshold')
+                    backup_nodes = policy.get('backup_monitoring_nodes', primary_nodes)
+                    backup_threshold = policy.get('backup_threshold', primary_threshold)
+                    
+                    nodes_to_use = primary_nodes if actual_ip_on_cf == primary_ip else backup_nodes
+                    threshold_to_use = primary_threshold if actual_ip_on_cf == primary_ip else backup_threshold
+
+                    is_current_ip_online = await get_ip_health_with_cache(context, actual_ip_on_cf, port_to_check, nodes_to_use, threshold_to_use, ping_cache)
+
+                    if not is_current_ip_online:
+                        if not policy_status.get('downtime_start'):
+                            policy_status['downtime_start'] = datetime.now().isoformat()
+                            await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
+                            continue
+                        
+                        downtime_dt = datetime.fromisoformat(policy_status['downtime_start'])
+                        failover_minutes = policy.get("failover_minutes", 2.0)
+                        
+                        if (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
+                            logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
+                            continue
+
+                        logger.warning(f"FAILOVER TRIGGERED for '{policy_name}' on IP '{actual_ip_on_cf}'. Searching for backup.")
+                        next_healthy_backup = None
+                        for backup_ip in backup_ips:
+                            if backup_ip == actual_ip_on_cf: continue
+                            if await get_ip_health_with_cache(context, backup_ip, port_to_check, backup_nodes, backup_threshold, ping_cache):
+                                next_healthy_backup = backup_ip; break
+                        
+                        if next_healthy_backup:
+                            await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
+                            await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
+                            policy_status['downtime_start'] = None
+                        elif not policy_status.get('critical_alert_sent', False):
+                            await send_notification(context, 'messages.failover_notification_all_down', policy_name=policy_name, primary_ip=primary_ip, backup_ips=", ".join(backup_ips), add_settings_button=True)
+                            policy_status['critical_alert_sent'] = True
+                    else:
+                        if policy_status.get('downtime_start'):
+                            await send_notification(context, 'messages.server_recovered_notification', policy_name=policy_name, ip=actual_ip_on_cf)
+                        policy_status['downtime_start'] = None
+                        if policy_status.get('critical_alert_sent'): policy_status['critical_alert_sent'] = False
+
+                    is_primary_online = await get_ip_health_with_cache(context, primary_ip, port_to_check, primary_nodes, primary_threshold, ping_cache)
+                    if is_primary_online and actual_ip_on_cf != primary_ip:
+                        if not policy_status.get('uptime_start'):
+                            policy_status['uptime_start'] = datetime.now().isoformat()
+                            if policy.get('auto_failback', True):
+                                failback_minutes = policy.get('failback_minutes', 5.0)
+                                await send_notification(context, 'messages.failback_alert_notification', policy_name=policy_name, primary_ip=primary_ip, failback_minutes=failback_minutes)
+                        
+                        elif policy.get('auto_failback', True):
+                            uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
+                            failback_minutes = policy.get('failback_minutes', 5.0)
+                            if (datetime.now() - uptime_dt) >= timedelta(minutes=failback_minutes):
+                                await switch_dns_ip(context, policy, to_ip=primary_ip)
+                                await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
+                                policy_status.pop('uptime_start', None)
+                    elif not is_primary_online:
+                         policy_status.pop('uptime_start', None)
 
             await context.application.persistence.flush()
             logger.info("--- [HEALTH CHECK] Job Finished ---")
@@ -1778,15 +1798,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('is_bulk_ip_change')
         context.user_data['bulk_ip_confirm_details'] = {'new_ip': text, 'record_ids': selected_ids}
         kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="bulk_change_ip_execute")],
-              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_cancel")]]
-        await update.message.reply_text(get_text('messages.bulk_confirm_change_ip', lang, count=len(selected_ids), new_ip=f"`{text}`"),
-                                        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_cancel")]]
+        safe_new_ip = escape_markdown_v2(text)
+        await update.message.reply_text(
+            get_text('messages.bulk_confirm_change_ip', lang, count=len(selected_ids), new_ip=f"`{safe_new_ip}`"),
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="MarkdownV2"
+    )
     elif "edit" in context.user_data:
         data = context.user_data.pop("edit")
         context.user_data["confirm"] = {"id": data["id"], "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
         kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
-              [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
-        await update.message.reply_text(f"🔄 `{data['old']}` ➡️ `{text}`", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+          [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+
+        safe_old = escape_markdown_v2(data['old'])
+        safe_new = escape_markdown_v2(text)
+        await update.message.reply_text(f"🔄 `{safe_old}` ➡️ `{safe_new}`", reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
     elif "add_step" in context.user_data:
         step = context.user_data["add_step"]
         zone_name = context.user_data.get('selected_zone_name', 'your_domain.com')
@@ -1860,13 +1887,16 @@ async def select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record = context.user_data.get("records", {}).get(rid)
     if not record:
         await update.callback_query.edit_message_text(get_text('messages.no_records_found', lang)); return
+        
     proxy_text = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
     kb = [[InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{rid}")],
           [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
           [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
-    text = get_text('messages.record_details', lang, type=record['type'], name=f"`{record['name']}`", content=f"`{record['content']}`", proxy_status=proxy_text)
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+          [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]    
+    safe_name = escape_markdown_v2(record['name'])
+    safe_content = escape_markdown_v2(record['content'])
+    text = get_text('messages.record_details', lang, type=record['type'], name=f"`{safe_name}`", content=f"`{safe_content}`", proxy_status=proxy_text)
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
 
 async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -1888,9 +1918,10 @@ async def toggle_proxy_callback(update: Update, context: ContextTypes.DEFAULT_TY
     current_status = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
     new_status = get_text('messages.proxy_status_inactive', lang) if record.get('proxied') else get_text('messages.proxy_status_active', lang)
     kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"toggle_proxy_confirm|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]
-    text = get_text('messages.confirm_proxy_toggle', lang, record_name=f"`{record['name']}`", current_status=current_status, new_status=new_status)
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]          
+    safe_record_name = escape_markdown_v2(record['name'])
+    text = get_text('messages.confirm_proxy_toggle', lang, record_name=f"`{safe_record_name}`", current_status=current_status, new_status=new_status)
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
 
 async def toggle_proxy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -1914,9 +1945,10 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rid = update.callback_query.data.split('|')[1]
     record = context.user_data.get("records", {}).get(rid)
     kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"delete_confirm|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]
-    await update.callback_query.edit_message_text(get_text('messages.confirm_delete_record', lang, record_name=f"`{record['name']}`"),
-                                                  reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]          
+    safe_record_name = escape_markdown_v2(record['name'])
+    await update.callback_query.edit_message_text(get_text('messages.confirm_delete_record', lang, record_name=f"`{safe_record_name}`"),
+                                                  reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
 
 async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -2089,8 +2121,8 @@ async def bulk_delete_execute_callback(update: Update, context: ContextTypes.DEF
         else: fail += 1
         await asyncio.sleep(0.3)
     msg = get_text('messages.bulk_delete_report', lang, success=success, fail=fail)
-    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]    
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
     clear_state(context, preserve=['language', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name'])
 
 async def bulk_change_ip_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2109,9 +2141,11 @@ async def bulk_change_ip_execute_callback(update: Update, context: ContextTypes.
     details = context.user_data.pop('bulk_ip_confirm_details', {})
     if not details:
         await query.edit_message_text(get_text('messages.internal_error', lang)); return
-    new_ip, record_ids = details['new_ip'], details['record_ids']
-    await query.edit_message_text(get_text('messages.bulk_change_ip_progress', lang, count=len(record_ids), new_ip=f"`{new_ip}`"),
-                                  parse_mode="Markdown")
+    new_ip, record_ids = details['new_ip'], details['record_ids']    
+    safe_new_ip = escape_markdown_v2(new_ip)
+    await query.edit_message_text(get_text('messages.bulk_change_ip_progress', lang, count=len(record_ids), new_ip=f"`{safe_new_ip}`"),
+                                  parse_mode="MarkdownV2")
+                                  
     success, fail, skipped = 0, 0, 0
     all_records_map, zone_id = context.user_data.get("records", {}), context.user_data['selected_zone_id']
     for rid in record_ids:
@@ -2124,8 +2158,8 @@ async def bulk_change_ip_execute_callback(update: Update, context: ContextTypes.
         else: skipped += 1
         await asyncio.sleep(0.3)
     msg = get_text('messages.bulk_change_ip_report', lang, success=success, skipped=skipped, fail=fail)
-    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]    
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
     clear_state(context, preserve=['language', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name'])
 
 async def set_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
