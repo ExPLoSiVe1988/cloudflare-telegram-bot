@@ -195,10 +195,6 @@ def get_current_token(context: ContextTypes.DEFAULT_TYPE):
     account_nickname = context.user_data.get('selected_account_nickname')
     return CF_ACCOUNTS.get(account_nickname)
 
-def get_current_token(context: ContextTypes.DEFAULT_TYPE):
-    account_nickname = context.user_data.get('selected_account_nickname')
-    return CF_ACCOUNTS.get(account_nickname)
-
 # --- ADD THE NEW FUNCTION HERE ---
 def reset_policy_health_status(context: ContextTypes.DEFAULT_TYPE, policy_name: str):
     """Resets the health status for a specific policy to its default state."""
@@ -1066,13 +1062,16 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     search_query = context.user_data.get('search_query')
     search_ip_query = context.user_data.get('search_ip_query')
 
-    header_text = f"_{context.user_data.get('selected_account_nickname', 'N/A')}_ / `{zone_name}`"
+    safe_account_nickname = escape_markdown_v2(context.user_data.get('selected_account_nickname', 'N/A'))
+    safe_zone_name = escape_markdown_v2(zone_name or "")
+    header_text = f"_{safe_account_nickname}_ / `{safe_zone_name}`"
+    
     message_text = get_text('messages.all_records_list', lang)
     
     if search_query:
-        message_text = get_text('messages.search_results', lang, query=search_query)
+        message_text = get_text('messages.search_results', lang, query=escape_markdown_v2(search_query))
     elif search_ip_query:
-        message_text = get_text('messages.search_results_ip', lang, query=search_ip_query)
+        message_text = get_text('messages.search_results_ip', lang, query=escape_markdown_v2(search_ip_query))
     
     buttons = []
     
@@ -1083,8 +1082,8 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
         ])
         msg_text = get_text('messages.no_records_found_search' if (search_query or search_ip_query) else 'messages.no_records_found', lang)
         full_message = f"{header_text}\n\n{msg_text}"
-        if query: await query.edit_message_text(full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        else: await context.bot.send_message(update.effective_chat.id, full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        if query: await query.edit_message_text(full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
+        else: await context.bot.send_message(update.effective_chat.id, full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
         return
 
     context.user_data["records"] = {r['id']: r for r in all_records}
@@ -1135,9 +1134,9 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         if query:
-            await query.edit_message_text(full_message, reply_markup=reply_markup, parse_mode="Markdown")
+            await query.edit_message_text(full_message, reply_markup=reply_markup, parse_mode="MarkdownV2")
         else:
-            await context.bot.send_message(update.effective_chat.id, full_message, reply_markup=reply_markup, parse_mode="Markdown")
+            await context.bot.send_message(update.effective_chat.id, full_message, reply_markup=reply_markup, parse_mode="MarkdownV2")
     except Exception:
         pass
 
@@ -1647,7 +1646,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError("Invalid format")
             except (ValueError, IndexError):
                 context.user_data['edit_policy_field'] = 'rotation_interval_range'
-                await update.message.reply_text(get_text('messages.invalid_number_range', lang, default="Invalid format. Please enter a single number (e.g., 2) or a range (e.g., 1,3).")); return
+                await update.message.reply_text(get_text('messages.invalid_number_range', lang)); return # <<< FIX
             
             config = load_config()
             policy = config['load_balancer_policies'][policy_index]
@@ -1673,7 +1672,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not text.isdigit() or not (1 <= int(text) <= 65535): await update.message.reply_text(get_text('messages.invalid_port', lang)); return
             value_to_save = int(text)
         elif field in ['failover_minutes', 'failback_minutes']:
-             if not text.replace('.', '', 1).isdigit() or float(text) <= 0: await update.message.reply_text(get_text('messages.invalid_number', lang)); return
+             if not text.replace('.', '', 1).isdigit() or float(text) <= 0: await update.message.reply_text(get_text('messages.invalid_number', lang)); return # <<< FIX
              value_to_save = float(text)
         else:
             value_to_save = text
@@ -1729,14 +1728,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(get_text('prompts.enter_failover_minutes', lang))
             elif step == 'failover_minutes':
                 if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
-                    await update.message.reply_text(get_text('messages.invalid_number', lang)); return
+                    await update.message.reply_text(get_text('messages.invalid_number', lang)); return # <<< FIX
                 data['failover_minutes'] = float(text)
                 context.user_data['add_policy_step'] = 'account_nickname'
                 buttons = [[InlineKeyboardButton(n, callback_data=f"failover_policy_set_account|{n}")] for n in CF_ACCOUNTS.keys()]
                 await update.message.reply_text(get_text('prompts.choose_cf_account', lang), reply_markup=InlineKeyboardMarkup(buttons))
             elif step == 'failback_minutes':
                 if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
-                    await update.message.reply_text(get_text('messages.invalid_number', lang)); return
+                    await update.message.reply_text(get_text('messages.invalid_number', lang)); return # <<< FIX
                 data['failback_minutes'] = float(text)
                 config = load_config()
                 config['failover_policies'].append(data)
@@ -1770,7 +1769,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         raise ValueError("Invalid format")
                 except (ValueError, IndexError):
-                    await update.message.reply_text("فرمت نامعتبر. لطفاً یک عدد (مثلاً 2) یا یک بازه (مثلاً 1,3) وارد کنید."); return
+                    await update.message.reply_text(get_text('messages.invalid_number_range', lang)); return # <<< FIX
 
                 context.user_data['add_policy_step'] = 'check_port'
                 await update.message.reply_text(get_text('prompts.enter_check_port', lang))
@@ -1893,6 +1892,7 @@ async def select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
           [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
           [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
           [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]    
+    
     safe_name = escape_markdown_v2(record['name'])
     safe_content = escape_markdown_v2(record['content'])
     text = get_text('messages.record_details', lang, type=record['type'], name=f"`{safe_name}`", content=f"`{safe_content}`", proxy_status=proxy_text)
@@ -1908,8 +1908,10 @@ async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zone_name = context.user_data.get('selected_zone_name', '')
     record_short_name = get_short_name(record['name'], zone_name)
     prompt_key = 'prompts.enter_ip' if record['type'] in ['A', 'AAAA'] else 'prompts.enter_content'
-    prompt_text = get_text(prompt_key, lang, name=f"`{record_short_name}`")
-    await update.callback_query.message.reply_text(prompt_text, parse_mode="Markdown")
+    
+    safe_short_name = escape_markdown_v2(record_short_name)
+    prompt_text = get_text(prompt_key, lang, name=f"`{safe_short_name}`")
+    await update.callback_query.message.reply_text(prompt_text, parse_mode="MarkdownV2")
 
 async def toggle_proxy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -1947,8 +1949,10 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"delete_confirm|{rid}")],
           [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]          
     safe_record_name = escape_markdown_v2(record['name'])
-    await update.callback_query.edit_message_text(get_text('messages.confirm_delete_record', lang, record_name=f"`{safe_record_name}`"),
-                                                  reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2")
+    await update.callback_query.edit_message_text(
+        get_text('messages.confirm_delete_record', lang, record_name=f"`{safe_record_name}`"),
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="MarkdownV2"
+    )
 
 async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -1958,8 +1962,11 @@ async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     record = context.user_data.get("records", {}).get(rid, {})
     res = await delete_record(token, context.user_data['selected_zone_id'], rid)
     if res.get("success"):
-        await update.callback_query.edit_message_text(get_text('messages.record_deleted_successfully', lang, record_name=f"`{record.get('name', 'N/A')}`"),
-                                                      parse_mode="Markdown")
+        safe_name = escape_markdown_v2(record.get('name', 'N/A'))
+        await update.callback_query.edit_message_text(
+            get_text('messages.record_deleted_successfully', lang, record_name=f"`{safe_name}`"),
+            parse_mode="MarkdownV2"
+        )
         context.user_data.pop('all_records', None)
         await asyncio.sleep(1)
         await display_records_list(update, context)
@@ -1976,7 +1983,11 @@ async def confirm_change_callback(update: Update, context: ContextTypes.DEFAULT_
     proxied_status = original_record.get("proxied", False)
     res = await update_record(token, context.user_data['selected_zone_id'], info["id"], info["type"], info["name"], info["new"], proxied_status)
     if res.get("success"):
-        await query.edit_message_text(get_text('messages.record_updated_successfully', lang, record_name=f"`{info['name']}`"), parse_mode="Markdown")
+        safe_name = escape_markdown_v2(info['name'])
+        await query.edit_message_text(
+            get_text('messages.record_updated_successfully', lang, record_name=f"`{safe_name}`"),
+            parse_mode="MarkdownV2"
+        )
         context.user_data.pop('all_records', None)
         await asyncio.sleep(1)
         await display_records_list(update, context)
@@ -2017,7 +2028,11 @@ async def add_proxied_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     rtype, name, content = context.user_data.pop("new_type"), context.user_data.pop("new_name"), context.user_data.pop("new_content")
     res = await create_record(token, context.user_data['selected_zone_id'], rtype, name, content, proxied)
     if res.get("success"):
-        await update.callback_query.edit_message_text(get_text('messages.record_added_successfully', lang, rtype=rtype, name=f"`{name}`"), parse_mode="Markdown")
+        safe_name = escape_markdown_v2(name)
+        await update.callback_query.edit_message_text(
+            get_text('messages.record_added_successfully', lang, rtype=rtype, name=f"`{safe_name}`"),
+            parse_mode="MarkdownV2"
+        )
         context.user_data.pop('all_records', None)
         await asyncio.sleep(1)
         await display_records_list(update, context)
@@ -2359,7 +2374,7 @@ async def settings_failover_policies_callback(update: Update, context: ContextTy
 
     try:
         if query: await query.answer()
-    except telegram_error.BadRequest as e:
+    except error.BadRequest as e:
         if "Query is too old" not in str(e): raise e
     
     context.user_data.pop('edit_policy_index', None)
@@ -2374,7 +2389,9 @@ async def settings_failover_policies_callback(update: Update, context: ContextTy
     else:
         policies_text = ""
         for i, policy in enumerate(policies):
-            policies_text += f"*{i+1}. {policy.get('policy_name', 'N/A')}*\n`{policy.get('primary_ip', 'N/A')}`\n\n"
+            safe_name = escape_markdown_v2(policy.get('policy_name', 'N/A'))
+            safe_ip = escape_markdown_v2(policy.get('primary_ip', 'N/A'))
+            policies_text += f"*{i+1}\\. {safe_name}*\n`{safe_ip}`\n\n"
             buttons.append([InlineKeyboardButton(f"{i+1}. {policy.get('policy_name', 'N/A')}", callback_data=f"failover_policy_view|{i}")])
             
     text = get_text('messages.policies_list_menu', lang, policies_text=policies_text)
@@ -2382,9 +2399,9 @@ async def settings_failover_policies_callback(update: Update, context: ContextTy
     buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")])
     
     try:
-        if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-    except telegram_error.BadRequest as e:
+        if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
+        else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
+    except error.BadRequest as e:
         if "Message is not modified" not in str(e): raise e
 
 # --- LOAD BALANCER POLICY MANAGEMENT (NEW FUNCTIONS) ---
@@ -2516,7 +2533,7 @@ async def settings_lb_policies_callback(update: Update, context: ContextTypes.DE
 
     try:
         if query: await query.answer()
-    except telegram_error.BadRequest as e:
+    except error.BadRequest as e:
         if "Query is too old" not in str(e): raise e
     
     context.user_data.pop('edit_policy_index', None)
@@ -2531,8 +2548,9 @@ async def settings_lb_policies_callback(update: Update, context: ContextTypes.DE
     else:
         policies_text = ""
         for i, policy in enumerate(policies):
-            ips_str = ", ".join(policy.get('ips', []))
-            policies_text += f"*{i+1}. {policy.get('policy_name', 'N/A')}*\n`{ips_str}`\n\n"
+            safe_name = escape_markdown_v2(policy.get('policy_name', 'N/A'))
+            safe_ips = escape_markdown_v2(", ".join(policy.get('ips', [])))
+            policies_text += f"*{i+1}\\. {safe_name}*\n`{safe_ips}`\n\n"
             buttons.append([InlineKeyboardButton(f"{i+1}. {policy.get('policy_name', 'N/A')}", callback_data=f"lb_policy_view|{i}")])
             
     text = get_text('messages.lb_policies_list_menu', lang, policies_text=policies_text)
@@ -2540,9 +2558,9 @@ async def settings_lb_policies_callback(update: Update, context: ContextTypes.DE
     buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")])
     
     try:
-        if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-        else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-    except telegram_error.BadRequest as e:
+        if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
+        else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="MarkdownV2")
+    except error.BadRequest as e:
         if "Message is not modified" not in str(e): raise e
 
 async def lb_policy_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
