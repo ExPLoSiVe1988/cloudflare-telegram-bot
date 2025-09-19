@@ -178,7 +178,8 @@
     "not_set": "Not set",
     "search_menu_command_message": "To search, please first select a zone using the /list command, and then use the '🔎 Search' button.",
     "interval_display_fixed": "{hours} hours (Fixed)",
-    "interval_display_random": "{min_hours} to {max_hours} hours (Random)"
+    "interval_display_random": "{min_hours} to {max_hours} hours (Random)",
+    "hybrid_mode_help_text": "Tip: You can define both a Failover and a Load Balancing rule for the same records. In this 'Hybrid Mode', the Load Balancer manages the active IP, and the Failover rule acts as a final safety net if all Load Balancer IPs go down."
   },
   "prompts": {
       "enter_ip": "📥 Please enter the new IP for {name}:",
