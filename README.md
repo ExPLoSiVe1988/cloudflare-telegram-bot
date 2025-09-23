@@ -17,17 +17,21 @@ A powerful Telegram bot for complete DNS record management, equipped with two fu
 ## ✨ Features
 
 ### 🚀 Advanced Monitoring & High Availability
-*   🛡️ **Automatic Failover (High Availability)**: Continuously monitors your primary servers from multiple locations worldwide. If downtime is detected (based on a configurable failure threshold), it automatically switches DNS records to your backup IPs.
-*   🚦 **Smart Load Balancing (Performance & Redundancy)**: Periodically rotates traffic among a pool of healthy servers. The system automatically removes unhealthy servers from the rotation, using only available options.
-*   🔄 **Automatic Failback**: Once the primary server is back online and stable for a configurable period, the bot automatically switches traffic back.
-*   ⚙️ **Complete & Separated In-Bot Management**: All Failover and Load Balancing policies are fully independent and manageable (add, edit, delete) through the settings menu inside the bot.
-*   🧠 **Smart Settings Copy**: To simplify configuration, you can easily copy monitoring settings (cities and threshold) from the primary IP to the backup IPs.
+*   ⚡ **High-Speed Concurrent Monitoring**: The monitoring engine checks all unique IPs across all policies **simultaneously**, reducing detection time from minutes to seconds.
+*   🛡️ **Automatic Failover (High Availability)**: Continuously monitors your primary servers from multiple locations worldwide. If downtime is detected, it automatically switches DNS records to your backup IPs.
+*   🚦 **Advanced Weighted Load Balancing**:
+    *   **Weighted IP Pools**: Assign numerical weights to each IP in a pool (e.g., `1.1.1.1:2, 2.2.2.2:1`) to distribute traffic proportionally based on server capacity or cost.
+    *   **Two Intelligent Rotation Algorithms**: Choose your preferred strategy—**Weighted Random** for organic distribution or **Weighted Round-Robin** for precise, sequential balancing.
+    *   **In-Bot Algorithm Switching**: Easily switch between algorithms on-the-fly from within the bot's settings menu.
+*   🔄 **Automatic Failback**: Once a primary server is stable again, the bot automatically switches traffic back.
+*   ⚙️ **Complete In-Bot Management**: All Failover and Load Balancing policies are fully manageable (add, edit, delete) through the settings menu.
+*   🧠 **Smart Settings Copy**: Easily copy monitoring settings (cities and threshold) from a primary IP to backup IPs.
 
-### ⚙️ General DNS Management
-*   **👥 Multi-Admin Support**: Authorize multiple Telegram users to manage the bot.
-*   **🏢 Multi-Account Support**: Manage DNS records across multiple Cloudflare accounts.
+### ⚙️ General DNS Management & UX
+*   **🎨 Revamped User Interface (HTML)**: A complete migration to HTML formatting for all bot messages, resulting in a cleaner, more professional interface with no distracting characters and significantly improved readability.
+*   **👥 Multi-Admin & Multi-Account Support**: Authorize multiple users and manage DNS across several Cloudflare accounts.
 *   **🐳 Easy Docker Deployment**: Get the bot running in minutes with a fully automated installation script.
-*   **🌐 Multi-Zone Support**: Automatically detects all zones within the selected Cloudflare account.
+*   **🌐 Multi-Zone Support**: Automatically detects all zones within a selected Cloudflare account.
 *   **👥 Bulk Actions**: Select multiple records to delete or change their IP address all at once.
 *   **💾 Backup & Restore**: Create and restore `.json` backups for any of your zones.
 *   **🌍 Multi-Language**: Full support for English and Persian (فارسی).
