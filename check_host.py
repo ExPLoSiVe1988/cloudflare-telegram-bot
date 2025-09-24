@@ -168,8 +168,8 @@ async def get_nodes() -> Dict[str, Any]:
 
 async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str, bool]]:
     """
-    Performs a full TCP check. Returns a dictionary of statuses (True for OK, False for FAIL).
-    Returns None if the entire API call process fails.
+    Performs a full TCP check with intelligent polling and result stability checks
+    to prevent false positives from temporary network issues.
     """
     if not nodes:
         return {}
@@ -181,47 +181,76 @@ async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str,
     
     try:
         async with httpx.AsyncClient() as client:
-            # 1. Initiate the check request
             response = await client.get(check_url, headers=REQUEST_HEADERS, timeout=15)
             response.raise_for_status()
             initial_data = response.json()
 
-            if initial_data.get('ok') != 1:
-                logger.error(f"Check-Host API returned an error for {target}: {initial_data.get('error', 'Unknown error')}")
-                return None
-            
             request_id = initial_data.get('request_id')
             if not request_id:
                 logger.error(f"No request_id returned from Check-Host for {target}.")
                 return None
 
-            # 2. Wait and fetch the results
-            await asyncio.sleep(7)
-            
             result_url = f"{API_BASE_URL}/check-result/{request_id}"
-            result_response = await client.get(result_url, headers=REQUEST_HEADERS, timeout=20)
-            result_response.raise_for_status()
-            results = result_response.json()
+            results = None
+            max_wait_time = 20
+            poll_interval = 5
             
-            logger.info(f"RAW API RESULT for request_id {request_id} on host {target} -> {results}")
+            logger.info(f"Check-Host task created for {target} (ID: {request_id}). Polling for results up to {max_wait_time}s...")
+
+            for attempt in range(max_wait_time // poll_interval):
+                is_last_attempt = (attempt == (max_wait_time // poll_interval - 1))
+                await asyncio.sleep(poll_interval)
+                logger.info(f"Polling for results of {request_id} (Attempt {attempt + 1})...")
+                
+                result_response = await client.get(result_url, headers=REQUEST_HEADERS, timeout=20)
+                if result_response.status_code != 200:
+                    logger.warning(f"Polling attempt failed with status {result_response.status_code}. Retrying...")
+                    continue
+                
+                current_results = result_response.json()
+                
+                all_nodes_reported = all(current_results.get(node) is not None for node in unique_nodes)
+                
+                if not all_nodes_reported and not is_last_attempt:
+                    logger.info(f"Results for {request_id} are not yet complete. Retrying...")
+                    continue
+
+                temp_statuses = {}
+                for node_id in unique_nodes:
+                    result_data = current_results.get(node_id)
+                    is_ok = (result_data and isinstance(result_data, list) and len(result_data) > 0 and 
+                             isinstance(result_data[0], dict) and 'time' in result_data[0])
+                    temp_statuses[node_id] = is_ok
+                
+                num_failures = sum(1 for status in temp_statuses.values() if not status)
+                
+                stability_threshold = len(unique_nodes) // 2 
+
+                if num_failures < stability_threshold:
+                    results = current_results
+                    logger.info(f"Results for {request_id} are stable (failures: {num_failures}). Accepting result.")
+                    break
+                elif is_last_attempt:
+                    results = current_results
+                    logger.warning(f"High number of failures ({num_failures}) for {request_id}, but accepting result as it's the final attempt.")
+                    break
+                else:
+                    logger.warning(f"High number of failures ({num_failures}) for {request_id}. Polling again for stability.")
 
             if not results:
-                logger.warning(f"Received empty result for request {request_id}.")
+                logger.warning(f"Could not get a final result for request {request_id} after {max_wait_time} seconds.")
                 return None
 
-            statuses = {}
+            logger.info(f"FINAL RAW API RESULT for request_id {request_id} on host {target} -> {results}")
+
+            final_statuses = {}
             for node_id in unique_nodes:
                 result_data = results.get(node_id)
-                is_ok = False
-                
-                if result_data and isinstance(result_data, list) and len(result_data) > 0:
-                    first_result = result_data[0]
-                    if isinstance(first_result, dict) and 'time' in first_result:
-                        is_ok = True
-                
-                statuses[node_id] = is_ok
+                is_ok = (result_data and isinstance(result_data, list) and len(result_data) > 0 and 
+                         isinstance(result_data[0], dict) and 'time' in result_data[0])
+                final_statuses[node_id] = is_ok
             
-            return statuses
+            return final_statuses
 
     except Exception as e:
         logger.error(f"An unexpected error occurred in perform_check for {target}: {e}", exc_info=True)
