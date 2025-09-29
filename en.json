@@ -67,7 +67,11 @@
     "copy_settings_yes": "✅ Yes, Apply to Backup",
     "copy_settings_no": " No, Configure Separately",
     "force_update_nodes": "🔄 Force Update Cities List",
-    "change_algorithm": "🔄 Algorithm: {algo_name}"
+    "change_algorithm": "🔄 Algorithm: {algo_name}",
+    "change_type": "🔄 Change Type",
+    "move_record": "📤 Move to another Zone",
+    "action_delete_source": "Yes, Delete Original",
+    "action_copy_only": "No, Just Copy"
   },
   "messages": {
     "welcome": "Welcome to the Cloudflare Management Bot!\nUse /list or /language to get started.",
@@ -184,7 +188,12 @@
     "invalid_weight_positive": "❌ Invalid weight for IP <code>{ip}</code>. Weight must be a positive whole number (1 or greater).",
     "policy_records_updated": "✅ Record names for {policy_type} policy updated successfully!",
     "start_primary_monitoring_setup": "✅ Policy details saved.\n\nNow, let's configure monitoring for the <b>Primary IP</b>.",
-    "start_backup_monitoring_setup": "✅ Primary IP monitoring saved.\n\nNow, let's configure monitoring for the <b>Backup IPs</b>."
+    "start_backup_monitoring_setup": "✅ Primary IP monitoring saved.\n\nNow, let's configure monitoring for the <b>Backup IPs</b>.",
+    "move_record_in_progress": "⏳ Moving record...",
+    "move_record_success": "✅ Record successfully copied to <b>{dest_zone_name}</b>.",
+    "move_record_ask_delete": "Do you want to delete the original record from <b>{source_zone_name}</b>?",
+    "move_record_source_deleted": "✅ Original record deleted. Move complete!",
+    "move_record_copy_complete": "✅ Copy complete. The original record was kept."
   },
   "prompts": {
       "enter_ip": "📥 Please enter the new IP for <code>{name}</code>:",
@@ -224,7 +233,13 @@
       "enter_new_lb_rotation_interval_hours": "Please enter the new rotation time range in hours (min,max).\n\n<b>Examples:</b>\nFor a random rotation between 1 and 3 hours, enter: <code>1,3</code>\nFor a fixed rotation every 2 hours, enter: <code>2</code>",
       "enter_new_lb_record_names": "Please enter the new record names (comma-separated):",
       "ask_copy_monitoring_settings": "✅ Monitoring settings for the Primary IP have been saved successfully.\n\n🔄 Would you like to apply these exact same settings (cities and threshold) to the Backup IPs as well?",
-      "enter_new_lb_interval": "Please enter the new rotation time range in hours (min,max).\n\n<b>Examples:</b>\nFor a random rotation between 1 and 3 hours, enter: <code>1,3</code>\nFor a fixed rotation every 2 hours, enter: <code>2</code>"
+      "enter_new_lb_interval": "Please enter the new rotation time range in hours (min,max).\n\n<b>Examples:</b>\nFor a random rotation between 1 and 3 hours, enter: <code>1,3</code>\nFor a fixed rotation every 2 hours, enter: <code>2</code>",
+      "choose_new_record_type": "Please select the new type for the record <code>{record_name}</code>:",
+      "enter_new_ip_for_record": "📥 Please enter the new <b>IP address</b> for the record <code>{record_name}</code>:",
+      "enter_new_content_for_record": "📥 Please enter the new <b>content</b> for the record <code>{record_name}</code>:",
+      "enter_new_cname_for_record": "📥 Please enter the new <b>target domain</b> (e.g., example.com) for the CNAME record <code>{record_name}</code>:",
+      "choose_destination_account": "Please select the <b>destination Cloudflare account</b>:",
+      "choose_destination_zone": "Please select the <b>destination zone</b> to move the record to:"
   },
   "field_names": {
       "policy_name": "Name",
