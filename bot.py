@@ -1575,6 +1575,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
     text = update.message.text.strip()
 
+        # --- NEW STATE: Awaiting new content after changing record type ---
+    if 'change_type_data' in context.user_data:
+        data = context.user_data.pop('change_type_data')
+        rid = data['rid']
+        new_type = data['new_type']
+        new_content = text
+
+        record = context.user_data.get("records", {}).get(rid)
+        if not record:
+            await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+        
+        proxied = record.get('proxied', False)
+        if new_type not in ['A', 'AAAA', 'CNAME']:
+            proxied = False
+
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+
+        res = await update_record(token, zone_id, rid, new_type, record['name'], new_content, proxied)
+
+        if res.get("success"):
+            await send_or_edit(update, context, get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])))
+            context.user_data.pop('all_records', None)
+            await asyncio.sleep(1)
+            await display_records_list(update, context)
+        else:
+            error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+            await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
+        return
+
     # --- STATE 1: Awaiting a specific input ---
     if context.user_data.get('awaiting_notification_admin_id'):
         context.user_data.pop('awaiting_notification_admin_id')
@@ -1895,24 +1925,227 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
-    rid = update.callback_query.data.split('|')[1]
+    query = update.callback_query
+    rid = query.data.split('|')[1]
     record = context.user_data.get("records", {}).get(rid)
     if not record:
         await send_or_edit(update, context, get_text('messages.no_records_found', lang))
         return
         
     proxy_text = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
-    kb = [[InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
-          [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]    
     
+    kb = [
+        [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.change_type', lang), callback_data=f"change_type|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.move_record', lang), callback_data=f"move_record_start|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]
+    ]    
     text = get_text('messages.record_details', lang, 
                     type=record['type'], 
                     name=escape_html(record['name']), 
                     content=escape_html(record['content']), 
                     proxy_status=proxy_text)
+                    
     await send_or_edit(update, context, text, InlineKeyboardMarkup(kb))
+
+async def move_record_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record move/copy process."""
+    query = update.callback_query
+    await query.answer()
+    
+    rid = query.data.split('|')[1]
+    context.user_data['move_record_rid'] = rid
+    
+    if len(CF_ACCOUNTS) > 1:
+        lang = get_user_lang(context)
+        buttons = [[InlineKeyboardButton(nickname, callback_data=f"move_select_dest_account|{nickname}")] for nickname in CF_ACCOUNTS.keys()]
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+        text = get_text('prompts.choose_destination_account', lang)
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+    else:
+        single_account_nickname = list(CF_ACCOUNTS.keys())[0]
+        await display_destination_zones(update, context, single_account_nickname)
+
+async def move_select_dest_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the selection of the destination account."""
+    query = update.callback_query
+    await query.answer()
+    
+    dest_account_nickname = query.data.split('|')[1]
+    context.user_data['move_dest_account_nickname'] = dest_account_nickname
+    await display_destination_zones(update, context, dest_account_nickname)
+
+async def display_destination_zones(update: Update, context: ContextTypes.DEFAULT_TYPE, account_nickname: str):
+    """Fetches and displays the list of destination zones for the user to choose from."""
+    lang = get_user_lang(context)
+    
+    token = CF_ACCOUNTS.get(account_nickname)
+    if not token:
+        await send_or_edit(update, context, get_text('messages.error_no_token', lang)); return
+        
+    await send_or_edit(update, context, get_text('messages.fetching_zones', lang))
+    
+    all_zones = await get_all_zones(token)
+    
+    context.user_data['all_zones_for_move'] = all_zones
+    
+    source_zone_id = context.user_data.get('selected_zone_id')
+    destination_zones = [zone for zone in all_zones if zone['id'] != source_zone_id]
+    
+    if not destination_zones:
+        await send_or_edit(update, context, "No other zones found in this account to move the record to.")
+        return
+
+    buttons = [[InlineKeyboardButton(zone['name'], callback_data=f"move_select_dest_zone|{zone['id']}")] for zone in destination_zones]
+    
+    rid = context.user_data.get('move_record_rid')
+    if rid:
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+        
+    text = get_text('prompts.choose_destination_zone', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def move_select_dest_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the selection of the destination zone and performs the copy action."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        dest_zone_id = query.data.split('|')[1]
+        rid = context.user_data['move_record_rid']
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Source record not found")
+    except (IndexError, ValueError, KeyError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    await send_or_edit(update, context, get_text('messages.move_record_in_progress', lang))
+
+    dest_token = None
+    dest_account_nickname = context.user_data.get('move_dest_account_nickname')
+    if dest_account_nickname:
+        dest_token = CF_ACCOUNTS.get(dest_account_nickname)
+    elif len(CF_ACCOUNTS) == 1:
+        dest_token = list(CF_ACCOUNTS.values())[0]
+
+    if not dest_token:
+        await send_or_edit(update, context, get_text('messages.error_no_token', lang)); return
+    
+    res = await create_record(
+        token=dest_token,
+        zone_id=dest_zone_id,
+        rtype=record['type'],
+        name=record['name'],
+        content=record['content'],
+        proxied=record.get('proxied', False)
+    )
+
+    if res.get("success"):
+        all_zones_in_dest_account = context.user_data.get('all_zones_for_move', [])
+        dest_zone = next((z for z in all_zones_in_dest_account if z['id'] == dest_zone_id), None)
+        dest_zone_name = dest_zone['name'] if dest_zone else "the selected zone"
+
+        source_zone_name = context.user_data.get('selected_zone_name')
+
+        await send_or_edit(update, context, get_text('messages.move_record_success', lang, dest_zone_name=dest_zone_name))
+        await asyncio.sleep(1)
+
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.action_delete_source', lang), callback_data=f"move_delete_source|{rid}")],
+            [InlineKeyboardButton(get_text('buttons.action_copy_only', lang), callback_data="move_copy_complete")]
+        ]
+        text = get_text('messages.move_record_ask_delete', lang, source_zone_name=source_zone_name)
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await send_or_edit(update, context, get_text('messages.error_creating_record', lang, error=error_msg))
+
+async def move_delete_source_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the original record after a successful copy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        rid = query.data.split('|')[1]
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+    except (IndexError, KeyError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+    
+    res = await delete_record(token, zone_id, rid)
+
+    if res.get("success"):
+        await send_or_edit(update, context, get_text('messages.move_record_source_deleted', lang))
+    else:
+        await send_or_edit(update, context, get_text('messages.error_deleting_record', lang))
+    
+    for key in ['move_record_rid', 'move_dest_account_nickname']: context.user_data.pop(key, None)
+    context.user_data.pop('all_records', None)
+    await asyncio.sleep(2)
+    await display_records_list(update, context)
+
+async def move_copy_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finalizes the process when the user chooses to only copy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    await send_or_edit(update, context, get_text('messages.move_record_copy_complete', lang))
+    
+    for key in ['move_record_rid', 'move_dest_account_nickname']: context.user_data.pop(key, None)
+    context.user_data.pop('all_records', None)
+    await asyncio.sleep(2)
+    await display_records_list(update, context)
+
+async def change_record_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays a list of all possible DNS record types for the user to choose from."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        rid = query.data.split('|')[1]
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Record not found")
+    except (IndexError, ValueError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    buttons = [InlineKeyboardButton(t, callback_data=f"change_type_select|{rid}|{t}") for t in DNS_RECORD_TYPES]
+    buttons_in_rows = chunk_list(buttons, 3)
+    buttons_in_rows.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+
+    text = get_text('prompts.choose_new_record_type', lang, record_name=escape_html(record['name']))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons_in_rows))
+
+async def change_record_type_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the user's selection of a new record type and prompts for the new content."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, rid, new_type = query.data.split('|')
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Record not found")
+    except (IndexError, ValueError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    context.user_data['change_type_data'] = {
+        "rid": rid,
+        "new_type": new_type
+    }
+    
+    prompt_key = 'prompts.enter_new_content_for_record'
+    if new_type in ['A', 'AAAA']:
+        prompt_key = 'prompts.enter_new_ip_for_record'
+    elif new_type == 'CNAME':
+        prompt_key = 'prompts.enter_new_cname_for_record'
+        
+    text = get_text(prompt_key, lang, record_name=escape_html(record['name']))
+    await send_or_edit(update, context, text)
 
 async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
@@ -3289,6 +3522,12 @@ def main():
     application.add_handler(CallbackQueryHandler(refresh_list_callback, pattern="^refresh_list$"))
     application.add_handler(CallbackQueryHandler(back_to_records_list_callback, pattern="^back_to_records_list$"))
     application.add_handler(CallbackQueryHandler(select_callback, pattern="^select\|"))
+    application.add_handler(CallbackQueryHandler(change_record_type_callback, pattern="^change_type\|"))
+    application.add_handler(CallbackQueryHandler(move_record_start_callback, pattern="^move_record_start\|"))
+    application.add_handler(CallbackQueryHandler(move_select_dest_account_callback, pattern="^move_select_dest_account\|"))
+    application.add_handler(CallbackQueryHandler(move_select_dest_zone_callback, pattern="^move_select_dest_zone\|"))
+    application.add_handler(CallbackQueryHandler(move_delete_source_callback, pattern="^move_delete_source\|"))
+    application.add_handler(CallbackQueryHandler(move_copy_complete_callback, pattern="^move_copy_complete$"))
     application.add_handler(CallbackQueryHandler(edit_callback, pattern="^edit\|"))
     application.add_handler(CallbackQueryHandler(confirm_change_callback, pattern="^confirm_change$"))
     application.add_handler(CallbackQueryHandler(toggle_proxy_callback, pattern="^toggle_proxy\|"))
@@ -3302,6 +3541,8 @@ def main():
     application.add_handler(CallbackQueryHandler(search_menu_callback, pattern="^search_menu$"))
     application.add_handler(CallbackQueryHandler(search_by_name_callback, pattern="^search_by_name$"))
     application.add_handler(CallbackQueryHandler(search_by_ip_callback, pattern="^search_by_ip$"))
+    application.add_handler(CallbackQueryHandler(select_callback, pattern="^select\|"))
+    application.add_handler(CallbackQueryHandler(change_record_type_select_callback, pattern="^change_type_select\|"))
     
     # --- Bulk Actions ---
     application.add_handler(CallbackQueryHandler(bulk_start_callback, pattern="^bulk_start$"))
