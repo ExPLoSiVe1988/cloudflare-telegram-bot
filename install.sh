@@ -16,6 +16,7 @@ fi
 
 REPO_URL="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot.git"
 ENV_FILE="$PROJECT_DIR/.env"
+CONFIG_FILE="$PROJECT_DIR/config.json"
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
 COMPOSE_CMD=""
 
@@ -72,41 +73,6 @@ prompt_for_restart() {
 }
 
 # --- Configuration Management Functions ---
-manage_admins() {
-    local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
-    echo -e "\nCurrent Admins: ${YELLOW}${current_admins:-None}${NC}"
-    echo "1) Add Admin ID"
-    echo "2) Remove Admin ID"
-    echo "3) Back"
-    read -p "Choose an option: " choice
-    case $choice in
-        1)
-            read -p "Enter new Admin ID to add: " new_admin
-            if ! [[ "$new_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Must be a number.${NC}"; return; fi
-            if [[ ",$current_admins," == *",$new_admin,"* ]]; then
-                echo -e "${YELLOW}Admin ID $new_admin already exists.${NC}"
-            else
-                if [ -z "$current_admins" ]; then new_list="$new_admin"; else new_list="$current_admins,$new_admin"; fi
-                write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
-                echo -e "${GREEN}Admin $new_admin added.${NC}"
-            fi
-            ;;
-        2)
-            read -p "Enter Admin ID to remove: " remove_admin
-            if ! [[ "$remove_admin" =~ ^[0-9]+$ ]]; then echo -e "${RED}Invalid ID. Must be a number.${NC}"; return; fi
-            new_list=$(echo ",$current_admins," | sed "s/,$remove_admin,/,/" | sed 's/^,//;s/,$//')
-            if [ "$new_list" == "$current_admins" ]; then
-                echo -e "${RED}Admin ID $remove_admin not found.${NC}"
-            else
-                write_env_var "TELEGRAM_ADMIN_IDS" "$new_list"
-                echo -e "${GREEN}Admin $remove_admin removed.${NC}"
-            fi
-            ;;
-        3) return;;
-        *) echo -e "${RED}Invalid option.${NC}";;
-    esac
-    read -p "Press Enter to continue..."
-}
 
 manage_cf_accounts() {
     while true; do
@@ -172,31 +138,43 @@ edit_config() {
     if [ ! -d "$PROJECT_DIR" ]; then echo -e "${RED}Project directory not found. Please run Install first.${NC}"; read -p "Press Enter..."; return; fi
     
     local original_dir=$(pwd)
-    cd "$PROJECT_DIR" || return
+    cd "$PROJECT_DIR" || { echo -e "${RED}Failed to enter project directory.${NC}"; cd "$original_dir"; return; }
     
     local config_changed=false
     while true; do
         print_header
         echo -e "${YELLOW}--- Edit Core Configuration (.env) ---${NC}"
-        echo "1) Manage Admins"
+        echo "1) Manage Super Admins"
         echo "2) Manage Cloudflare Accounts"
         echo "3) Edit Telegram Bot Token"
         echo "4) Back to Main Menu"
         read -p "Choose an option: " choice
         
         case $choice in
-            1) manage_admins; config_changed=true;;
-            2) manage_cf_accounts; config_changed=true;;
+            1)
+                local current_admins=$(read_env_var "TELEGRAM_ADMIN_IDS")
+                echo -e "\nCurrent Super Admins (from .env): ${YELLOW}${current_admins:-None}${NC}"
+                echo -e "${YELLOW}These are the main admins with full control. Regular admins are managed inside the bot.${NC}"
+                read -p "Enter the new comma-separated list of Super Admin IDs: " new_admins
+                write_env_var "TELEGRAM_ADMIN_IDS" "$new_admins"
+                echo -e "${GREEN}Super Admins list updated.${NC}"
+                config_changed=true
+                read -p "Press Enter..."
+                ;;
+            2)
+                manage_cf_accounts
+                config_changed=true
+                ;;
             3)
                 current_token=$(read_env_var "TELEGRAM_BOT_TOKEN")
-                echo "Current Token: $current_token"
+                echo "Current Token: ${current_token:0:10}..."
                 read -p "Enter the new Telegram Bot Token (leave empty to cancel): " new_bot_token
                 if [ -n "$new_bot_token" ]; then
                     write_env_var "TELEGRAM_BOT_TOKEN" "$new_bot_token"
                     echo -e "${GREEN}Bot Token updated.${NC}"
                     config_changed=true
                 fi
-                read -p "Press Enter to continue..."
+                read -p "Press Enter..."
                 ;;
             4) break;;
             *) echo -e "${RED}Invalid option.${NC}";;
@@ -239,6 +217,26 @@ install_bot() {
         echo -e "${YELLOW}Cloning repository into $PROJECT_DIR...${NC}"; git clone "$REPO_URL" "$PROJECT_DIR";
     fi
     
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "\n${RED}WARNING: An existing installation was found.${NC}"
+        echo -e "${YELLOW}The 'Install/Reinstall' option performs a CLEAN installation.${NC}"
+        echo -e "${RED}This will ERASE your existing rules and settings (config.json).${NC}"
+        
+        read -p "Do you want to back up your current config.json first? (y/n): " backup_confirm
+        if [[ "$backup_confirm" == "y" || "$backup_confirm" == "Y" ]]; then
+            backup_name="config.json.bak.$(date +%Y%m%d-%H%M%S)"
+            cp "$CONFIG_FILE" "$PROJECT_DIR/$backup_name"
+            echo -e "${GREEN}Backup created at: $PROJECT_DIR/$backup_name${NC}"
+        fi
+
+        read -p "Are you sure you want to proceed with a clean reinstallation? (y/n): " reinstall_confirm
+        if [[ "$reinstall_confirm" != "y" && "$reinstall_confirm" != "Y" ]]; then
+            echo -e "${YELLOW}Reinstallation cancelled.${NC}"
+            read -p "Press Enter..."
+            return
+        fi
+    fi
+
     echo -e "\n${YELLOW}Stopping any existing bot instance...${NC}"
     $COMPOSE_CMD down --remove-orphans
 
@@ -246,8 +244,9 @@ install_bot() {
     cd "$PROJECT_DIR" || { echo -e "${RED}Failed to enter project directory. Aborting.${NC}"; exit 1; }
     
     echo -e "\n${YELLOW}--- Core Configuration ---${NC}"
+    echo -e "You are setting up the core configuration. These values are stored in the .env file."
     read -p "Enter your Telegram Bot Token: " bot_token
-    read -p "Enter your Telegram Admin User ID(s) (comma-separated): " admin_ids
+    read -p "Enter your SUPER ADMIN User ID(s) (comma-separated): " admin_ids
     
     cf_accounts_list=""
     while true; do
@@ -265,10 +264,10 @@ install_bot() {
     echo "CF_ACCOUNTS=${cf_accounts_list}" >> "$ENV_FILE"
     echo -e "${GREEN}.env file created successfully.${NC}"
 
-    echo -e "\n${YELLOW}Preparing data files...${NC}"
-    rm -rf "$PROJECT_DIR/config.json" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
-    touch "$PROJECT_DIR/config.json" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
-    echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[]}' > "$PROJECT_DIR/config.json"
+    echo -e "\n${YELLOW}Preparing data files for a clean installation...${NC}"
+    rm -f "$CONFIG_FILE" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
+    touch "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
+    echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[],"admins":[]}' > "$CONFIG_FILE"
     echo -e "${GREEN}Data files are now clean and ready.${NC}"
     
     cd "$original_dir"
@@ -299,7 +298,7 @@ update_bot() {
     $COMPOSE_CMD down
 
     echo "Cleaning up incompatible old data files (your rules in config.json will be preserved)..."
-    rm -rf "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"  
+    rm -f "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"  
     touch "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"
     echo -e "${GREEN}Cleanup complete.${NC}"
 
@@ -308,7 +307,7 @@ update_bot() {
     $COMPOSE_CMD up -d --build --remove-orphans
     
     echo -e "\n${GREEN}--- Bot has been updated and restarted successfully! ---${NC}"
-    echo -e "Your settings and rules have been preserved and migrated to the new version."
+    echo -e "Your settings and rules have been preserved."
 }
 
 # --- Main Menu ---
