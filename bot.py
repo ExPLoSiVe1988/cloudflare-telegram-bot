@@ -29,8 +29,8 @@ health_check_lock = asyncio.Lock()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-raw_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
-ADMIN_IDS = {int(admin_id.strip()) for admin_id in raw_admin_ids if admin_id.strip().isdigit()}
+raw_super_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
+SUPER_ADMIN_IDS = {int(admin_id.strip()) for admin_id in raw_super_admin_ids if admin_id.strip().isdigit()}
 
 raw_accounts = os.getenv("CF_ACCOUNTS", "").split(',')
 CF_ACCOUNTS = {}
@@ -205,8 +205,25 @@ def save_config(config_data):
 def get_short_name(full_name: str, zone_name: str) -> str:
     return "@" if full_name == zone_name else full_name.removesuffix(f".{zone_name}")
 
-def is_admin(update: Update):
-    return update.effective_user.id in ADMIN_IDS
+raw_super_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
+SUPER_ADMIN_IDS = {int(admin_id.strip()) for admin_id in raw_super_admin_ids if admin_id.strip().isdigit()}
+
+def is_admin(update: Update) -> bool:
+    """Checks if a user is either a Super Admin or a regular Admin."""
+    user_id = update.effective_user.id
+    if user_id in SUPER_ADMIN_IDS:
+        return True
+    
+    config = load_config()
+    if not config:
+        return False
+        
+    admin_list = config.get("admins", [])
+    return user_id in admin_list
+
+def is_super_admin(update: Update) -> bool:
+    """Checks if a user is a Super Admin (defined in .env)."""
+    return update.effective_user.id in SUPER_ADMIN_IDS
 
 def chunk_list(lst, n): return [lst[i:i + n] for i in range(0, len(lst), n)]
 
@@ -445,7 +462,7 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, message_key: str
     if config is None or not config.get("notifications", {}).get("enabled", False):
         return
 
-    all_notification_ids = set(config.get("notifications", {}).get("chat_ids", [])) | ADMIN_IDS
+    all_notification_ids = set(config.get("notifications", {}).get("chat_ids", [])) | SUPER_ADMIN_IDS
     if not all_notification_ids:
         return
 
@@ -518,6 +535,9 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
             config = load_config()
             if config is None:
                 logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted."); return
+            
+            if 'monitoring_log' not in context.bot_data:
+                context.bot_data['monitoring_log'] = []
 
             all_ips_to_check = {}
             all_policies = config.get("load_balancer_policies", []) + config.get("failover_policies", [])
@@ -558,6 +578,15 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     health_results[ip] = is_online
                     if service_failed:
                         service_failure_detected_in_job = True
+
+            now_iso = datetime.now().isoformat()
+            for ip, is_online in health_results.items():
+                context.bot_data['monitoring_log'].append({
+                    "timestamp": now_iso,
+                    "event_type": "IP_STATUS",
+                    "ip": ip,
+                    "status": "UP" if is_online else "DOWN"
+                })
 
             if service_failure_detected_in_job:
                 new_failure_count = context.bot_data.get('check_host_failure_count', 0) + 1
@@ -642,6 +671,13 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         if selection_pool: chosen_ip = random.choice(selection_pool)
                     
                     if chosen_ip and actual_ip_on_cf != chosen_ip:
+                        context.bot_data['monitoring_log'].append({
+                            "timestamp": now_iso,
+                            "event_type": "LB_ROTATION",
+                            "policy_name": policy_name,
+                            "from_ip": actual_ip_on_cf,
+                            "to_ip": chosen_ip
+                        })
                         await switch_dns_ip(context, policy, to_ip=chosen_ip)
                         ip_to_set = chosen_ip
                         logger.info(f"Switched DNS for '{policy_name}' to choice: {chosen_ip}")
@@ -710,6 +746,14 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         logger.warning(f"FAILOVER TRIGGERED for '{policy_name}' on IP '{actual_ip_on_cf}'. Searching for backup.")
                         next_healthy_backup = next((ip for ip in backup_ips if ip != actual_ip_on_cf and health_results.get(ip, True)), None)
                         if next_healthy_backup:
+                            context.bot_data['monitoring_log'].append({
+                                "timestamp": now_iso,
+                                "event_type": "FAILOVER",
+                                "policy_name": policy_name,
+                                "from_ip": effective_primary_ip,
+                                "to_ip": next_healthy_backup,
+                                "mode": "hybrid"
+                            })
                             await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
                             await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
                             policy_status['downtime_start'] = None
@@ -731,6 +775,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         elif policy.get('auto_failback', True):
                             uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
                             if (datetime.now() - uptime_dt) >= timedelta(minutes=policy.get('failback_minutes', 5.0)):
+                                context.bot_data['monitoring_log'].append({
+                                "timestamp": now_iso,
+                                "event_type": "FAILBACK",
+                                "policy_name": policy_name,
+                                "to_ip": primary_ip
+                            })
                                 await switch_dns_ip(context, policy, to_ip=primary_ip)
                                 await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
                                 policy_status.pop('uptime_start', None)
@@ -741,6 +791,98 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info("--- [HEALTH CHECK] Job Finished ---")
         except Exception as e:
             logger.error(f"!!! [HEALTH CHECK] An unhandled exception in health_check_job !!!", exc_info=True)
+
+def clean_old_monitoring_logs(context: ContextTypes.DEFAULT_TYPE):
+    """Removes old monitoring log entries based on the configured retention period."""
+    config = load_config()
+    retention_days = config.get("log_retention_days", 30)
+    
+    if retention_days <= 0 or 'monitoring_log' not in context.bot_data:
+        return
+    
+    log = context.bot_data['monitoring_log']
+    cutoff_date = datetime.now() - timedelta(days=retention_days)
+    
+    recent_logs = [entry for entry in log if datetime.fromisoformat(entry['timestamp']) >= cutoff_date]
+    
+    if len(recent_logs) < len(log):
+        context.bot_data['monitoring_log'] = recent_logs
+        logger.info(f"Cleaned up {len(log) - len(recent_logs)} old monitoring log entries (older than {retention_days} days).")
+
+async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """Generates and sends the daily monitoring report to all admins."""
+    logger.info("--- [JOB] Generating and sending daily report... ---")
+    
+    clean_old_monitoring_logs(context)
+    log = context.bot_data.get('monitoring_log', [])
+    now = datetime.now()
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    
+    recent_events = [e for e in log if datetime.fromisoformat(e['timestamp']) >= twenty_four_hours_ago]
+    
+    failover_events = [e for e in recent_events if e['event_type'] == 'FAILOVER']
+    lb_rotations = [e for e in recent_events if e['event_type'] == 'LB_ROTATION']
+    
+    lb_distribution = {}
+    if lb_rotations:
+        rotations_by_policy = {}
+        for event in lb_rotations:
+            policy_name = event['policy_name']
+            if policy_name not in rotations_by_policy: rotations_by_policy[policy_name] = []
+            rotations_by_policy[policy_name].append(event)
+        
+        for policy_name, events in rotations_by_policy.items():
+            total_rotations, ip_counts = len(events), {}
+            for event in events:
+                to_ip = event['to_ip']
+                ip_counts[to_ip] = ip_counts.get(to_ip, 0) + 1
+            ip_percentages = {ip: {"count": count, "percent": f"{(count / total_rotations) * 100:.1f}"} for ip, count in ip_counts.items()}
+            lb_distribution[policy_name] = ip_percentages
+
+    uptime_stats = {}
+    ip_status_events = [e for e in recent_events if e['event_type'] == 'IP_STATUS']
+    if ip_status_events:
+        unique_ips_in_log = sorted(list(set(e['ip'] for e in ip_status_events)))
+        for ip in unique_ips_in_log:
+            ip_specific_log = [e for e in ip_status_events if e['ip'] == ip]
+            if ip_specific_log:
+                up_checks = sum(1 for e in ip_specific_log if e['status'] == 'UP')
+                uptime_percent = (up_checks / len(ip_specific_log)) * 100
+                uptime_stats[ip] = f"{uptime_percent:.2f}"
+
+    config = load_config()
+    all_admin_ids = set(config.get("notifications", {}).get("chat_ids", [])) | SUPER_ADMIN_IDS
+    user_data = await context.application.persistence.get_user_data()
+
+    for chat_id in all_admin_ids:
+        lang = user_data.get(chat_id, {}).get('language', 'fa')
+        message_parts = [get_text('messages.daily_report_header', lang)]
+        
+        if not failover_events and not lb_rotations:
+            message_parts.append(get_text('messages.daily_report_no_events', lang))
+        else:
+            message_parts.append(get_text('messages.daily_report_summary', lang, total_outages=len(failover_events), lb_rotations=len(lb_rotations)))
+            if failover_events:
+                message_parts.append(get_text('messages.daily_report_failover_header', lang))
+                for event in failover_events: message_parts.append(get_text('messages.daily_report_failover_entry', lang, **event))
+            if lb_distribution:
+                message_parts.append(get_text('messages.daily_report_lb_header', lang))
+                for policy_name, stats in sorted(lb_distribution.items()):
+                    message_parts.append(get_text('messages.daily_report_lb_entry', lang, policy_name=escape_html(policy_name)))
+                    for ip, data in sorted(stats.items()):
+                        message_parts.append(get_text('messages.daily_report_lb_ip_entry', lang, ip=ip, count=data['count'], percent=data['percent']))
+
+        if uptime_stats:
+            message_parts.append(get_text('messages.daily_report_uptime_header', lang))
+            for ip, uptime_percent in sorted(uptime_stats.items()):
+                message_parts.append(get_text('messages.daily_report_uptime_entry', lang, ip=ip, uptime_percent=uptime_percent))
+        
+        full_message = "\n".join(message_parts)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to send daily report to {chat_id}: {e}")
+
 # --- State Management ---
 def clear_state(context: ContextTypes.DEFAULT_TYPE, preserve=None):
     if preserve is None: preserve = []
@@ -998,20 +1140,29 @@ async def display_zones_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not token:
         await display_account_list(update, context)
         return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    await send_or_edit(update, context, get_text('messages.fetching_zones', lang))
     zones = await get_all_zones(token)
     if not zones:
         msg = get_text('messages.no_zones_found', lang)
         buttons = [[InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="back_to_accounts")]]
-        if query: await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
-        else: await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
+        await send_or_edit(update, context, msg, reply_markup=InlineKeyboardMarkup(buttons))
         return
     context.user_data['all_zones'] = {z['id']: z for z in zones}
-    buttons = [[InlineKeyboardButton(zone['name'], callback_data=f"select_zone|{zone['id']}")] for zone in zones]
+    config = load_config()
+    aliases = config.get('zone_aliases', {})
+    buttons = []
+    for zone in sorted(zones, key=lambda z: aliases.get(z['id'], z['name'])):
+        zone_id = zone['id']
+        zone_name = zone['name']
+        alias = aliases.get(zone_id)
+        button_text = alias if alias else zone_name
+        buttons.append([
+            InlineKeyboardButton(button_text, callback_data=f"select_zone|{zone_id}"),
+            InlineKeyboardButton(get_text('buttons.set_zone_alias', lang), callback_data=f"set_alias_start|{zone_id}")
+        ])
     buttons.append([InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="back_to_accounts")])
     text = get_text('messages.choose_zone', lang)
-    if query: await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await send_or_edit(update, context, text, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
     lang = get_user_lang(context)
@@ -1022,9 +1173,12 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data['current_page'] = page
     if 'all_records' not in context.user_data:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        await send_or_edit(update, context, get_text('messages.fetching_records', lang))
         context.user_data['all_records'] = await get_dns_records(token, zone_id)
     
+    config = load_config()
+    record_aliases = config.get('record_aliases', {}).get(zone_id, {})
+
     records_in_view = context.user_data.get('records_in_view', context.user_data.get('all_records', []))
     search_query, search_ip_query = context.user_data.get('search_query'), context.user_data.get('search_ip_query')
 
@@ -1056,7 +1210,12 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
         short_name = get_short_name(r['name'], zone_name)
         proxy_icon = "☁️" if r.get('proxied') else "⬜️"
         check_icon = "✅" if is_bulk_mode and r['id'] in selected_records else "▫️"
-        button_text = f"{check_icon if is_bulk_mode else proxy_icon} {r['type']} {short_name}"
+        
+        alias_key = f"{r['type']}:{r['name']}"
+        alias = record_aliases.get(alias_key)
+        alias_display = f" ({escape_html(alias)})" if alias else ""
+        
+        button_text = f"{check_icon if is_bulk_mode else proxy_icon} {r['type']} {short_name}{alias_display}"
         callback_data = f"bulk_select|{r['id']}|{page}" if is_bulk_mode else f"select|{r['id']}"
         buttons.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
     
@@ -1087,6 +1246,380 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
 
 # --- Callback Handlers ---
+async def set_record_alias_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of setting a record alias."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        rid = query.data.split('|')[1]
+        record = context.user_data['records'][rid]
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+        
+    prompt_message_id = query.message.message_id
+    
+    context.user_data['awaiting_record_alias'] = {
+        'record_id': rid,
+        'record_name': record['name'],
+        'record_type': record['type'],
+        'prompt_message_id': prompt_message_id 
+    }
+    
+    text = get_text('prompts.set_record_alias_prompt', lang, record_name=escape_html(record['name']))
+    await query.edit_message_text(text, parse_mode="HTML")
+
+async def set_alias_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of setting a zone alias."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        zone_id = query.data.split('|')[1]
+        zone_name = context.user_data['all_zones'][zone_id]['name']
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+        
+    context.user_data['awaiting_zone_alias'] = {
+        'zone_id': zone_id,
+        'zone_name': zone_name
+    }
+    context.user_data['last_menu_message_id'] = query.message.message_id
+    
+    text = get_text('prompts.set_alias_prompt', lang, zone_name=escape_html(zone_name))
+    await query.edit_message_text(text, parse_mode="HTML")
+
+async def clear_logs_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asks for confirmation before clearing logs."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="clear_logs_execute")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="reporting_menu")]
+    ]
+    text = get_text('messages.confirm_clear_logs', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def clear_logs_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears all monitoring logs."""
+    query = update.callback_query
+    
+    if 'monitoring_log' in context.bot_data:
+        context.bot_data['monitoring_log'] = []
+    
+    await query.answer(get_text('messages.logs_cleared_success', get_user_lang(context)), show_alert=True)
+    
+    await reporting_menu_callback(update, context)
+
+async def log_retention_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays options for setting the log retention period."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    buttons = [
+        [InlineKeyboardButton(get_text('messages.log_retention_7_days', lang), callback_data="set_log_retention|7")],
+        [InlineKeyboardButton(get_text('messages.log_retention_30_days', lang), callback_data="set_log_retention|30")],
+        [InlineKeyboardButton(get_text('messages.log_retention_90_days', lang), callback_data="set_log_retention|90")],
+        [InlineKeyboardButton(get_text('messages.log_retention_never', lang), callback_data="set_log_retention|0")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="reporting_menu")]
+    ]
+    text = get_text('messages.log_retention_menu_header', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def set_log_retention_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the selected log retention period to the config."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+    
+    days = int(query.data.split('|')[1])
+    
+    config = load_config()
+    config['log_retention_days'] = days
+    save_config(config)
+    
+    if days > 0:
+        await query.answer(get_text('messages.log_retention_set_success', lang, days=days), show_alert=True)
+    else:
+        await query.answer(get_text('messages.log_retention_set_never', lang), show_alert=True)
+        
+    await reporting_menu_callback(update, context)
+
+async def user_management_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    if not getattr(query, 'is_dummy', False):
+        await query.answer()
+    
+    if not is_super_admin(update):
+        if not getattr(query, 'is_dummy', False):
+            await query.answer(get_text('messages.not_a_super_admin', get_user_lang(context)), show_alert=True)
+        return
+        
+    lang = get_user_lang(context)
+    config = load_config()
+    
+    super_admins_str = ", ".join(map(str, sorted(list(SUPER_ADMIN_IDS))))
+    
+    admins = config.get("admins", [])
+    admins_str = ", ".join(map(str, sorted(admins))) if admins else get_text('messages.no_admins_in_config', lang)
+    
+    text = get_text('messages.user_management_menu_header', lang, super_admins=super_admins_str, admins=admins_str)
+    
+    buttons = [
+        [
+            InlineKeyboardButton(get_text('buttons.add_admin_id', lang), callback_data="admin_add_start"),
+            InlineKeyboardButton(get_text('buttons.remove_admin_id', lang), callback_data="admin_remove_start")
+        ],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+    
+    await send_or_edit(update, context, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def admin_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new bot admin."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    context.user_data['awaiting_admin_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(get_text('prompts.add_admin_prompt', lang))
+
+async def admin_remove_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a list of configurable admins to be removed."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    config = load_config()
+    admins = config.get("admins", [])
+    
+    if not admins:
+        await query.answer(get_text('messages.no_admins_in_config', lang), show_alert=True)
+        return
+        
+    buttons = [[InlineKeyboardButton(str(admin_id), callback_data=f"admin_remove_confirm|{admin_id}")] for admin_id in sorted(admins)]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="user_management_menu")])
+    
+    await query.edit_message_text(get_text('prompts.remove_admin_prompt', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def admin_remove_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lang = get_user_lang(context)
+    
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+        
+    admin_id_to_remove = int(query.data.split('|')[1])
+    config = load_config()
+    
+    if admin_id_to_remove in config.get("admins", []):
+        config["admins"].remove(admin_id_to_remove)
+        save_config(config)
+        await query.answer(get_text('messages.admin_removed_success', lang, user_id=admin_id_to_remove), show_alert=True)
+    else:
+        await query.answer()
+
+    await user_management_menu_callback(update, context)
+
+# --- Notification Recipient Callbacks ---
+async def add_recipient_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new notification recipient."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    context.user_data['awaiting_recipient_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(get_text('prompts.add_recipient_prompt', lang))
+
+async def remove_recipient_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a list of notification recipients to be removed."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    config = load_config()
+    
+    recipients = config.get("notifications", {}).get("chat_ids", [])
+    
+    if not recipients:
+        await query.answer(get_text('messages.no_recipients_to_remove', lang), show_alert=True)
+        return
+        
+    buttons = []
+    for recipient_id in sorted(recipients):
+        buttons.append([InlineKeyboardButton(str(recipient_id), callback_data=f"remove_recipient_confirm|{recipient_id}")])
+    
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="settings_notifications")])
+    
+    await query.edit_message_text(get_text('prompts.remove_recipient_prompt', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def remove_recipient_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes a selected recipient from the config."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    recipient_id_to_remove = int(query.data.split('|')[1])
+    config = load_config()
+    
+    if recipient_id_to_remove in config.get("notifications", {}).get("chat_ids", []):
+        config['notifications']['chat_ids'].remove(recipient_id_to_remove)
+        save_config(config)
+        await query.answer(get_text('messages.recipient_removed_success', lang, user_id=recipient_id_to_remove), show_alert=True)
+    
+    await show_settings_notifications_menu(update, context)
+
+async def user_management_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', get_user_lang(context)), show_alert=True)
+        return
+        
+    lang = get_user_lang(context)
+    config = load_config()
+    
+    super_admins_str = ", ".join(map(str, sorted(list(SUPER_ADMIN_IDS))))
+    
+    admins = config.get("admins", [])
+    admins_str = ", ".join(map(str, sorted(admins))) if admins else get_text('messages.no_admins_in_config', lang)
+    
+    text = get_text('messages.user_management_menu_header', lang, super_admins=super_admins_str, admins=admins_str)
+    
+    buttons = [
+        [
+            InlineKeyboardButton(get_text('buttons.add_admin_id', lang), callback_data="admin_add_start"),
+            InlineKeyboardButton(get_text('buttons.remove_admin_id', lang), callback_data="admin_remove_start")
+        ],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def admin_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    context.user_data['awaiting_admin_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(get_text('prompts.add_admin_prompt', lang))
+
+async def reporting_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    config = load_config()
+    retention_days = config.get("log_retention_days", 30)
+
+    if retention_days > 0:
+        retention_text = get_text('buttons.log_retention_period', lang, days=retention_days)
+    else:
+        retention_text = get_text('buttons.log_retention_never', lang)
+
+    buttons = [
+        [InlineKeyboardButton(get_text('messages.report_time_range_1', lang), callback_data="report_generate|1")],
+        [InlineKeyboardButton(get_text('messages.report_time_range_7', lang), callback_data="report_generate|7")],
+        [InlineKeyboardButton(get_text('messages.report_time_range_30', lang), callback_data="report_generate|30")],
+        [InlineKeyboardButton(retention_text, callback_data="log_retention_menu")],
+        [InlineKeyboardButton(get_text('buttons.clear_monitoring_logs', lang), callback_data="clear_logs_confirm")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+    
+    text = get_text('messages.reporting_menu_header_with_options', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        days = int(query.data.split('|')[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Error processing request.", parse_mode="HTML")
+        return
+
+    await query.edit_message_text(get_text('messages.generating_report', lang), parse_mode="HTML")
+
+    log = context.bot_data.get('monitoring_log', [])
+    now = datetime.now()
+    cutoff_date = now - timedelta(days=days)
+
+    recent_events = [e for e in log if datetime.fromisoformat(e['timestamp']) >= cutoff_date]
+
+    if not recent_events:
+        await query.edit_message_text(get_text('messages.no_events_found', lang, days=days), parse_mode="HTML")
+        return
+
+    failover_events = [e for e in recent_events if e['event_type'] == 'FAILOVER']
+    failback_events = [e for e in recent_events if e['event_type'] == 'FAILBACK']
+    lb_rotations = [e for e in recent_events if e['event_type'] == 'LB_ROTATION']
+    
+    uptime_stats = {}
+    ip_status_events = [e for e in recent_events if e['event_type'] == 'IP_STATUS']
+    if ip_status_events:
+        unique_ips_in_log = sorted(list(set(e['ip'] for e in ip_status_events)))
+        for ip in unique_ips_in_log:
+            ip_specific_log = [e for e in ip_status_events if e['ip'] == ip]
+            if ip_specific_log:
+                up_checks = sum(1 for e in ip_specific_log if e['status'] == 'UP')
+                total_checks = len(ip_specific_log)
+                uptime_percent = (up_checks / total_checks) * 100 if total_checks > 0 else 100
+                uptime_stats[ip] = f"{uptime_percent:.2f}"
+
+    message_parts = [get_text('messages.report_header', lang, days=days)]
+
+    summary_text = get_text('messages.report_summary', lang, 
+                              failovers=len(failover_events),
+                              failbacks=len(failback_events),
+                              rotations=len(lb_rotations))
+    message_parts.append(summary_text)
+
+    if uptime_stats:
+        message_parts.append(get_text('messages.report_uptime_header', lang))
+        for ip, uptime_percent in sorted(uptime_stats.items()):
+            message_parts.append(get_text('messages.report_uptime_entry', lang, ip=ip, uptime_percent=uptime_percent))
+
+    if failover_events:
+        message_parts.append(get_text('messages.report_failover_header', lang))
+        for event in failover_events[:5]:
+            ts = datetime.fromisoformat(event['timestamp']).strftime('%Y-%m-%d %H:%M')
+            safe_event = {k: escape_html(str(v)) for k, v in event.items()}
+            safe_event['ts'] = ts
+            message_parts.append(get_text('messages.report_failover_entry', lang, **safe_event))
+
+    full_message = "\n".join(message_parts)
+    
+    buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="reporting_menu")]]
+
+    await query.edit_message_text(full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
 async def lb_policy_change_algo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1299,53 +1832,6 @@ async def policy_confirm_nodes_callback(update: Update, context: ContextTypes.DE
                               count=len(selected_nodes), 
                               monitoring_type=type_text)
     await send_or_edit(update, context, text_to_send)
-
-async def remove_notification_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lang = get_user_lang(context)
-    config = load_config()
-    
-    admin_ids = config.get("notifications", {}).get("chat_ids", [])
-    
-    if not admin_ids:
-        await query.answer(get_text('messages.no_admins_to_remove', lang), show_alert=True)
-        return
-        
-    buttons = []
-    for admin_id in admin_ids:
-        buttons.append([InlineKeyboardButton(str(admin_id), callback_data=f"confirm_remove_admin|{admin_id}")])
-    
-    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="settings_notifications")])
-    
-    await query.edit_message_text(
-    get_text('prompts.select_admin_to_remove', lang),
-    reply_markup=InlineKeyboardMarkup(buttons)
-)
-
-async def confirm_remove_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lang = get_user_lang(context)
-    
-    admin_id_to_remove = int(query.data.split('|')[1])
-    config = load_config()
-    
-    if admin_id_to_remove in config['notifications']['chat_ids']:
-        config['notifications']['chat_ids'].remove(admin_id_to_remove)
-        save_config(config)
-        await query.answer(get_text('messages.admin_id_removed', lang, admin_id=admin_id_to_remove), show_alert=True)
-    
-    await show_settings_notifications_menu(update, context)
-
-async def add_notification_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lang = get_user_lang(context)
-    
-    context.user_data['awaiting_notification_admin_id'] = True
-    
-    await query.edit_message_text(get_text('prompts.enter_admin_id_to_add', lang))
 
 async def policy_records_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1574,9 +2060,256 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     lang = get_user_lang(context)
     text = update.message.text.strip()
+    
+    def create_dummy_update(message_id, original_update, bot):
+        async def dummy_answer(*args, **kwargs):
+            return True
 
-        # --- NEW STATE: Awaiting new content after changing record type ---
-    if 'change_type_data' in context.user_data:
+        dummy_query = type('obj', (object,), {
+            'is_dummy': True,
+            'answer': dummy_answer,
+            'edit_message_text': lambda *args, **kwargs: bot.edit_message_text(
+                chat_id=original_update.effective_chat.id,
+                message_id=message_id,
+                *args, **kwargs
+            ),
+            'message': type('obj', (object,), {
+                'message_id': message_id,
+                'chat': original_update.effective_chat
+            })
+        })
+        dummy_update = type('obj', (object,), {
+            'callback_query': dummy_query,
+            'effective_user': original_update.effective_user,
+            'effective_chat': original_update.effective_chat
+        })
+        return dummy_update
+    
+    # STATE: AWAITING RECORD ALIAS
+    if context.user_data.get('awaiting_record_alias'):
+        alias_data = context.user_data.pop('awaiting_record_alias')
+        prompt_message_id = alias_data.get('prompt_message_id')
+        lang = get_user_lang(context)
+
+        try:
+            await update.message.delete()
+            if prompt_message_id:
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_message_id)
+        except Exception:
+            pass
+            
+        config = load_config()
+        zone_id = context.user_data.get('selected_zone_id')
+        config.setdefault('record_aliases', {}).setdefault(zone_id, {})
+        
+        alias_key = f"{alias_data['record_type']}:{alias_data['record_name']}"
+        alias_text = text.strip()
+        
+        temp_msg_text = ""
+        if alias_text == '-':
+            if alias_key in config['record_aliases'][zone_id]:
+                del config['record_aliases'][zone_id][alias_key]
+                save_config(config)
+            temp_msg_text = get_text('messages.record_alias_removed_success', lang, record_name=escape_html(alias_data['record_name']))
+        else:
+            config['record_aliases'][zone_id][alias_key] = alias_text
+            save_config(config)
+            temp_msg_text = get_text('messages.record_alias_set_success', lang, record_name=escape_html(alias_data['record_name']), alias=escape_html(alias_text))
+
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(2)
+        try:
+            await temp_msg.delete()
+        except Exception:
+            pass
+
+        context.user_data.pop('all_records', None)
+        
+        clean_update = type('obj', (object,), {
+            'callback_query': None,
+            'effective_chat': update.effective_chat,
+            'effective_user': update.effective_user
+        })
+        
+        await display_records_list(clean_update, context)
+        return
+    
+    # STATE: AWAITING ZONE ALIAS
+    if context.user_data.get('awaiting_zone_alias'):
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+        alias_data = context.user_data.pop('awaiting_zone_alias')
+        zone_id = alias_data['zone_id']
+        zone_name = alias_data['zone_name']
+        lang = get_user_lang(context)
+        
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+            
+        config = load_config()
+        config.setdefault('zone_aliases', {})
+        
+        alias_text = text.strip()
+        
+        if alias_text == '-':
+            if zone_id in config['zone_aliases']:
+                del config['zone_aliases'][zone_id]
+                save_config(config)
+            
+            temp_msg_text = get_text('messages.alias_removed_success', lang, zone_name=escape_html(zone_name))
+        else:
+            config['zone_aliases'][zone_id] = alias_text
+            save_config(config)
+            temp_msg_text = get_text('messages.alias_set_success', lang, zone_name=escape_html(zone_name), alias=escape_html(alias_text))
+
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(3)
+        try: await temp_msg.delete()
+        except Exception: pass
+
+        if message_id_to_edit:
+            dummy_update = create_dummy_update(message_id_to_edit, update, context.bot)
+            await display_zones_list(dummy_update, context)
+        return
+
+    # STATE: ADDING A NEW ADMIN
+    if context.user_data.get('awaiting_admin_id_to_add'):
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+        context.user_data.pop('awaiting_admin_id_to_add')
+
+        if not is_super_admin(update):
+            await update.message.reply_text(get_text('messages.not_a_super_admin', lang))
+            return
+
+        try: await update.message.delete()
+        except Exception: pass
+
+        if not text.isdigit():
+            if message_id_to_edit:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id_to_edit,
+                    text=f"{get_text('prompts.add_admin_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}"
+                )
+                context.user_data['awaiting_admin_id_to_add'] = True
+                context.user_data['last_menu_message_id'] = message_id_to_edit
+            else:
+                await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
+            return
+
+        admin_id = int(text)
+        config = load_config()
+        config.setdefault("admins", [])
+
+        temp_msg_text = ""
+        if admin_id in config["admins"] or admin_id in SUPER_ADMIN_IDS:
+            temp_msg_text = get_text('messages.admin_already_exists', lang)
+        else:
+            config["admins"].append(admin_id)
+            save_config(config)
+            temp_msg_text = get_text('messages.admin_added_success', lang, user_id=admin_id)
+
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(3)
+        try: await temp_msg.delete()
+        except Exception: pass
+
+        if message_id_to_edit:
+            dummy_update = create_dummy_update(message_id_to_edit, update, context.bot)
+            await user_management_menu_callback(dummy_update, context)
+        return
+        
+    # STATE: ADDING A NEW NOTIFICATION RECIPIENT
+    elif context.user_data.get('awaiting_recipient_id_to_add'):
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+        context.user_data.pop('awaiting_recipient_id_to_add')
+
+        try: await update.message.delete()
+        except Exception: pass
+
+        if not text.isdigit():
+            if message_id_to_edit:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id_to_edit,
+                    text=f"{get_text('prompts.add_recipient_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}"
+                )
+                context.user_data['awaiting_recipient_id_to_add'] = True
+                context.user_data['last_menu_message_id'] = message_id_to_edit
+            else:
+                await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
+            return
+        
+        recipient_id = int(text)
+        config = load_config()
+        config.setdefault("notifications", {"enabled": True, "chat_ids": []})
+        
+        temp_msg_text = ""
+        if recipient_id in config["notifications"]["chat_ids"]:
+            temp_msg_text = get_text('messages.recipient_already_exists', lang)
+        else:
+            config["notifications"]["chat_ids"].append(recipient_id)
+            save_config(config)
+            temp_msg_text = get_text('messages.recipient_added_success', lang, user_id=recipient_id)
+
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(3)
+        try: await temp_msg.delete()
+        except Exception: pass
+        
+        if message_id_to_edit:
+            dummy_update = create_dummy_update(message_id_to_edit, update, context.bot)
+            await show_settings_notifications_menu(dummy_update, context)
+        return
+        
+    # STATE: ADDING A NEW NOTIFICATION RECIPIENT
+    elif context.user_data.get('awaiting_recipient_id_to_add'):
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+        context.user_data.pop('awaiting_recipient_id_to_add')
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        if not text.isdigit():
+            if message_id_to_edit:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id_to_edit,
+                    text=f"{get_text('prompts.add_recipient_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}"
+                )
+                context.user_data['awaiting_recipient_id_to_add'] = True
+                context.user_data['last_menu_message_id'] = message_id_to_edit
+            else:
+                await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
+            return
+        
+        recipient_id = int(text)
+        config = load_config()
+        config.setdefault("notifications", {"enabled": True, "chat_ids": []})
+        
+        temp_msg_text = ""
+        if recipient_id in config["notifications"]["chat_ids"]:
+            temp_msg_text = get_text('messages.recipient_already_exists', lang)
+        else:
+            config["notifications"]["chat_ids"].append(recipient_id)
+            save_config(config)
+            temp_msg_text = get_text('messages.recipient_added_success', lang, user_id=recipient_id)
+
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(3)
+        try: await temp_msg.delete()
+        except Exception: pass
+        
+        if message_id_to_edit:
+            dummy_update = create_dummy_update(message_id_to_edit, update)
+            await show_settings_notifications_menu(dummy_update, context)
+        return
+
+    # STATE: CHANGING A RECORD'S TYPE
+    elif 'change_type_data' in context.user_data:
         data = context.user_data.pop('change_type_data')
         rid = data['rid']
         new_type = data['new_type']
@@ -1605,20 +2338,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
         return
 
-    # --- STATE 1: Awaiting a specific input ---
-    if context.user_data.get('awaiting_notification_admin_id'):
-        context.user_data.pop('awaiting_notification_admin_id')
-        if not text.isdigit():
-            await send_or_edit(update, context, get_text('messages.invalid_id_numeric', lang))
-        else:
-            admin_id = int(text)
-            config = load_config()
-            config.setdefault("notifications", {"enabled": True, "chat_ids": []})['chat_ids'].append(admin_id)
-            save_config(config)
-            await send_or_edit(update, context, get_text('messages.admin_id_added', lang, admin_id=admin_id))
-        await show_settings_notifications_menu(update, context)
-        return
-
+    # STATE: ENTERING MONITORING THRESHOLD
     elif context.user_data.get('awaiting_threshold'):
         if not text.isdigit() or int(text) < 1:
             await send_or_edit(update, context, get_text('messages.threshold_invalid_message', lang)); return
@@ -1645,6 +2365,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             policy_name = config['load_balancer_policies'][policy_index].get('policy_name', '')
             await send_or_edit(update, context, get_text('messages.policy_added_successfully', lang, name=escape_html(policy_name)))
+            await asyncio.sleep(2)
             await settings_lb_policies_callback(update, context)
 
         else:
@@ -1665,9 +2386,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 policy_name = config['failover_policies'][policy_index].get('policy_name', '')
                 await send_or_edit(update, context, get_text('messages.policy_added_successfully', lang, name=escape_html(policy_name)))
+                await asyncio.sleep(2)
                 await settings_failover_policies_callback(update, context)
         return
-
+    
     # --- STATE 2: Editing a policy field ---
     elif 'edit_policy_field' in context.user_data:
         field = context.user_data.pop('edit_policy_field')
@@ -1934,19 +2656,34 @@ async def select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     proxy_text = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
     
+    config = load_config()
+    zone_id = context.user_data.get('selected_zone_id')
+    alias_key = f"{record['type']}:{record['name']}"
+    alias = config.get('record_aliases', {}).get(zone_id, {}).get(alias_key)
+    
+    if alias:
+        text = get_text('messages.record_details_with_alias', lang, 
+                        alias=escape_html(alias),
+                        type=record['type'], 
+                        name=escape_html(record['name']), 
+                        content=escape_html(record['content']), 
+                        proxy_status=proxy_text)
+    else:
+        text = get_text('messages.record_details', lang, 
+                        type=record['type'], 
+                        name=escape_html(record['name']), 
+                        content=escape_html(record['content']), 
+                        proxy_status=proxy_text)
+
     kb = [
         [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.set_record_alias', lang), callback_data=f"set_record_alias_start|{rid}")],
         [InlineKeyboardButton(get_text('buttons.change_type', lang), callback_data=f"change_type|{rid}")],
         [InlineKeyboardButton(get_text('buttons.move_record', lang), callback_data=f"move_record_start|{rid}")],
         [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
         [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
         [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]
     ]    
-    text = get_text('messages.record_details', lang, 
-                    type=record['type'], 
-                    name=escape_html(record['name']), 
-                    content=escape_html(record['content']), 
-                    proxy_status=proxy_text)
                     
     await send_or_edit(update, context, text, InlineKeyboardMarkup(kb))
 
@@ -2577,22 +3314,18 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
     buttons = [
         [InlineKeyboardButton(get_text('buttons.manage_failover_policies', lang), callback_data="settings_failover_policies")],
         [InlineKeyboardButton(get_text('buttons.manage_lb_policies', lang), callback_data="settings_lb_policies")],
-        [InlineKeyboardButton(get_text('buttons.manage_notifications', lang), callback_data="settings_notifications")],
-        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]
+        [InlineKeyboardButton(get_text('buttons.reporting_and_stats', lang), callback_data="reporting_menu")]
     ]
+
+    if is_super_admin(update):
+        buttons.append([InlineKeyboardButton(get_text('buttons.user_management', lang), callback_data="user_management_menu")])
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.manage_notifications', lang), callback_data="settings_notifications")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")])
+    
     reply_markup = InlineKeyboardMarkup(buttons)
     text = get_text('messages.settings_menu', lang)
-
-    query = update.callback_query
-    
-    if query and not force_new_message:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        except Exception:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
-    else:
-        chat_id = update.effective_chat.id
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    await send_or_edit(update, context, text, reply_markup)
 
 async def go_to_main_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2941,12 +3674,6 @@ async def lb_policy_delete_confirm_callback(update: Update, context: ContextType
 
 async def settings_notifications_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
-    try:
-        if query: await query.answer()
-    except error.BadRequest as e:
-        if "Query is too old" not in str(e): raise e
-
     if query:
         await query.answer()
     await show_settings_notifications_menu(update, context)
@@ -2958,23 +3685,22 @@ async def show_settings_notifications_menu(update: Update, context: ContextTypes
     is_enabled = config.get("notifications", {}).get("enabled", True)
     status_text = get_text('buttons.notifications_on', lang) if is_enabled else get_text('buttons.notifications_off', lang)
     
+    recipients = config.get("notifications", {}).get("chat_ids", [])
+    recipients_str = ", ".join(map(str, sorted(recipients))) if recipients else get_text('messages.no_recipients_in_config', lang)
+    
     buttons = [
         [InlineKeyboardButton(status_text, callback_data="toggle_notifications")],
         [
-            InlineKeyboardButton(get_text('buttons.add_admin_id', lang), callback_data="add_notification_admin"),
-            InlineKeyboardButton(get_text('buttons.remove_admin_id', lang), callback_data="remove_notification_admin")
+            InlineKeyboardButton(get_text('buttons.add_recipient', lang), callback_data="add_recipient_start"),
+            InlineKeyboardButton(get_text('buttons.remove_recipient', lang), callback_data="remove_recipient_start")
         ],
         [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
     ]
     
-    text = get_text('messages.notifications_menu', lang)
+    text = get_text('messages.notifications_menu_header', lang, recipients=recipients_str)
     reply_markup = InlineKeyboardMarkup(buttons)
-    
-    query = update.callback_query
-    if query:
-        await query.edit_message_text(text, reply_markup=reply_markup)
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+
+    await send_or_edit(update, context, text, reply_markup)
 
 async def toggle_notifications_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3455,6 +4181,61 @@ async def post_startup_tasks(application: Application):
     if not job_queue.get_jobs_by_name("health_check_job"):
         job_queue.run_repeating(health_check_job, interval=310, first=15, name="health_check_job")
 
+    if not job_queue.get_jobs_by_name("daily_report_job"):
+        report_time = datetime.strptime("04:30", "%H:%M").time()
+        job_queue.run_daily(
+            send_daily_report_job,
+            time=report_time,
+            name="daily_report_job"
+        )
+        logger.info(f"Daily report job scheduled to run every day at {report_time} UTC.")
+
+async def debug_show_logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A debug command to show a summary of the latest health check run."""
+    if not is_admin(update): return
+    
+    lang = get_user_lang(context)
+    monitoring_log = context.bot_data.get('monitoring_log', [])
+    
+    if not monitoring_log:
+        await send_or_edit(update, context, get_text('messages.debug_log_empty', lang))
+        return
+        
+    last_event = monitoring_log[-1]
+    last_timestamp = last_event['timestamp']
+    
+    last_run_events = [e for e in monitoring_log if e['timestamp'] == last_timestamp]
+    
+    ip_status_events = [e for e in last_run_events if e['event_type'] == 'IP_STATUS']
+    other_events = [e for e in last_run_events if e['event_type'] != 'IP_STATUS']
+
+    ts_formatted = datetime.fromisoformat(last_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    message_parts = [
+        get_text('messages.debug_log_header_last_run', lang),
+        get_text('messages.debug_log_timestamp', lang, timestamp=ts_formatted)
+    ]
+
+    if ip_status_events:
+        message_parts.append(get_text('messages.debug_log_ip_statuses_header', lang))
+        unique_ips = sorted(list(set(e['ip'] for e in ip_status_events)))
+        for ip in unique_ips:
+            status_entry = next((e for e in ip_status_events if e['ip'] == ip), None)
+            if status_entry:
+                message_parts.append(get_text('messages.debug_log_ip_status_entry', lang, ip=ip, status=status_entry['status']))
+    
+    if other_events:
+        message_parts.append(get_text('messages.debug_log_actions_header', lang))
+        for event in other_events:
+            event_type = event['event_type']
+            if event_type == "FAILOVER":
+                message_parts.append(get_text('messages.debug_log_action_failover', lang, **event))
+            elif event_type == "LB_ROTATION":
+                message_parts.append(get_text('messages.debug_log_action_rotation', lang, **event))
+            elif event_type == "FAILBACK":
+                message_parts.append(get_text('messages.debug_log_action_failback', lang, **event))
+
+    await send_or_edit(update, context, "\n".join(message_parts))
+
 def main():
     """Starts the bot."""
     persistence_file = "bot_data.pickle"
@@ -3509,6 +4290,7 @@ def main():
     application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("restore", restore_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("debuglogs", debug_show_logs_command))
     
     # === Specific Callback Handlers (Corrected & Ordered) ===
 
@@ -3543,6 +4325,12 @@ def main():
     application.add_handler(CallbackQueryHandler(search_by_ip_callback, pattern="^search_by_ip$"))
     application.add_handler(CallbackQueryHandler(select_callback, pattern="^select\|"))
     application.add_handler(CallbackQueryHandler(change_record_type_select_callback, pattern="^change_type_select\|"))
+    application.add_handler(CallbackQueryHandler(clear_logs_confirm_callback, pattern="^clear_logs_confirm$"))
+    application.add_handler(CallbackQueryHandler(clear_logs_execute_callback, pattern="^clear_logs_execute$"))
+    application.add_handler(CallbackQueryHandler(log_retention_menu_callback, pattern="^log_retention_menu$"))
+    application.add_handler(CallbackQueryHandler(set_log_retention_callback, pattern="^set_log_retention\|"))
+    application.add_handler(CallbackQueryHandler(set_alias_start_callback, pattern="^set_alias_start\|"))
+    application.add_handler(CallbackQueryHandler(set_record_alias_start_callback, pattern="^set_record_alias_start\|"))
     
     # --- Bulk Actions ---
     application.add_handler(CallbackQueryHandler(bulk_start_callback, pattern="^bulk_start$"))
@@ -3562,13 +4350,19 @@ def main():
     application.add_handler(CallbackQueryHandler(go_to_main_list_callback, pattern="^go_to_main_list$"))
     application.add_handler(CallbackQueryHandler(go_to_settings_from_startup_callback, pattern="^go_to_settings_from_startup$"))
     application.add_handler(CallbackQueryHandler(sync_now_callback, pattern="^sync_now$"))
+    application.add_handler(CallbackQueryHandler(reporting_menu_callback, pattern="^reporting_menu$"))
+    application.add_handler(CallbackQueryHandler(generate_report_callback, pattern="^report_generate\|"))
     
-    # --- Notification Settings ---
+    # --- Notification Settings & User Management ---
     application.add_handler(CallbackQueryHandler(settings_notifications_callback, pattern="^settings_notifications$"))
     application.add_handler(CallbackQueryHandler(toggle_notifications_callback, pattern="^toggle_notifications$"))
-    application.add_handler(CallbackQueryHandler(add_notification_admin_callback, pattern="^add_notification_admin$"))
-    application.add_handler(CallbackQueryHandler(remove_notification_admin_callback, pattern="^remove_notification_admin$"))
-    application.add_handler(CallbackQueryHandler(confirm_remove_admin_callback, pattern="^confirm_remove_admin\|"))
+    application.add_handler(CallbackQueryHandler(add_recipient_start_callback, pattern="^add_recipient_start$"))
+    application.add_handler(CallbackQueryHandler(remove_recipient_start_callback, pattern="^remove_recipient_start$"))
+    application.add_handler(CallbackQueryHandler(remove_recipient_confirm_callback, pattern="^remove_recipient_confirm\|"))
+    application.add_handler(CallbackQueryHandler(user_management_menu_callback, pattern="^user_management_menu$"))
+    application.add_handler(CallbackQueryHandler(admin_add_start_callback, pattern="^admin_add_start$"))
+    application.add_handler(CallbackQueryHandler(admin_remove_start_callback, pattern="^admin_remove_start$"))
+    application.add_handler(CallbackQueryHandler(admin_remove_confirm_callback, pattern="^admin_remove_confirm\|"))
 
     # --- Failover Policy Management ---
     application.add_handler(CallbackQueryHandler(copy_monitoring_confirm_callback, pattern="^copy_monitoring_confirm\|"))
