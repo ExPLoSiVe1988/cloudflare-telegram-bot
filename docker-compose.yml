@@ -7,6 +7,4 @@ services:
       - .env
     restart: unless-stopped
     volumes:
-      - ./config.json:/app/config.json
-      - ./bot_data.pickle:/app/bot_data.pickle
-      - ./nodes_cache.json:/app/nodes_cache.json
+      - .:/app
