@@ -17,6 +17,33 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, PicklePersistence
 )
 
+# --- Persistent Log File Management ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(SCRIPT_DIR, "monitoring_log.json")
+
+def load_monitoring_log():
+    """Loads the monitoring log from its dedicated JSON file."""
+    try:
+        if not os.path.exists(LOG_FILE):
+            return []
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logger.error(f"Could not read or decode {LOG_FILE}. Returning empty log.")
+        return []
+
+def save_monitoring_log(log_data):
+    """Saves the monitoring log to its dedicated JSON file."""
+    try:
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(log_data, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        # We still keep the error logging, as it's useful.
+        logger.error(f"Could not write to {LOG_FILE}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in save_monitoring_log: {e}", exc_info=True)
+
+# --- Initial Setup ---
 load_dotenv()
 
 logging.basicConfig(
@@ -75,43 +102,47 @@ def get_user_lang(context: ContextTypes.DEFAULT_TYPE):
     return context.user_data.get('language', 'fa')
 
 def get_flag_emoji(country_code: str) -> str:
-    """Converts a two-letter country code to its flag emoji."""
     if not country_code or len(country_code) != 2:
         return "🏳️" 
-    
     offset = 127397
     return chr(ord(country_code[0].upper()) + offset) + chr(ord(country_code[1].upper()) + offset)
 
 # --- Helper Functions ---
 CONFIG_FILE = "config.json"
 
-async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
-    """Unified helper to send/edit messages, always using HTML parse mode."""
+async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, parse_mode="HTML"):
     chat_id = update.effective_chat.id
     query = update.callback_query
     try:
         if query:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            # Check if the message object exists and has text/reply_markup attributes
+            if hasattr(query, 'message') and query.message and (query.message.text != text or query.message.reply_markup != reply_markup):
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            else:
+                # If nothing to edit, just answer the query to stop the loading icon
+                await query.answer()
         else:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     except error.BadRequest as e:
-        if "Message is not modified" not in str(e):
-            logger.error(f"Error editing message: {e}")
+        if "Message is not modified" in str(e):
+            try: await query.answer()
+            except: pass
+        else:
+            logger.error(f"Error editing/sending message: {e}")
             if query:
-                try: await query.answer()
+                try: await query.answer("An error occurred.", show_alert=True)
                 except: pass
-                await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
         logger.error(f"An unexpected error occurred in send_or_edit: {e}", exc_info=True)
 
+
 def escape_html(text: str) -> str:
-    """Escapes special characters for HTML parsing."""
     if not isinstance(text, str):
         text = str(text)
     return html.escape(text)
 
 def normalize_ip_list(ip_list: list) -> list:
-    """Converts a list of IPs into the new format with weights for backward compatibility."""
     normalized = []
     if not ip_list:
         return []
@@ -132,34 +163,31 @@ def is_valid_ip(ip: str) -> bool:
 def load_config():
     try:
         if not os.path.exists(CONFIG_FILE):
-            logger.info(f"{CONFIG_FILE} not found. Creating a new one with default structure.")
+            logger.info(f"{CONFIG_FILE} not found. Creating a new one.")
             default_config = {
                 "notifications": {"enabled": True, "chat_ids": []},
                 "failover_policies": [],
-                "load_balancer_policies": []
+                "load_balancer_policies": [],
+                "admins": [],
+                "zone_aliases": {},
+                "record_aliases": {},
+                "log_retention_days": 30
             }
             save_config(default_config)
             return default_config
 
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-
-        config_needs_migration = False
-        if "load_balancer_policies" not in config:
-            config_needs_migration = "load_balancer_policies" not in config or \
-                                 any("load_balancer" in p for p in config.get("failover_policies", []))
         
-        if config_needs_migration:
+        migrated = False
+        if "load_balancer_policies" not in config or any("load_balancer" in p for p in config.get("failover_policies", [])):
             logger.warning("Legacy configuration format detected. Starting automatic migration...")
-            
             backup_filename = f"{CONFIG_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
             with open(backup_filename, 'w', encoding='utf-8') as backup_f:
                 json.dump(config, backup_f, indent=2, ensure_ascii=False)
             logger.info(f"Successfully created a backup at: {backup_filename}")
 
-            if "load_balancer_policies" not in config:
-                config["load_balancer_policies"] = []
-
+            config.setdefault("load_balancer_policies", [])
             migrated_lb_policies = []
             failover_policies_copy = config.get("failover_policies", []).copy()
             
@@ -180,12 +208,26 @@ def load_config():
                             "threshold": policy.get("backup_threshold", 1)
                         }
                         migrated_lb_policies.append(new_lb_policy)
-                    
                     del policy["load_balancer"]
             
             config["failover_policies"] = failover_policies_copy
             config["load_balancer_policies"].extend(migrated_lb_policies)
-            
+            migrated = True
+
+        if "admins" not in config:
+            config["admins"] = []
+            migrated = True
+        if "zone_aliases" not in config:
+            config["zone_aliases"] = {}
+            migrated = True
+        if "record_aliases" not in config:
+            config["record_aliases"] = {}
+            migrated = True
+        if "log_retention_days" not in config:
+            config["log_retention_days"] = 30
+            migrated = True
+
+        if migrated:
             logger.info("Migration complete. Saving new configuration file.")
             save_config(config)
             
@@ -205,24 +247,17 @@ def save_config(config_data):
 def get_short_name(full_name: str, zone_name: str) -> str:
     return "@" if full_name == zone_name else full_name.removesuffix(f".{zone_name}")
 
-raw_super_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
-SUPER_ADMIN_IDS = {int(admin_id.strip()) for admin_id in raw_super_admin_ids if admin_id.strip().isdigit()}
-
 def is_admin(update: Update) -> bool:
-    """Checks if a user is either a Super Admin or a regular Admin."""
     user_id = update.effective_user.id
     if user_id in SUPER_ADMIN_IDS:
         return True
-    
     config = load_config()
     if not config:
         return False
-        
     admin_list = config.get("admins", [])
     return user_id in admin_list
 
 def is_super_admin(update: Update) -> bool:
-    """Checks if a user is a Super Admin (defined in .env)."""
     return update.effective_user.id in SUPER_ADMIN_IDS
 
 def chunk_list(lst, n): return [lst[i:i + n] for i in range(0, len(lst), n)]
@@ -236,7 +271,6 @@ def reset_policy_health_status(context: ContextTypes.DEFAULT_TYPE, policy_name: 
         del context.bot_data['health_status'][policy_name]
 
 async def set_bot_commands(application: Application):
-    """Sets the bot's command list for the Telegram UI."""
     commands = [
         BotCommand("start", "▶️ Start Bot / شروع مجدد ربات"),
         BotCommand("language", "🌐 Change Language / تغییر زبان"),
@@ -255,7 +289,6 @@ async def set_bot_commands(application: Application):
         logger.error(f"Failed to set bot commands: {e}")
 
 async def policy_force_update_nodes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Forces a refresh of the Check-Host.net node list by clearing the cache."""
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -270,12 +303,11 @@ async def policy_force_update_nodes_callback(update: Update, context: ContextTyp
     await display_countries_for_selection(update, context, page=0)
 
 async def update_check_host_nodes_job(context: ContextTypes.DEFAULT_TYPE):
-    """A scheduled job to periodically refresh the list of Check-Host.net nodes."""
     logger.info("--- [JOB] Starting scheduled Check-Host.net node list update ---")
     
     nodes_data = await check_host.get_nodes()
     if not nodes_data:
-        logger.error("[JOB] Failed to fetch updated node list from Check-Host.net. Will try again on the next run.")
+        logger.error("[JOB] Failed to fetch updated node list from Check-Host.net.")
         return
         
     countries = {}
@@ -293,7 +325,6 @@ async def update_check_host_nodes_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"--- [JOB] Successfully updated and cached {len(nodes_data)} Check-Host.net nodes. ---")
 
 async def clear_zone_cache_for_all_users(persistence: PicklePersistence, zone_id: str):
-    """Clears the 'all_records' cache for a specific zone_id across all users."""
     logger.info(f"CACHE CLEAR: Clearing cache for zone_id {zone_id} for all users.")
     user_data_copy = (await persistence.get_user_data()).copy()
     
@@ -316,7 +347,7 @@ async def clear_zone_cache_for_all_users(persistence: PicklePersistence, zone_id
 # --- API Functions ---
 async def clear_commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A temporary command to forcefully delete all bot commands."""
-    if not is_admin(update): return
+    if not is_super_admin(update): return # Use is_super_admin for safety
     try:
         await context.bot.delete_my_commands()
         await update.message.reply_text("All bot commands have been forcefully deleted from all scopes.")
@@ -327,7 +358,7 @@ async def clear_commands_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def api_request(token: str, method: str, url: str, **kwargs):
     if not token:
-        return {"success": False, "errors": [{"message": "No API token selected for the request."}]}
+        return {"success": False, "errors": [{"message": "No API token selected."}]}
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -352,36 +383,24 @@ async def get_all_zones(token: str):
     return all_zones
 
 async def get_dns_records(token: str, zone_id: str):
-    """Fetches all DNS records for a given zone ID, with robust pagination handling."""
     url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
     all_records, page = [], 1
-    
     while True:
         res = await api_request(token, "get", url, params={'per_page': 100, 'page': page})
-        
         if not res.get("success"):
             logger.error(f"API request failed for get_dns_records on zone {zone_id}, page {page}.")
             break
-            
         data = res.get("result", [])
         if not data:
             break
-
         all_records.extend(data)
-        
         result_info = res.get('result_info', {})
-        total_pages = result_info.get('total_pages', 1)
-        current_page = result_info.get('page', 1)
-        
-        if current_page >= total_pages:
+        if result_info.get('page', 1) >= result_info.get('total_pages', 1):
             break
-            
         page += 1
-        
         if page > 100: 
-            logger.warning("get_dns_records exceeded 100 pages, breaking loop to prevent infinite loop.")
+            logger.warning("get_dns_records exceeded 100 pages, breaking loop.")
             break
-
     return all_records
 
 async def update_record(token: str, zone_id, rid, rtype, name, content, proxied):
@@ -400,18 +419,13 @@ async def create_record(token: str, zone_id, rtype, name, content, proxied):
 
 # --- Health Check & Failover Functions ---
 async def switch_dns_ip(context: ContextTypes.DEFAULT_TYPE, policy: dict, to_ip: str) -> int:
-    """
-    Switches DNS records for a given policy to the target IP (to_ip).
-    It updates any record that is not already pointing to the target IP.
-    Returns the number of successful updates.
-    """
     policy_name = policy.get('policy_name', 'Unnamed Policy')
     logger.info(f"DNS SWITCH: For policy '{policy_name}', ensuring records point to '{to_ip}'.")
     
     account_nickname = policy.get('account_nickname')
     token = CF_ACCOUNTS.get(account_nickname)
     if not token:
-        logger.error(f"DNS SWITCH FAILED for '{policy_name}': No token found for account '{account_nickname}'.")
+        logger.error(f"DNS SWITCH FAILED for '{policy_name}': No token for account '{account_nickname}'.")
         return 0
 
     zones = await get_all_zones(token)
@@ -437,7 +451,7 @@ async def switch_dns_ip(context: ContextTypes.DEFAULT_TYPE, policy: dict, to_ip:
                 success_count += 1
             else:
                 error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
-                logger.error(f"DNS SWITCH FAILED: Could not update record '{record['name']}'. Reason: {error_msg}")
+                logger.error(f"DNS SWITCH FAILED for '{record['name']}'. Reason: {error_msg}")
 
     if success_count > 0:
         await clear_zone_cache_for_all_users(context.application.persistence, zone_id)
@@ -454,10 +468,6 @@ async def check_ip_health(ip: str, port: int, timeout: int = 5) -> bool:
         return False
 
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, message_key: str, add_settings_button: bool = False, **kwargs):
-    """
-    Sends a localized notification message to all configured admin chat IDs,
-    with automatic MarkdownV2 escaping for variables.
-    """
     config = load_config()
     if config is None or not config.get("notifications", {}).get("enabled", False):
         return
@@ -466,12 +476,7 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, message_key: str
     if not all_notification_ids:
         return
 
-    safe_kwargs = {}
-    for key, value in kwargs.items():
-        if isinstance(value, (str, int, float)):
-            safe_kwargs[key] = escape_html(str(value))
-        else:
-            safe_kwargs[key] = value
+    safe_kwargs = {k: escape_html(str(v)) for k, v in kwargs.items()}
 
     user_data = await context.application.persistence.get_user_data()
     
@@ -494,21 +499,45 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, message_key: str
         except Exception as e:
             logger.error(f"Failed to send notification to {chat_id}: {e}", exc_info=True)
 
-async def get_ip_health_with_cache(context: ContextTypes.DEFAULT_TYPE, ip: str, port: int, nodes: list, threshold: int) -> tuple[bool, bool]:
-    """
-    Checks IP health for a single IP using Check-Host. Designed to be called concurrently.
-    Returns a tuple: (is_online: bool, service_failed: bool).
-    """
-    if not ip or not port:
+async def get_ip_health_with_cache(context: ContextTypes.DEFAULT_TYPE, ip: str, policy_details: dict) -> tuple[bool, bool]:
+    if not ip:
         return True, True
 
     is_online = True
     service_failed = False
 
+    check_type = policy_details.get('check_type', 'tcp')
+    port = policy_details.get('check_port')
+    
+    is_failover_policy = 'primary_ip' in policy_details
+    
+    if is_failover_policy:
+        if ip == policy_details.get('primary_ip'):
+            nodes = policy_details.get('primary_monitoring_nodes', [])
+            threshold = policy_details.get('primary_threshold', 1)
+        else:
+            nodes = policy_details.get('backup_monitoring_nodes', [])
+            threshold = policy_details.get('backup_threshold', 1)
+    else:
+        nodes = policy_details.get('monitoring_nodes', [])
+        threshold = policy_details.get('threshold', 1)
+
+    if not port:
+        logger.warning(f"No check_port for IP {ip} in policy '{policy_details.get('policy_name')}'. Assuming online.")
+        return True, True
+
     use_advanced_monitoring = all([nodes, threshold])
 
     if use_advanced_monitoring:
-        check_results = await check_host.perform_check(ip, port, nodes)
+        check_results = None
+        logger.info(f"IP '{ip}' advanced {check_type.upper()} check started...")
+        
+        if check_type == 'http':
+            path = policy_details.get('check_path', '/')
+            protocol = 'https' if policy_details.get('check_protocol', 'https') != 'http' else 'http'
+            check_results = await check_host.perform_http_check(ip, port, path, protocol, nodes)
+        else:
+            check_results = await check_host.perform_check(ip, port, nodes)
         
         if check_results is None:
             logger.warning(f"Could not get check results for {ip}. Assuming online as a fail-safe.")
@@ -530,14 +559,15 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
         return
         
     async with health_check_lock:
+
+        monitoring_log = load_monitoring_log()
+        
         try:
             logger.info("--- [HEALTH CHECK] Job Started (Concurrent Mode) ---")
             config = load_config()
             if config is None:
-                logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted."); return
-            
-            if 'monitoring_log' not in context.bot_data:
-                context.bot_data['monitoring_log'] = []
+                logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted.")
+                return
 
             all_ips_to_check = {}
             all_policies = config.get("load_balancer_policies", []) + config.get("failover_policies", [])
@@ -551,16 +581,15 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                 for ip in set(ips_in_policy):
                     if ip and ip not in all_ips_to_check:
-                        all_ips_to_check[ip] = {
-                            "port": policy.get('check_port', 443),
-                            "nodes": policy.get('primary_monitoring_nodes') or policy.get('monitoring_nodes'),
-                            "threshold": policy.get('primary_threshold') or policy.get('threshold', 1)
-                        }
+                        all_ips_to_check[ip] = policy
+
+            if not all_ips_to_check:
+                logger.info("--- [HEALTH CHECK] No policies configured to check. Job Finished ---")
+                return
             
             tasks, ip_order = [], list(all_ips_to_check.keys())
             for ip in ip_order:
-                ip_config = all_ips_to_check[ip]
-                tasks.append(get_ip_health_with_cache(context, ip, ip_config["port"], ip_config["nodes"], ip_config["threshold"]))
+                tasks.append(get_ip_health_with_cache(context, ip, all_ips_to_check[ip]))
 
             logger.info(f"Dispatching {len(tasks)} health checks concurrently...")
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -581,7 +610,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
             now_iso = datetime.now().isoformat()
             for ip, is_online in health_results.items():
-                context.bot_data['monitoring_log'].append({
+                monitoring_log.append({
                     "timestamp": now_iso,
                     "event_type": "IP_STATUS",
                     "ip": ip,
@@ -671,7 +700,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         if selection_pool: chosen_ip = random.choice(selection_pool)
                     
                     if chosen_ip and actual_ip_on_cf != chosen_ip:
-                        context.bot_data['monitoring_log'].append({
+                        monitoring_log.append({
                             "timestamp": now_iso,
                             "event_type": "LB_ROTATION",
                             "policy_name": policy_name,
@@ -717,6 +746,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     primary_ip = policy.get('primary_ip')
                     backup_ips = policy.get('backup_ips', [])
                     if not all([primary_ip, backup_ips, record_names, zone_name]): continue
+                    valid_ips = set(backup_ips) | {primary_ip}
                     policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
 
                     actual_ip_on_cf = None
@@ -730,29 +760,37 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                             if actual_record: actual_ip_on_cf = actual_record['content']
                     if not actual_ip_on_cf: continue
 
+                    is_current_ip_valid = actual_ip_on_cf in valid_ips
                     is_current_ip_online = health_results.get(actual_ip_on_cf, True)
 
-                    if not is_current_ip_online:
-                        if not policy_status.get('downtime_start'):
+                    if not is_current_ip_valid or not is_current_ip_online:
+                        
+                        if not is_current_ip_valid:
+                            logger.warning(f"POLICY '{policy_name}': Current IP {actual_ip_on_cf} is no longer valid. Forcing failover.")
+                        else:
+                            logger.info(f"POLICY '{policy_name}': Current IP {actual_ip_on_cf} is OFFLINE.")
+                        
+                        if not is_current_ip_valid or not policy_status.get('downtime_start'):
                             policy_status['downtime_start'] = datetime.now().isoformat()
-                            await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
-                            continue
+                            if is_current_ip_online:
+                                await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
+                            save_monitoring_log(monitoring_log)
                         downtime_dt = datetime.fromisoformat(policy_status['downtime_start'])
                         failover_minutes = policy.get("failover_minutes", 2.0)
-                        if (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
+                        if is_current_ip_valid and (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
                             logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
                             continue
 
-                        logger.warning(f"FAILOVER TRIGGERED for '{policy_name}' on IP '{actual_ip_on_cf}'. Searching for backup.")
+                        logger.warning(f"FAILOVER TRIGGERED for '{policy_name}'. Searching for backup.")
                         next_healthy_backup = next((ip for ip in backup_ips if ip != actual_ip_on_cf and health_results.get(ip, True)), None)
                         if next_healthy_backup:
-                            context.bot_data['monitoring_log'].append({
+                            monitoring_log.append({
                                 "timestamp": now_iso,
                                 "event_type": "FAILOVER",
                                 "policy_name": policy_name,
-                                "from_ip": effective_primary_ip,
+                                "from_ip": actual_ip_on_cf,
                                 "to_ip": next_healthy_backup,
-                                "mode": "hybrid"
+                                "mode": "standard"
                             })
                             await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
                             await send_notification(context, 'messages.failover_notification_message', policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup, add_settings_button=True)
@@ -762,6 +800,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                             policy_status['critical_alert_sent'] = True
                     else:
                         if policy_status.get('downtime_start'):
+                            logger.info(f"POLICY '{policy_name}': Downtime started at {policy_status['downtime_start']}. Sending initial alert.")
                             await send_notification(context, 'messages.server_recovered_notification', policy_name=policy_name, ip=actual_ip_on_cf)
                         policy_status['downtime_start'] = None
                         if policy_status.get('critical_alert_sent'): policy_status['critical_alert_sent'] = False
@@ -775,46 +814,59 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         elif policy.get('auto_failback', True):
                             uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
                             if (datetime.now() - uptime_dt) >= timedelta(minutes=policy.get('failback_minutes', 5.0)):
-                                context.bot_data['monitoring_log'].append({
+                                monitoring_log.append({
                                 "timestamp": now_iso,
                                 "event_type": "FAILBACK",
                                 "policy_name": policy_name,
                                 "to_ip": primary_ip
-                            })
+                                })
                                 await switch_dns_ip(context, policy, to_ip=primary_ip)
                                 await send_notification(context, 'messages.failback_executed_notification', policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
                                 policy_status.pop('uptime_start', None)
                     elif not is_primary_online:
                          policy_status.pop('uptime_start', None)
+                    pass
 
-            await context.application.persistence.flush()
-            logger.info("--- [HEALTH CHECK] Job Finished ---")
         except Exception as e:
             logger.error(f"!!! [HEALTH CHECK] An unhandled exception in health_check_job !!!", exc_info=True)
+        
+        finally:
+            logger.info("--- [HEALTH CHECK] Finalizing job and saving logs. ---")
+            save_monitoring_log(monitoring_log)
+            
+            try:
+                await context.application.persistence.flush()
+            except Exception as e:
+                logger.error(f"Failed to flush persistence at the end of health check job: {e}")
+            
+            logger.info("--- [HEALTH CHECK] Job Finished ---")
 
 def clean_old_monitoring_logs(context: ContextTypes.DEFAULT_TYPE):
     """Removes old monitoring log entries based on the configured retention period."""
     config = load_config()
     retention_days = config.get("log_retention_days", 30)
     
-    if retention_days <= 0 or 'monitoring_log' not in context.bot_data:
+    if retention_days <= 0:
         return
     
-    log = context.bot_data['monitoring_log']
-    cutoff_date = datetime.now() - timedelta(days=retention_days)
+    log = load_monitoring_log()
+    if not log:
+        return
     
+    cutoff_date = datetime.now() - timedelta(days=retention_days)
+
     recent_logs = [entry for entry in log if datetime.fromisoformat(entry['timestamp']) >= cutoff_date]
     
     if len(recent_logs) < len(log):
-        context.bot_data['monitoring_log'] = recent_logs
+        save_monitoring_log(recent_logs)
         logger.info(f"Cleaned up {len(log) - len(recent_logs)} old monitoring log entries (older than {retention_days} days).")
 
 async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     """Generates and sends the daily monitoring report to all admins."""
     logger.info("--- [JOB] Generating and sending daily report... ---")
     
-    clean_old_monitoring_logs(context)
-    log = context.bot_data.get('monitoring_log', [])
+    clean_old_monitoring_logs()
+    log = load_monitoring_log()
     now = datetime.now()
     twenty_four_hours_ago = now - timedelta(hours=24)
     
@@ -1246,6 +1298,35 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
 
 # --- Callback Handlers ---
+async def failover_start_backup_monitoring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'No, configure separately' button to start backup monitoring setup."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        policy_index = int(query.data.split('|')[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    # Set the context for the node selection process for BACKUP IPs
+    context.user_data['edit_policy_index'] = policy_index
+    context.user_data['editing_policy_type'] = 'failover'
+    context.user_data['monitoring_type'] = 'backup' # <-- This is the key part
+    
+    # Load existing backup nodes if any, otherwise start with an empty list
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+    context.user_data['policy_selected_nodes'] = policy.get('backup_monitoring_nodes', [])
+
+    # Send a message to the user and then show the country selection
+    msg = get_text('messages.start_backup_monitoring_setup', lang)
+    await query.edit_message_text(msg)
+    await asyncio.sleep(2) # Give user time to read the message
+    
+    await display_countries_for_selection(update, context, page=0)
+
 async def set_record_alias_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the process of setting a record alias."""
     query = update.callback_query
@@ -1310,8 +1391,7 @@ async def clear_logs_execute_callback(update: Update, context: ContextTypes.DEFA
     """Clears all monitoring logs."""
     query = update.callback_query
     
-    if 'monitoring_log' in context.bot_data:
-        context.bot_data['monitoring_log'] = []
+    save_monitoring_log([])
     
     await query.answer(get_text('messages.logs_cleared_success', get_user_lang(context)), show_alert=True)
     
@@ -1567,7 +1647,7 @@ async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT
 
     await query.edit_message_text(get_text('messages.generating_report', lang), parse_mode="HTML")
 
-    log = context.bot_data.get('monitoring_log', [])
+    log = load_monitoring_log()
     now = datetime.now()
     cutoff_date = now - timedelta(days=days)
 
@@ -4366,6 +4446,7 @@ def main():
 
     # --- Failover Policy Management ---
     application.add_handler(CallbackQueryHandler(copy_monitoring_confirm_callback, pattern="^copy_monitoring_confirm\|"))
+    application.add_handler(CallbackQueryHandler(failover_start_backup_monitoring_callback, pattern="^failover_start_backup_monitoring\|"))
     application.add_handler(CallbackQueryHandler(settings_failover_policies_callback, pattern="^settings_failover_policies$"))
     application.add_handler(CallbackQueryHandler(failover_policy_view_callback, pattern="^failover_policy_view\|"))
     application.add_handler(CallbackQueryHandler(failover_policy_edit_callback, pattern="^failover_policy_edit\|"))
