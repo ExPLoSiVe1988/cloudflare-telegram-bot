@@ -38,7 +38,6 @@ def save_monitoring_log(log_data):
         with open(LOG_FILE, 'w', encoding='utf-8') as f:
             json.dump(log_data, f, indent=2, ensure_ascii=False)
     except IOError as e:
-        # We still keep the error logging, as it's useful.
         logger.error(f"Could not write to {LOG_FILE}: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"An unexpected error occurred in save_monitoring_log: {e}", exc_info=True)
@@ -115,11 +114,9 @@ async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     query = update.callback_query
     try:
         if query:
-            # Check if the message object exists and has text/reply_markup attributes
             if hasattr(query, 'message') and query.message and (query.message.text != text or query.message.reply_markup != reply_markup):
                 await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
             else:
-                # If nothing to edit, just answer the query to stop the loading icon
                 await query.answer()
         else:
             await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -347,7 +344,7 @@ async def clear_zone_cache_for_all_users(persistence: PicklePersistence, zone_id
 # --- API Functions ---
 async def clear_commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A temporary command to forcefully delete all bot commands."""
-    if not is_super_admin(update): return # Use is_super_admin for safety
+    if not is_super_admin(update): return
     try:
         await context.bot.delete_my_commands()
         await update.message.reply_text("All bot commands have been forcefully deleted from all scopes.")
@@ -772,9 +769,11 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         
                         if not is_current_ip_valid or not policy_status.get('downtime_start'):
                             policy_status['downtime_start'] = datetime.now().isoformat()
-                            if is_current_ip_online:
-                                await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
+                            logger.info(f"POLICY '{policy_name}': Downtime started. Sending initial alert.")
+                            await send_notification(context, 'messages.server_alert_notification', policy_name=policy_name, ip=actual_ip_on_cf, add_settings_button=True)
                             save_monitoring_log(monitoring_log)
+                            continue
+                        
                         downtime_dt = datetime.fromisoformat(policy_status['downtime_start'])
                         failover_minutes = policy.get("failover_minutes", 2.0)
                         if is_current_ip_valid and (datetime.now() - downtime_dt) < timedelta(minutes=failover_minutes):
@@ -1310,20 +1309,19 @@ async def failover_start_backup_monitoring_callback(update: Update, context: Con
         await query.edit_message_text(get_text('messages.session_expired_error', lang))
         return
 
-    # Set the context for the node selection process for BACKUP IPs
     context.user_data['edit_policy_index'] = policy_index
     context.user_data['editing_policy_type'] = 'failover'
-    context.user_data['monitoring_type'] = 'backup' # <-- This is the key part
+    context.user_data['monitoring_type'] = 'backup'
     
-    # Load existing backup nodes if any, otherwise start with an empty list
     config = load_config()
     policy = config['failover_policies'][policy_index]
     context.user_data['policy_selected_nodes'] = policy.get('backup_monitoring_nodes', [])
 
-    # Send a message to the user and then show the country selection
     msg = get_text('messages.start_backup_monitoring_setup', lang)
-    await query.edit_message_text(msg)
-    await asyncio.sleep(2) # Give user time to read the message
+    
+    await query.edit_message_text(msg, parse_mode="HTML")
+    
+    await asyncio.sleep(2)
     
     await display_countries_for_selection(update, context, page=0)
 
