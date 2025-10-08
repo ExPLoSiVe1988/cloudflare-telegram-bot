@@ -4,7 +4,7 @@
 <br>
 
 # Cloudflare Management Bot 🐳
-A powerful Telegram bot for complete DNS record management, equipped with two fully independent systems: **intelligent Monitoring & Automatic Failover** and **Smart Load Balancing**. This bot monitors your servers 24/7, redirecting traffic to backup servers in case of an outage or distributing it among healthy servers to ensure maximum uptime and performance.
+A powerful Telegram bot for complete DNS record management and intelligent monitoring. Equipped with **Standalone Monitoring**, **Automatic Failover**, and **Smart Load Balancing**, this bot is your all-in-one solution for ensuring maximum uptime and performance.
 
 ---
 <div align="center">
@@ -16,32 +16,33 @@ A powerful Telegram bot for complete DNS record management, equipped with two fu
 
 ## ✨ Features
 
-### 🚀 Advanced Monitoring & High Availability
-*   ⚡ **High-Speed Concurrent Monitoring**: The monitoring engine checks all unique IPs across all policies **simultaneously**, reducing detection time from minutes to seconds.
-*   🛡️ **Automatic Failover (High Availability)**: Continuously monitors your primary servers from multiple locations worldwide. If downtime is detected, it automatically switches DNS records to your backup IPs.
+### 🚀 Universal & Advanced Monitoring
+*   👁️ **Standalone Monitoring**: Monitor any IP or domain (like a database server or a third-party API) independently of your Cloudflare DNS, with instant up/down alerts.
+*   📍 **Centralized Monitoring Groups**: Create reusable groups of monitoring locations (e.g., "Europe," "Iran") with a defined failure threshold. Assign these groups to any monitor or policy for fast, consistent, and easily manageable setups.
+*   🛡️ **Automatic Failover (High Availability)**: If a primary server goes down, the bot automatically switches DNS records to a healthy backup IP from your predefined list.
 *   🚦 **Advanced Weighted Load Balancing**:
-    *   **Weighted IP Pools**: Assign numerical weights to each IP in a pool (e.g., `1.1.1.1:2, 2.2.2.2:1`) to distribute traffic proportionally based on server capacity or cost.
-    *   **Two Intelligent Rotation Algorithms**: Choose your preferred strategy—**Weighted Random** for organic distribution or **Weighted Round-Robin** for precise, sequential balancing.
-*   🔄 **Automatic Failback**: Once a primary server is stable again, the bot automatically switches traffic back.
-*   📊 **On-Demand Reporting & Log Management**:
-    *   Generate monitoring reports for custom timeframes (24 hours, 7 days, 30 days).
-    *   Configure automatic log deletion policies to manage data retention.
+    *   **Weighted IP Pools**: Distribute traffic proportionally based on server capacity (e.g., `1.1.1.1:2, 2.2.2.2:1`).
+    *   **Two Intelligent Algorithms**: Choose between **Weighted Random** and **Weighted Round-Robin** (default).
+*   📊 **Advanced Reporting & Analytics**:
+    *   **Time-Based Analytics**: Load Balancer reports now show the **total time (hours) and percentage** each IP was active, providing a true reflection of traffic distribution.
+    *   Generate on-demand reports for custom timeframes and manage log retention policies.
 
 ### ⚙️ Advanced DNS & User Management
 *   **🏷️ Zone & Record Aliases**: Assign friendly display names to both your zones (domains) and individual records for much easier identification and management.
-*   **📤 Move & Copy Records Between Zones**: Easily migrate a DNS record from one zone to another, even **across different Cloudflare accounts**, directly within the bot.
-*   **🔄 Convert Record Types**: Change the type of an existing record (e.g., from `CNAME` to `A`) on the fly without needing to delete and recreate it.
-*   **👥 Advanced User Management**:
+*   **👥 Advanced In-Bot User Management**:
     *   **Super Admins** (from `.env`) can manage **Regular Admins** directly within the bot.
-    *   Manage a separate list of **Notification Recipients** who receive alerts without having admin privileges.
-*   **👥 Bulk Actions**: Select multiple records to delete or change their IP address all at once.
+    *   Manage a separate list of **Notification Recipients** who only receive alerts without having admin privileges.
+*   **📤 Move & Copy Records**: Easily migrate DNS records between different zones, even across different Cloudflare accounts.
+*   **🔄 Convert Record Types**: Change a record's type (e.g., from `A` to `CNAME`) on the fly.
+*   **👥 Bulk Actions**: Delete or change the IP for multiple records at once.
 *   **💾 Backup & Restore**: Create and restore `.json` backups for any of your zones.
 
-### 🤖 General Bot & UX Features
-*   **🎨 Revamped User Interface (HTML)**: A complete migration to HTML formatting for all bot messages, resulting in a cleaner, more professional interface.
-*   **🐳 Smart & Safe Installation Script**: The management script now warns you before overwriting settings on reinstall and offers to create a backup.
-*   **👥 Multi-Account Support**: Manage DNS across several Cloudflare accounts.
-*   **🌍 Multi-Language**: Full support for English and Persian (فارسی).
+### 🤖 General Bot & UX
+*   **🚀 Quick Setup Wizard**: A new step-by-step wizard guides new users through creating their first monitoring rule effortlessly.
+*   **📊 `/status` Command**: Get an instant, real-time overview of the health of all your configured policies and monitors.
+*   **🐳 Smart & Safe Installation Script**: The management script now warns you before overwriting settings on reinstall and offers to back up both `config.json` and `monitoring_log.json`.
+*   **🧠 Automatic Data Migration**: The bot intelligently detects old `config.json` files and automatically updates them to the new structure without deleting user data.
+*   **🎨 Revamped UI (HTML)**, **Multi-Account Support**, and **Multi-Language**.
 
 ---
 
