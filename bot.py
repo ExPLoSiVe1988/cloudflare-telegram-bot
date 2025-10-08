@@ -22,19 +22,32 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "monitoring_log.json")
 
 def load_monitoring_log():
-    """Loads the monitoring log from its dedicated JSON file."""
+    """Loads the monitoring log from its dedicated JSON file, handling corrupted files."""
+    if not os.path.exists(LOG_FILE):
+        return []
+    
     try:
-        if not os.path.exists(LOG_FILE):
-            return []
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        logger.error(f"Could not read or decode {LOG_FILE}. Returning empty log.")
+            content = f.read()
+            if not content:
+                logger.warning(f"{LOG_FILE} is empty. Returning empty list.")
+                return []
+            return json.loads(content)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Could not read or decode {LOG_FILE}: {e}. The file seems corrupted.")
+        
+        try:
+            corrupted_backup_path = f"{LOG_FILE}.corrupted.{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            os.rename(LOG_FILE, corrupted_backup_path)
+            logger.warning(f"Corrupted log file has been backed up to: {corrupted_backup_path}")
+        except Exception as backup_e:
+            logger.error(f"Could not back up or remove corrupted log file: {backup_e}")
         return []
 
 def save_monitoring_log(log_data):
     """Saves the monitoring log to its dedicated JSON file."""
     try:
+
         with open(LOG_FILE, 'w', encoding='utf-8') as f:
             json.dump(log_data, f, indent=2, ensure_ascii=False)
     except IOError as e:
@@ -963,22 +976,26 @@ async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     if lb_rotations:
         rotations_by_policy = {}
         for event in lb_rotations:
-            policy_name = event['policy_name']
+            policy_name = event.get('policy_name')
+            if not policy_name: continue
             if policy_name not in rotations_by_policy:
                 rotations_by_policy[policy_name] = []
             rotations_by_policy[policy_name].append(event)
 
         for policy_name, events in rotations_by_policy.items():
+            if not events: continue
             events.sort(key=lambda e: e['timestamp'])
             ip_durations = {}
             
             initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
             
+            active_ip_at_start = None
             if initial_events:
-                active_ip_at_start = initial_events[-1]['to_ip']
+                active_ip_at_start = initial_events[-1].get('to_ip')
             elif events:
-                active_ip_at_start = events[0]['from_ip']
-            else:
+                active_ip_at_start = events[0].get('from_ip')
+
+            if not active_ip_at_start:
                 continue
 
             last_event_time = cutoff_date
@@ -991,11 +1008,12 @@ async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
                 ip_durations[active_ip] = ip_durations.get(active_ip, timedelta()) + duration
                 
                 last_event_time = event_time
-                active_ip_at_start = event['to_ip']
+                active_ip_at_start = event.get('to_ip')
 
-            duration_for_final_ip = now - last_event_time
-            final_active_ip = active_ip_at_start
-            ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
+            if active_ip_at_start:
+                duration_for_final_ip = now - last_event_time
+                final_active_ip = active_ip_at_start
+                ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
 
             total_duration = sum(ip_durations.values(), timedelta())
             if total_duration.total_seconds() > 0:
@@ -1003,7 +1021,7 @@ async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
                     ip: {
                         "hours": dur.total_seconds() / 3600,
                         "percent": (dur.total_seconds() / total_duration.total_seconds()) * 100
-                    } for ip, dur in ip_durations.items()
+                    } for ip, dur in ip_durations.items() if dur.total_seconds() > 0
                 }
 
     uptime_stats = {}
@@ -2238,7 +2256,9 @@ async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT
 
     try:
         days = int(query.data.split('|')[1])
+        
         await query.edit_message_text(get_text('messages.generating_report', lang), parse_mode="HTML")
+
         log = load_monitoring_log()
         
         now = datetime.now()
@@ -2270,45 +2290,54 @@ async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT
         lb_duration_stats = {}
         if lb_rotations:
             rotations_by_policy = {}
-        for event in lb_rotations:
-            policy_name = event['policy_name']
-            if policy_name not in rotations_by_policy:
-                rotations_by_policy[policy_name] = []
-            rotations_by_policy[policy_name].append(event)
+            for event in lb_rotations:
+                policy_name = event.get('policy_name')
+                if not policy_name: continue
+                if policy_name not in rotations_by_policy:
+                    rotations_by_policy[policy_name] = []
+                rotations_by_policy[policy_name].append(event)
 
-        for policy_name, events in rotations_by_policy.items():
-            events.sort(key=lambda e: e['timestamp'])
-            ip_durations = {}
-            
-            initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
-            
-            if not events: continue
-            
-            active_ip_at_start = initial_events[-1]['to_ip'] if initial_events else events[0]['from_ip']
-            last_event_time = cutoff_date
-
-            for event in events:
-                event_time = datetime.fromisoformat(event['timestamp'])
-                duration = event_time - last_event_time
+            for policy_name, events in rotations_by_policy.items():
+                if not events: continue
+                events.sort(key=lambda e: e['timestamp'])
+                ip_durations = {}
                 
-                active_ip = active_ip_at_start
-                ip_durations[active_ip] = ip_durations.get(active_ip, timedelta()) + duration
+                initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
                 
-                last_event_time = event_time
-                active_ip_at_start = event['to_ip']
+                active_ip_at_start = None
+                if initial_events:
+                    active_ip_at_start = initial_events[-1].get('to_ip')
+                elif events:
+                    active_ip_at_start = events[0].get('from_ip')
 
-            duration_for_final_ip = now - last_event_time
-            final_active_ip = active_ip_at_start
-            ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
+                if not active_ip_at_start:
+                    continue
 
-            total_duration = sum(ip_durations.values(), timedelta())
-            if total_duration.total_seconds() > 0:
-                lb_duration_stats[policy_name] = {
-                    ip: {
-                        "hours": dur.total_seconds() / 3600,
-                        "percent": (dur.total_seconds() / total_duration.total_seconds()) * 100
-                    } for ip, dur in ip_durations.items()
-                }
+                last_event_time = cutoff_date
+
+                for event in events:
+                    event_time = datetime.fromisoformat(event['timestamp'])
+                    duration = event_time - last_event_time
+                    
+                    active_ip = active_ip_at_start
+                    ip_durations[active_ip] = ip_durations.get(active_ip, timedelta()) + duration
+                    
+                    last_event_time = event_time
+                    active_ip_at_start = event.get('to_ip')
+
+                if active_ip_at_start:
+                    duration_for_final_ip = now - last_event_time
+                    final_active_ip = active_ip_at_start
+                    ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
+
+                total_duration = sum(ip_durations.values(), timedelta())
+                if total_duration.total_seconds() > 0:
+                    lb_duration_stats[policy_name] = {
+                        ip: {
+                            "hours": dur.total_seconds() / 3600,
+                            "percent": (dur.total_seconds() / total_duration.total_seconds()) * 100
+                        } for ip, dur in ip_durations.items() if dur.total_seconds() > 0
+                    }
 
         message_parts = [get_text('messages.report_header', lang, days=days)]
 
