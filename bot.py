@@ -168,7 +168,8 @@ def load_config():
                 "admins": [],
                 "zone_aliases": {},
                 "record_aliases": {},
-                "log_retention_days": 30
+                "log_retention_days": 30,
+                "monitoring_groups": {}
             }
             save_config(default_config)
             return default_config
@@ -177,39 +178,45 @@ def load_config():
             config = json.load(f)
         
         migrated = False
-        if "load_balancer_policies" not in config or any("load_balancer" in p for p in config.get("failover_policies", [])):
-            logger.warning("Legacy configuration format detected. Starting automatic migration...")
-            backup_filename = f"{CONFIG_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
-            with open(backup_filename, 'w', encoding='utf-8') as backup_f:
-                json.dump(config, backup_f, indent=2, ensure_ascii=False)
-            logger.info(f"Successfully created a backup at: {backup_filename}")
+        
+        config.setdefault("monitoring_groups", {})
+        
+        def find_or_create_group(nodes, threshold):
+            if not nodes:
+                return None
+            for name, data in config["monitoring_groups"].items():
+                if set(data.get("nodes", [])) == set(nodes) and data.get("threshold") == threshold:
+                    return name
+            new_group_name = f"migrated_group_{len(config['monitoring_groups']) + 1}"
+            config["monitoring_groups"][new_group_name] = {"nodes": nodes, "threshold": threshold}
+            logger.info(f"Migration: Created new monitoring group '{new_group_name}'.")
+            return new_group_name
 
-            config.setdefault("load_balancer_policies", [])
-            migrated_lb_policies = []
-            failover_policies_copy = config.get("failover_policies", []).copy()
-            
-            for policy in failover_policies_copy:
-                if "load_balancer" in policy:
-                    if policy["load_balancer"].get("enabled"):
-                        lb_config = policy["load_balancer"]
-                        new_lb_policy = {
-                            "policy_name": f"{policy.get('policy_name', 'Unnamed')} LB",
-                            "ips": lb_config.get("ips", []),
-                            "rotation_interval_hours": lb_config.get("rotation_interval_hours", 6),
-                            "check_port": policy.get("check_port", 443),
-                            "account_nickname": policy.get("account_nickname"),
-                            "zone_name": policy.get("zone_name"),
-                            "record_names": policy.get("record_names", []),
-                            "enabled": True,
-                            "monitoring_nodes": policy.get("backup_monitoring_nodes", []),
-                            "threshold": policy.get("backup_threshold", 1)
-                        }
-                        migrated_lb_policies.append(new_lb_policy)
-                    del policy["load_balancer"]
-            
-            config["failover_policies"] = failover_policies_copy
-            config["load_balancer_policies"].extend(migrated_lb_policies)
-            migrated = True
+        for policy in config.get("failover_policies", []):
+            if "primary_monitoring_nodes" in policy and "primary_monitoring_group" not in policy:
+                migrated = True
+                group_name = find_or_create_group(policy.get("primary_monitoring_nodes"), policy.get("primary_threshold"))
+                if group_name:
+                    policy["primary_monitoring_group"] = group_name
+                policy.pop("primary_monitoring_nodes", None)
+                policy.pop("primary_threshold", None)
+
+            if "backup_monitoring_nodes" in policy and "backup_monitoring_group" not in policy:
+                migrated = True
+                group_name = find_or_create_group(policy.get("backup_monitoring_nodes"), policy.get("backup_threshold"))
+                if group_name:
+                    policy["backup_monitoring_group"] = group_name
+                policy.pop("backup_monitoring_nodes", None)
+                policy.pop("backup_threshold", None)
+
+        for policy in config.get("load_balancer_policies", []):
+            if "monitoring_nodes" in policy and "monitoring_group" not in policy:
+                migrated = True
+                group_name = find_or_create_group(policy.get("monitoring_nodes"), policy.get("threshold"))
+                if group_name:
+                    policy["monitoring_group"] = group_name
+                policy.pop("monitoring_nodes", None)
+                policy.pop("threshold", None)
 
         if "admins" not in config:
             config["admins"] = []
