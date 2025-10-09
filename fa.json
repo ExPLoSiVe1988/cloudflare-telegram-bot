@@ -361,7 +361,8 @@
     "monitor_up_alert": "✅ <b>بازیابی مانیتور: {monitor_name}</b> ✅\n\nهدف <code>{ip}:{port}</code> دوباره آنلاین شد.",
     "monitor_select_new_group": "لطفاً گروه مانیتورینگ جدید را انتخاب کنید:",
     "select_monitoring_group_prompt": "لطفاً یک گروه مانیتورینگ برای آی‌پی‌های <b>{monitoring_type}</b> انتخاب کنید:",
-    "monitoring_group_updated": "✅ گروه مانیتورینگ برای آی‌پی‌های <b>{monitoring_type}</b> به '<b>{group_name}</b>' تغییر یافت."
+    "monitoring_group_updated": "✅ گروه مانیتورینگ برای آی‌پی‌های <b>{monitoring_type}</b> به '<b>{group_name}</b>' تغییر یافت.",
+    "policy_add_ask_group": "✅ رکوردهای مورد نظر انتخاب شدند.\n\nدر نهایت، یک گروه مانیتورینگ برای این قانون جدید انتخاب کنید."
   },
 
   "prompts": {
