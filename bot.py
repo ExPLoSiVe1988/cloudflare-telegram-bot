@@ -985,43 +985,50 @@ async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         for policy_name, events in rotations_by_policy.items():
             if not events: continue
             events.sort(key=lambda e: e['timestamp'])
-            ip_durations = {}
             
-            initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
+            ip_durations_seconds = {}
             
-            active_ip_at_start = None
-            if initial_events:
-                active_ip_at_start = initial_events[-1].get('to_ip')
-            elif events:
-                active_ip_at_start = events[0].get('from_ip')
-
-            if not active_ip_at_start:
-                continue
-
-            last_event_time = cutoff_date
-
+            involved_ips = set()
             for event in events:
-                event_time = datetime.fromisoformat(event['timestamp'])
-                duration = event_time - last_event_time
-                
-                active_ip = active_ip_at_start
-                ip_durations[active_ip] = ip_durations.get(active_ip, timedelta()) + duration
-                
-                last_event_time = event_time
-                active_ip_at_start = event.get('to_ip')
+                involved_ips.add(event.get('from_ip'))
+                involved_ips.add(event.get('to_ip'))
 
-            if active_ip_at_start:
-                duration_for_final_ip = now - last_event_time
-                final_active_ip = active_ip_at_start
-                ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
+            for ip in involved_ips:
+                if not ip: continue
+                total_active_time = timedelta()
 
-            total_duration = sum(ip_durations.values(), timedelta())
-            if total_duration.total_seconds() > 0:
+                for i, event in enumerate(events):
+                    if event.get('to_ip') == ip:
+                        start_time = datetime.fromisoformat(event['timestamp'])
+                        end_time = now
+                        if i + 1 < len(events):
+                            end_time = datetime.fromisoformat(events[i+1]['timestamp'])
+                        
+                        start_time = max(start_time, cutoff_date)
+                        end_time = min(end_time, now)
+
+                        if end_time > start_time:
+                            total_active_time += (end_time - start_time)
+
+                initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
+                if initial_events:
+                    active_ip_at_start = initial_events[-1].get('to_ip')
+                    if active_ip_at_start == ip:
+                        first_event_time_in_window = events[0]['timestamp']
+                        duration = datetime.fromisoformat(first_event_time_in_window) - cutoff_date
+                        if duration.total_seconds() > 0:
+                            total_active_time += duration
+                
+                if total_active_time.total_seconds() > 0:
+                    ip_durations_seconds[ip] = total_active_time.total_seconds()
+
+            total_duration_seconds = sum(ip_durations_seconds.values())
+            if total_duration_seconds > 0:
                 lb_duration_stats[policy_name] = {
                     ip: {
-                        "hours": dur.total_seconds() / 3600,
-                        "percent": (dur.total_seconds() / total_duration.total_seconds()) * 100
-                    } for ip, dur in ip_durations.items() if dur.total_seconds() > 0
+                        "hours": seconds / 3600,
+                        "percent": (seconds / total_duration_seconds) * 100
+                    } for ip, seconds in ip_durations_seconds.items()
                 }
 
     uptime_stats = {}
@@ -1441,6 +1448,65 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
 
 # --- Callback Handlers ---
+async def policy_add_step_ask_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the list of monitoring groups for the user to choose when adding a new policy."""
+    lang = get_user_lang(context)
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    if not groups:
+        await send_or_edit(update, context, get_text('messages.no_groups_for_selection', lang))
+        # Clean up state
+        for key in ['add_policy_step', 'new_policy_data', 'add_policy_type']:
+            context.user_data.pop(key, None)
+        return
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"policy_add_select_group|{name}")] for name in sorted(groups.keys())]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="back_to_settings_main")])
+    
+    text = get_text('messages.policy_add_ask_group', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def policy_add_select_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the selected group and creates the new policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        group_name = query.data.split('|', 1)[1]
+        policy_data = context.user_data['new_policy_data']
+        policy_type = context.user_data['add_policy_type']
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+        
+    config = load_config()
+
+    if policy_type == 'failover':
+        policy_data['primary_monitoring_group'] = group_name
+        policy_data['backup_monitoring_group'] = group_name
+        policy_data.setdefault('auto_failback', True)
+        policy_data.setdefault('failback_minutes', 5.0)
+        config.setdefault('failover_policies', []).append(policy_data)
+        
+    else:
+        policy_data['monitoring_group'] = group_name
+        config.setdefault('load_balancer_policies', []).append(policy_data)
+            
+    save_config(config)
+    
+    for key in ['add_policy_step', 'new_policy_data', 'add_policy_type', 'last_callback_query']:
+        context.user_data.pop(key, None)
+        
+    await query.edit_message_text(get_text('messages.policy_added_successfully', lang, name=escape_html(policy_data['policy_name'])), parse_mode="HTML")
+    await asyncio.sleep(2)
+    
+    if policy_type == 'failover':
+        await settings_failover_policies_callback(update, context)
+    else:
+        await settings_lb_policies_callback(update, context)
+
 async def policy_change_group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the process of changing the monitoring group for any policy type."""
     query = update.callback_query
@@ -1765,16 +1831,18 @@ async def groups_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def monitor_edit_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
     """Displays the edit menu for a specific standalone monitor."""
     query = update.callback_query
-    if query: await query.answer()
+    if query and not getattr(query, 'is_dummy', False):
+        await query.answer()
     lang = get_user_lang(context)
     
     try:
-        monitor_index = context.user_data.get('edit_monitor_index')
-        if monitor_index is None and query:
+        if query and "monitor_edit|" in query.data:
             monitor_index = int(query.data.split('|')[1])
-        
+        else:
+            monitor_index = context.user_data.get('edit_monitor_index')
+
         if monitor_index is None:
-             raise KeyError("Monitor index not found.")
+             raise KeyError("Monitor index not found in context or query.")
 
         config = load_config()
         monitor = config['standalone_monitors'][monitor_index]
@@ -2290,54 +2358,61 @@ async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT
         lb_duration_stats = {}
         if lb_rotations:
             rotations_by_policy = {}
-            for event in lb_rotations:
-                policy_name = event.get('policy_name')
-                if not policy_name: continue
-                if policy_name not in rotations_by_policy:
-                    rotations_by_policy[policy_name] = []
-                rotations_by_policy[policy_name].append(event)
+        for event in lb_rotations:
+            policy_name = event.get('policy_name')
+            if not policy_name: continue
+            if policy_name not in rotations_by_policy:
+                rotations_by_policy[policy_name] = []
+            rotations_by_policy[policy_name].append(event)
 
-            for policy_name, events in rotations_by_policy.items():
-                if not events: continue
-                events.sort(key=lambda e: e['timestamp'])
-                ip_durations = {}
-                
+        for policy_name, events in rotations_by_policy.items():
+            if not events: continue
+            events.sort(key=lambda e: e['timestamp'])
+            
+            ip_durations_seconds = {}
+            
+            involved_ips = set()
+            for event in events:
+                involved_ips.add(event.get('from_ip'))
+                involved_ips.add(event.get('to_ip'))
+
+            for ip in involved_ips:
+                if not ip: continue
+                total_active_time = timedelta()
+
+                for i, event in enumerate(events):
+                    if event.get('to_ip') == ip:
+                        start_time = datetime.fromisoformat(event['timestamp'])
+                        end_time = now
+                        if i + 1 < len(events):
+                            end_time = datetime.fromisoformat(events[i+1]['timestamp'])
+                        
+                        start_time = max(start_time, cutoff_date)
+                        end_time = min(end_time, now)
+
+                        if end_time > start_time:
+                            total_active_time += (end_time - start_time)
+
                 initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
-                
-                active_ip_at_start = None
                 if initial_events:
                     active_ip_at_start = initial_events[-1].get('to_ip')
-                elif events:
-                    active_ip_at_start = events[0].get('from_ip')
+                    if active_ip_at_start == ip:
+                        first_event_time_in_window = events[0]['timestamp']
+                        duration = datetime.fromisoformat(first_event_time_in_window) - cutoff_date
+                        if duration.total_seconds() > 0:
+                            total_active_time += duration
+                
+                if total_active_time.total_seconds() > 0:
+                    ip_durations_seconds[ip] = total_active_time.total_seconds()
 
-                if not active_ip_at_start:
-                    continue
-
-                last_event_time = cutoff_date
-
-                for event in events:
-                    event_time = datetime.fromisoformat(event['timestamp'])
-                    duration = event_time - last_event_time
-                    
-                    active_ip = active_ip_at_start
-                    ip_durations[active_ip] = ip_durations.get(active_ip, timedelta()) + duration
-                    
-                    last_event_time = event_time
-                    active_ip_at_start = event.get('to_ip')
-
-                if active_ip_at_start:
-                    duration_for_final_ip = now - last_event_time
-                    final_active_ip = active_ip_at_start
-                    ip_durations[final_active_ip] = ip_durations.get(final_active_ip, timedelta()) + duration_for_final_ip
-
-                total_duration = sum(ip_durations.values(), timedelta())
-                if total_duration.total_seconds() > 0:
-                    lb_duration_stats[policy_name] = {
-                        ip: {
-                            "hours": dur.total_seconds() / 3600,
-                            "percent": (dur.total_seconds() / total_duration.total_seconds()) * 100
-                        } for ip, dur in ip_durations.items() if dur.total_seconds() > 0
-                    }
+            total_duration_seconds = sum(ip_durations_seconds.values())
+            if total_duration_seconds > 0:
+                lb_duration_stats[policy_name] = {
+                    ip: {
+                        "hours": seconds / 3600,
+                        "percent": (seconds / total_duration_seconds) * 100
+                    } for ip, seconds in ip_durations_seconds.items()
+                }
 
         message_parts = [get_text('messages.report_header', lang, days=days)]
 
@@ -2633,7 +2708,7 @@ async def policy_select_record_callback(update: Update, context: ContextTypes.DE
     await display_records_for_selection(update, context, page=page)
 
 async def policy_confirm_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Finalizes record selection for both editing and adding new policies."""
+    """Finalizes record selection for editing, wizard, and adding new policies."""
     query = update.callback_query
     context.user_data['last_callback_query'] = query
     await query.answer()
@@ -2666,8 +2741,11 @@ async def policy_confirm_records_callback(update: Update, context: ContextTypes.
         config = load_config()
         policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
         
-        config[policy_list_key][policy_index]['record_names'] = selected_records
-        save_config(config)
+        try:
+            config[policy_list_key][policy_index]['record_names'] = selected_records
+            save_config(config)
+        except IndexError:
+            await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
         
         policy_type_display = "LB" if policy_type == 'lb' else "Failover"
         await send_or_edit(update, context, get_text('messages.policy_records_updated', lang, policy_type=policy_type_display))
@@ -2680,6 +2758,7 @@ async def policy_confirm_records_callback(update: Update, context: ContextTypes.
             await lb_policy_view_callback(update, context)
         else:
             await failover_policy_view_callback(update, context)
+        return
 
     else:
         if not selected_records:
@@ -2692,30 +2771,12 @@ async def policy_confirm_records_callback(update: Update, context: ContextTypes.
         for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
             context.user_data.pop(key, None)
 
-        if policy_type == 'lb':
-            config = load_config()
-            config['load_balancer_policies'].append(data)
-            save_config(config)
-            
-            new_policy_index = len(config['load_balancer_policies']) - 1
-            
-            for key in ['add_policy_step', 'new_policy_data', 'add_policy_type']:
-                context.user_data.pop(key, None)
-                
-            context.user_data['edit_policy_index'] = new_policy_index
-            context.user_data['editing_policy_type'] = 'lb'
-            context.user_data['monitoring_type'] = 'lb'
-            context.user_data['policy_selected_nodes'] = []
-
-            await display_countries_for_selection(update, context, page=0)
-
-        elif policy_type == 'failover':
-            context.user_data['add_policy_step'] = 'auto_failback'
-            buttons = [[
-                InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="policy_set_failback|true"),
-                InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="policy_set_failback|false")
-            ]]
-            await send_or_edit(update, context, get_text('prompts.ask_auto_failback', lang), InlineKeyboardMarkup(buttons))
+        if policy_type == 'lb' or policy_type == 'failover':
+            context.user_data['add_policy_step'] = 'select_group'
+            await policy_add_step_ask_group(update, context)
+        else:
+            await query.edit_message_text("Unsupported policy type for this flow.")
+        return
 
 async def policy_set_failback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5551,7 +5612,7 @@ async def post_startup_tasks(application: Application):
         )
         
     if not job_queue.get_jobs_by_name("health_check_job"):
-        job_queue.run_repeating(health_check_job, interval=200, first=15, name="health_check_job")
+        job_queue.run_repeating(health_check_job, interval=310, first=15, name="health_check_job")
 
     if not job_queue.get_jobs_by_name("daily_report_job"):
         report_time = datetime.strptime("04:30", "%H:%M").time()
@@ -5793,6 +5854,7 @@ def main():
     application.add_handler(CallbackQueryHandler(lb_policy_set_account_callback, pattern="^lb_policy_set_account\|"))
     application.add_handler(CallbackQueryHandler(lb_policy_set_zone_callback, pattern="^lb_policy_set_zone\|"))
     application.add_handler(CallbackQueryHandler(lb_policy_change_algo_callback, pattern="^lb_policy_change_algo\|"))
+    application.add_handler(CallbackQueryHandler(policy_add_select_group_callback, pattern="^policy_add_select_group\|"))
 
     # --- Shared/Generic Policy Handlers (Nodes & Records Selection) ---
     application.add_handler(CallbackQueryHandler(policy_force_update_nodes_callback, pattern="^policy_force_update_nodes$"))
