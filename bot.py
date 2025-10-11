@@ -901,6 +901,13 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info("--- [HEALTH CHECK] Stage 3: Processing Standalone Monitors ---")
             if 'monitor_status' not in context.bot_data:
                 context.bot_data['monitor_status'] = {}
+
+            standalone_monitors = config.get("standalone_monitors", [])
+            current_monitor_names = {m.get("monitor_name") for m in standalone_monitors}
+            stale_monitors = [name for name in context.bot_data['monitor_status'] if name not in current_monitor_names]
+            for name in stale_monitors:
+                del context.bot_data['monitor_status'][name]
+                logger.info(f"Cleaned up stale monitor status for deleted/renamed monitor: '{name}'")
             
             for monitor in standalone_monitors:
                 if not monitor.get('enabled', True): continue
@@ -1448,6 +1455,34 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
 
 # --- Callback Handlers ---
+async def monitor_purge_old_ip_logs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes all IP_STATUS events for a specific IP from the monitoring log."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        ip_to_purge = query.data.split('|', 1)[1]
+    except IndexError:
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    log = load_monitoring_log()
+    
+    new_log = [event for event in log if not (event.get('event_type') == 'IP_STATUS' and event.get('ip') == ip_to_purge)]
+    
+    if len(new_log) < len(log):
+        save_monitoring_log(new_log)
+        await query.answer(get_text('messages.monitor_logs_purged', lang, old_ip=escape_html(ip_to_purge)), show_alert=True)
+    else:
+        await query.answer("No logs found for the old IP.", show_alert=True)
+
+    monitor_index = context.user_data.get('edit_monitor_index')
+    if monitor_index is not None:
+        await monitor_edit_menu_callback(update, context)
+    else:
+        await monitors_menu_callback(update, context)
+
 async def policy_add_step_ask_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the list of monitoring groups for the user to choose when adding a new policy."""
     lang = get_user_lang(context)
@@ -1869,6 +1904,7 @@ async def monitor_edit_menu_callback(update: Update, context: ContextTypes.DEFAU
 async def monitor_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the process of editing a specific field of a monitor."""
     query = update.callback_query
+    context.user_data['last_callback_query'] = query
     await query.answer()
     lang = get_user_lang(context)
     
@@ -3022,27 +3058,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await update.message.delete()
-            if context.user_data.get('last_callback_query'):
-                await context.user_data['last_callback_query'].message.delete()
         except Exception:
             pass
 
-        value_to_save = text
+        new_value = text.strip()
+        
         if field == 'check_port':
-            if not text.isdigit() or not (1 <= int(text) <= 65535):
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.monitor_invalid_port', lang))
+            if not new_value.isdigit() or not (1 <= int(new_value) <= 65535):
+                error_text = get_text('messages.monitor_ask_port_edit', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
+                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]]
+                if context.user_data.get('last_callback_query'):
+                    await context.user_data['last_callback_query'].message.edit_text(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
                 context.user_data['monitor_edit_step'] = field
                 return
-            value_to_save = int(text)
+            value_to_save = int(new_value)
+        else:
+            value_to_save = new_value
         
         config = load_config()
+        old_ip = None
+        
         try:
+            if field == 'ip':
+                old_ip = config['standalone_monitors'][monitor_index].get('ip')
+            
             config['standalone_monitors'][monitor_index][field] = value_to_save
             save_config(config)
-        except IndexError:
+        except (IndexError, KeyError):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.internal_error', lang))
             return
-            
+
+        if field == 'ip' and old_ip and old_ip != value_to_save:
+            logger.info("--- EDIT MONITOR DEBUG: Entering purge log question block. ---")
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"monitor_purge_logs|{old_ip}")],
+                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]
+            ]
+            text_to_send = get_text('messages.monitor_ask_purge_logs', lang, old_ip=escape_html(old_ip))
+            if context.user_data.get('last_callback_query'):
+                await context.user_data['last_callback_query'].message.edit_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+            return
+
+        logger.info("--- EDIT MONITOR DEBUG: Skipping purge log question. Returning to edit menu. ---")
         temp_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.value_updated_success', lang))
         await asyncio.sleep(2)
         await temp_msg.delete()
@@ -5789,6 +5846,7 @@ def main():
     application.add_handler(CallbackQueryHandler(policy_change_group_start_callback, pattern="^policy_change_group_start\|"))
     application.add_handler(CallbackQueryHandler(policy_change_group_execute_callback, pattern="^policy_change_group_execute\|"))
     application.add_handler(CallbackQueryHandler(monitor_select_group_callback, pattern="^monitor_select_group\|"))
+    application.add_handler(CallbackQueryHandler(monitor_purge_old_ip_logs_callback, pattern="^monitor_purge_logs\|"))
     
     # --- Wizard Actions ---
     application.add_handler(CallbackQueryHandler(wizard_select_account_callback, pattern="^wizard_select_account\|"))
