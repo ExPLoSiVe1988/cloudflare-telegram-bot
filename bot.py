@@ -622,22 +622,16 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 ip_to_check = monitor.get('ip')
                 group_name = monitor.get('monitoring_group')
                 
-                if ip_to_check and group_name and group_name in monitoring_groups:
-                    monitor_key = f"monitor_{i}_{ip_to_check}"
+                if ip_to_check and group_name and group_name in monitoring_groups and ip_to_check not in unique_checks:
                     group_data = monitoring_groups[group_name]
-                    
-                    check_details = {
+                    unique_checks[ip_to_check] = {
                         "ip": ip_to_check,
-                        "is_standalone": True,
-                        "policy_or_monitor": monitor,
-                        "monitor_name": monitor.get("monitor_name"),
                         "check_port": monitor.get("check_port"),
                         "check_type": monitor.get("check_type", "tcp"),
                         "check_path": monitor.get("check_path", "/"),
                         "nodes": group_data.get("nodes", []),
                         "threshold": group_data.get("threshold", 1)
                     }
-                    unique_checks[monitor_key] = check_details
 
             if not unique_checks:
                 logger.info("--- [HEALTH CHECK] No policies or monitors to check. Job Finished ---")
