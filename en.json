@@ -362,7 +362,9 @@
     "monitor_select_new_group": "Please select the new monitoring group:",
     "select_monitoring_group_prompt": "Please select a monitoring group for the <b>{monitoring_type}</b> IPs:",
     "monitoring_group_updated": "✅ Monitoring group for <b>{monitoring_type}</b> IPs has been set to '<b>{group_name}</b>'.",
-    "policy_add_ask_group": "✅ Records selected.\n\nFinally, select a monitoring group for this new rule."
+    "policy_add_ask_group": "✅ Records selected.\n\nFinally, select a monitoring group for this new rule.",
+    "monitor_ask_purge_logs": "✅ IP updated successfully.\n\nDo you want to remove all historical monitoring data for the old IP (<code>{old_ip}</code>) from the reports?",
+    "monitor_logs_purged": "✅ Historical data for <code>{old_ip}</code> has been purged."
   },
   
   "prompts": {
