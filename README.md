@@ -18,7 +18,10 @@ A powerful Telegram bot for complete DNS record management and intelligent monit
 
 ### 🚀 Universal & Advanced Monitoring
 *   👁️ **Standalone Monitoring**: Monitor any IP or domain (like a database server or a third-party API) independently of your Cloudflare DNS, with instant up/down alerts.
-*   📍 **Centralized Monitoring Groups**: Create reusable groups of monitoring locations (e.g., "Europe," "Iran") with a defined failure threshold. Assign these groups to any monitor or policy for fast, consistent, and easily manageable setups.
+*   🎯 **Targeted Notification System**:
+    *   Define specific alert recipients (individual users or entire Telegram groups) for **each individual Failover/LB Rule or Standalone Monitor**.
+    *   Alerts are delivered only to the responsible teams, preventing alert fatigue and spam.
+*   📍 **Centralized Monitoring Groups**: Create reusable groups of monitoring locations (e.g., "Europe," "Asia") with a defined failure threshold. Assign these groups to any monitor or policy for fast, consistent, and easily manageable setups.
 *   🛡️ **Automatic Failover (High Availability)**: If a primary server goes down, the bot automatically switches DNS records to a healthy backup IP from your predefined list.
 *   🚦 **Advanced Weighted Load Balancing**:
     *   **Weighted IP Pools**: Distribute traffic proportionally based on server capacity (e.g., `1.1.1.1:2, 2.2.2.2:1`).
@@ -31,17 +34,17 @@ A powerful Telegram bot for complete DNS record management and intelligent monit
 *   **🏷️ Zone & Record Aliases**: Assign friendly display names to both your zones (domains) and individual records for much easier identification and management.
 *   **👥 Advanced In-Bot User Management**:
     *   **Super Admins** (from `.env`) can manage **Regular Admins** directly within the bot.
-    *   Manage a separate list of **Notification Recipients** who only receive alerts without having admin privileges.
 *   **📤 Move & Copy Records**: Easily migrate DNS records between different zones, even across different Cloudflare accounts.
 *   **🔄 Convert Record Types**: Change a record's type (e.g., from `A` to `CNAME`) on the fly.
 *   **👥 Bulk Actions**: Delete or change the IP for multiple records at once.
 *   **💾 Backup & Restore**: Create and restore `.json` backups for any of your zones.
 
 ### 🤖 General Bot & UX
-*   **🚀 Quick Setup Wizard**: A new step-by-step wizard guides new users through creating their first monitoring rule effortlessly.
+*   **📄 Zone List Pagination**: No more endless scrolling if you manage many domains. The zone list (`/list`) is now paginated for easier and faster navigation.
+*   **🚀 Quick Setup Wizard**: A step-by-step wizard guides new users through creating their first monitoring rule effortlessly.
 *   **📊 `/status` Command**: Get an instant, real-time overview of the health of all your configured policies and monitors.
-*   **🐳 Smart & Safe Installation Script**: The management script now warns you before overwriting settings on reinstall and offers to back up both `config.json` and `monitoring_log.json`.
-*   **🧠 Automatic Data Migration**: The bot intelligently detects old `config.json` files and automatically updates them to the new structure without deleting user data.
+*   **🧠 Automatic Data Migration**: The bot intelligently detects old `config.json` files (including old notification structures) and automatically updates them to the new format without deleting user data.
+*   **🐳 Smart & Safe Installation Script**: The management script warns you before overwriting settings on reinstall and offers to back up `config.json`.
 *   **🎨 Revamped UI (HTML)**, **Multi-Account Support**, and **Multi-Language**.
 
 ---
