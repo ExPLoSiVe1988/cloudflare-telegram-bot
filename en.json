@@ -105,7 +105,20 @@
     "edit_monitor_group": "📍 Change Monitoring Group",
     "edit_primary_group": "📍 Primary Monitoring Group",
     "edit_backup_group": "📡 Backup Monitoring Group",
-    "edit_lb_group": "📍 LB Monitoring Group"
+    "edit_lb_group": "📍 LB Monitoring Group",
+    "notification_groups": "🔔 Notification Groups",
+    "add_notification_group": "➕ Add New Group",
+    "edit_notification_group": "📝 Edit Group",
+    "delete_notification_group": "🗑 Delete Group",
+    "set_notification_group": "🔔 Notification Group",
+    "add_group_members": "Add Members",
+    "remove_group_members": "Remove Members",
+    "default_recipients": "👤 Default Recipients",
+    "item_recipients_policy": "🛡️ Rule: {item_name}",
+    "item_recipients_lb_policy": "🚦 Rule: {item_name}",
+    "item_recipients_monitor": "👁️ Monitor: {item_name}",
+    "add_member": "➕ Add Member",
+    "remove_member": "➖ Remove Member"
   },
   "messages": {
     "welcome": "Welcome to the Cloudflare Management Bot!\nUse /list or /language to get started.",
@@ -364,7 +377,24 @@
     "monitoring_group_updated": "✅ Monitoring group for <b>{monitoring_type}</b> IPs has been set to '<b>{group_name}</b>'.",
     "policy_add_ask_group": "✅ Records selected.\n\nFinally, select a monitoring group for this new rule.",
     "monitor_ask_purge_logs": "✅ IP updated successfully.\n\nDo you want to remove all historical monitoring data for the old IP (<code>{old_ip}</code>) from the reports?",
-    "monitor_logs_purged": "✅ Historical data for <code>{old_ip}</code> has been purged."
+    "monitor_logs_purged": "✅ Historical data for <code>{old_ip}</code> has been purged.",
+    "notification_groups_menu_header": "<b>🔔 Notification Group Management</b>\n\nHere you can define groups of users to receive alerts.\n\n<b>Your Groups:</b>\n{groups_list}",
+    "no_notification_groups": "No notification groups have been defined yet.",
+    "notification_group_details": "<b>Group: {group_name}</b>\n\n<b>Members (User IDs):</b>\n<code>{members}</code>",
+    "add_group_prompt_name": "Please enter a name for the new notification group (e.g., `DevOps Team`).",
+    "group_name_saved_prompt_members": "✅ Group name saved.\n\nPlease enter the numeric User IDs of the members, separated by commas.",
+    "notification_group_created": "✅ Notification group '<b>{group_name}</b>' created successfully.",
+    "confirm_delete_notification_group": "⚠️ Are you sure you want to delete the notification group '<b>{group_name}</b>'?",
+    "notification_group_deleted": "✅ Notification group '{group_name}' has been deleted.",
+    "prompt_add_members": "Please enter the numeric User IDs to add (comma-separated):",
+    "prompt_remove_members": "Please select a member to remove:",
+    "members_added_success": "✅ New members added successfully.",
+    "member_removed_success": "✅ User successfully removed from the group.",
+    "select_notification_group_prompt": "Please select a notification group for this item:",
+    "notification_group_set_success": "✅ Notification group successfully set to '<b>{group_name}</b>'.",
+    "notification_group_cleared": "✅ Notification group has been cleared for this item.",
+    "enter_recipient_ids": "Please enter the numeric ID of the user or group (including negative numbers). Separate multiple IDs with a comma.",
+    "select_member_to_remove": "Please select a member to remove:"
   },
   
   "prompts": {

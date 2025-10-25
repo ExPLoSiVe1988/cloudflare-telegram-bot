@@ -267,7 +267,7 @@ install_bot() {
     echo -e "\n${YELLOW}Preparing data files for a clean installation...${NC}"
     rm -f "$CONFIG_FILE" "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
     touch "$PROJECT_DIR/nodes_cache.json" "$PROJECT_DIR/bot_data.pickle"
-    echo '{"notifications":{"enabled":true,"chat_ids":[]},"failover_policies":[],"load_balancer_policies":[],"admins":[]}' > "$CONFIG_FILE"
+    echo '{"notifications":{"enabled":true,"recipients":{"__default__":[]}},"failover_policies":[],"load_balancer_policies":[],"admins":[]}' > "$CONFIG_FILE"
     echo -e "${GREEN}Data files are now clean and ready.${NC}"
     
     cd "$original_dir"
