@@ -185,7 +185,7 @@ async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str,
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(check_url, headers=REQUEST_HEADERS, timeout=15)
+                response = await client.get(check_url, headers=REQUEST_HEADERS, timeout=30)
                 response.raise_for_status()
                 
                 initial_data = response.json()
@@ -216,7 +216,14 @@ async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str,
 
                 if not results:
                     logger.warning(f"Could not get a final result for request {request_id}.")
-                    return None
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying entire check for {target} due to incomplete results.")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error(f"All retries failed to get complete results for {target}.")
+                        return None
+
 
                 logger.info(f"FINAL RAW API RESULT for request_id {request_id} on host {target} -> {results}")
 
@@ -229,6 +236,14 @@ async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str,
                 
                 return final_statuses
 
+        except httpx.ReadTimeout as e:
+            logger.warning(f"Attempt {attempt + 1}/{max_retries} for {target} failed with ReadTimeout.")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                logger.error(f"All {max_retries} retries failed for {target} due to ReadTimeout. Giving up.")
         except httpx.HTTPStatusError as e:
             if 500 <= e.response.status_code < 600:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} for {target} failed with server error {e.response.status_code}.")
