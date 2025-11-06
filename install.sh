@@ -258,10 +258,23 @@ install_bot() {
     done
 
     echo -e "\n${YELLOW}Creating .env file...${NC}"
-    > "$ENV_FILE"
-    echo "TELEGRAM_BOT_TOKEN=${bot_token}" >> "$ENV_FILE"
+    echo "TELEGRAM_BOT_TOKEN=${bot_token}" > "$ENV_FILE"
     echo "TELEGRAM_ADMIN_IDS=${admin_ids}" >> "$ENV_FILE"
     echo "CF_ACCOUNTS=${cf_accounts_list}" >> "$ENV_FILE"
+    
+    echo "------------------------------------------------------------"
+    echo "Setting up TIMEZONE variable."
+    echo "Please enter your desired timezone (e.g., Asia/Tehran, Europe/London, UTC)."
+    read -p "Default is [Asia/Tehran]: " user_timezone
+    
+    if [ -z "$user_timezone" ]; then
+      user_timezone="Asia/Tehran"
+    fi
+    
+    echo "" >> "$ENV_FILE"
+    echo "# Timezone for log and report timestamps" >> "$ENV_FILE"
+    echo "TIMEZONE=${user_timezone}" >> "$ENV_FILE"
+
     echo -e "${GREEN}.env file created successfully.${NC}"
 
     echo -e "\n${YELLOW}Preparing data files for a clean installation...${NC}"
@@ -291,6 +304,28 @@ update_bot() {
     echo -e "${YELLOW}Fetching latest changes from GitHub...${NC}"
     (cd "$PROJECT_DIR" && git pull origin main)
     echo -e "${GREEN}Local repository updated successfully.${NC}"
+
+    echo -e "\n${YELLOW}Checking for .env updates...${NC}"
+    if [ -f "$ENV_FILE" ]; then
+        if ! grep -q "^TIMEZONE=" "$ENV_FILE"; then
+            echo "TIMEZONE variable not found in your .env. Let's add it."
+            echo "This sets the timezone for timestamps in logs and reports (e.g., Asia/Tehran)."
+            read -p "Enter your timezone [Default: Asia/Tehran]: " user_timezone
+            
+            if [ -z "$user_timezone" ]; then
+                user_timezone="Asia/Tehran"
+            fi
+            
+            echo "" >> "$ENV_FILE"
+            echo "# Timezone for log and report timestamps" >> "$ENV_FILE"
+            echo "TIMEZONE=${user_timezone}" >> "$ENV_FILE"
+            echo -e "${GREEN}TIMEZONE set to '$user_timezone' and added to .env file.${NC}"
+        else
+            echo -e "${GREEN}TIMEZONE variable already exists. Skipping.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}.env file not found. Skipping .env update.${NC}"
+    fi
 
     echo -e "\n${YELLOW}Preparing for a clean restart...${NC}"
     
