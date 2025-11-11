@@ -879,10 +879,11 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     primary_ip = policy.get('primary_ip')
                     backup_ips = policy.get('backup_ips', [])
-                    if not all([primary_ip, backup_ips, record_names, zone_name]): continue
+                    if not all([primary_ip, backup_ips, record_names, zone_name]):
+                        continue
                     
                     policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
-
+                    
                     actual_ip_on_cf = None
                     token = CF_ACCOUNTS.get(policy.get('account_nickname'))
                     if token:
@@ -892,8 +893,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                             all_dns_records = await get_dns_records(token, zone_id)
                             if all_dns_records is not None:
                                 actual_record = next((r for r in all_dns_records if get_short_name(r['name'], zone_name) in record_names), None)
-                                if actual_record: actual_ip_on_cf = actual_record['content']
-                    if not actual_ip_on_cf: continue
+                                if actual_record:
+                                    actual_ip_on_cf = actual_record['content']
+                    
+                    if not actual_ip_on_cf:
+                        logger.warning(f"Could not determine current IP for Failover policy '{policy_name}'. Skipping.")
+                        continue
 
                     is_primary_online = health_results.get(primary_ip, True)
                     
@@ -910,12 +915,13 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         policy_status['critical_alert_sent'] = False
 
                         if actual_ip_on_cf != primary_ip:
+                            is_on_valid_backup = actual_ip_on_cf in backup_ips
                             
                             if not policy.get('auto_failback', True):
                                 policy_status.pop('uptime_start', None)
                                 logger.info(f"Primary IP for '{policy_name}' is online, but auto-failback is disabled. No action taken.")
                             
-                            elif actual_ip_on_cf in backup_ips:
+                            elif is_on_valid_backup:
                                 if not policy_status.get('uptime_start'):
                                     policy_status['uptime_start'] = datetime.now().isoformat()
                                     await send_notification(context, recipients_to_notify, 'messages.failback_alert_notification', 
@@ -943,8 +949,13 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         policy_status.pop('uptime_start', None)
                         is_current_ip_online = health_results.get(actual_ip_on_cf, True)
+                        is_on_valid_backup = actual_ip_on_cf in backup_ips
 
-                        if actual_ip_on_cf != primary_ip and is_current_ip_online:
+                        if is_current_ip_online and not is_on_valid_backup and actual_ip_on_cf != primary_ip:
+                            logger.warning(f"SELF-HEALING: DNS for '{policy_name}' points to an invalid IP ({actual_ip_on_cf}) while primary is offline. Finding a valid backup.")
+                            is_current_ip_online = False 
+
+                        if is_current_ip_online and is_on_valid_backup:
                             logger.info(f"Policy '{policy_name}' is stable on backup IP {actual_ip_on_cf}.")
                             policy_status['downtime_start'] = None
                             policy_status['critical_alert_sent'] = False
