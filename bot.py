@@ -6855,6 +6855,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         index = i + 1
         policy_name = policy.get('policy_name', 'Unnamed')
         line = ""
+        icon = "🛡️" if policy_type == 'failover' else "🚦"
 
         if policy.get('maintenance_mode', False):
             maintenance_text = get_text('messages.status_in_maintenance', lang)
@@ -6883,7 +6884,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 active_ip = status_data.get(policy_name, {}).get('active_ip', 'Unknown')
                 line = get_text('messages.status_lb_ok', lang, policy_name=escape_html(policy_name), ip=active_ip)
         
-        message_parts.append(f"{direction_char}<b>{index}.</b> {line}")
+        message_parts.append(f"{direction_char}<b>{index}.</b> {icon} {line}")
 
     last_check_time = context.bot_data.get('last_health_check_time')
     if last_check_time:
@@ -6893,11 +6894,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     buttons = []
     row = []
-    for i, (_, policy) in enumerate(all_policies):
+    for i, (policy_type, policy) in enumerate(all_policies):
         policy_name = policy.get('policy_name', 'Unnamed')
         short_name = policy_name[:20] + '...' if len(policy_name) > 20 else policy_name
-        
-        button_text = f"{i + 1}. {short_name}"
+
+        icon = "🛡️" if policy_type == 'failover' else "🚦"
+        button_text = f"{icon} {i + 1}. {short_name}"
         
         row.append(InlineKeyboardButton(button_text, callback_data=f"status_select_policy|{i}"))
         
