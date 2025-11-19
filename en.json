@@ -133,7 +133,14 @@
     "back_to_status_list": "↩️ Back to Status List",
     "enter_maintenance": "🔧 Enter Maintenance Mode",
     "exit_maintenance": "❌ Exit Maintenance Mode",
-    "clone_policy": "♻️ Clone This Rule"
+    "clone_policy": "♻️ Clone This Rule",
+    "edit_lb_item_value": "📝 Edit Address (IP/Host)",
+    "lb_add_manual": "⌨️ Type Manually",
+    "lb_add_from_list": "📋 Select from Records",
+    "select_records": "Select Records",
+    "type_ip_manually": "⌨️ Type IP Manually",
+    "select_ip_from_records": "📋 Select from Existing Records",
+    "force_rotate": "🔄 Force Rotate Now"
   },
   "messages": {
     "welcome": "Welcome to the Cloudflare Management Bot!\nUse /list or /language to get started.",
@@ -300,7 +307,7 @@
     "admin_added_success": "✅ User with ID {user_id} has been successfully added as an admin.",
     "admin_already_exists": "⚠️ This User ID is already an admin.",
     "remove_admin_prompt": "Please select an admin to remove:",
-    "admin_removed_success": "✅ User with ID <code>{user_id}</code> has been successfully removed.",
+    "admin_removed_success": "✅ User with ID {user_id} has been successfully removed.",
     "not_a_super_admin": "❌ This action is reserved for Super Admins only (defined in .env).",
     "user_management_menu_header": "<b>👤 User Management</b>\n\n- <b>Super Admins (from .env):</b>\n<code>{super_admins}</code>\n\n- <b>Admins (from config):</b>\n<code>{admins}</code>",
     "notifications_menu_header": "<b>🔔 Notification Settings</b>\n\nHere you can manage who receives alerts from the bot.\n\n- <b>Notification Recipients:</b>\n<code>{recipients}</code>",
@@ -350,7 +357,7 @@
     "status_failover_grace_period": "⚠️ <b>{policy_name}</b>: Primary IP (<code>{ip}</code>) is down! Waiting for grace period to end before failover.",
     "status_failover_active": "🚨 <b>{policy_name}</b>: Failover is active on backup IP (<code>{ip}</code>).",
     "status_failover_all_down": "❌ <b>{policy_name}</b>: CRITICAL! All configured IPs are down.",
-    "status_lb_ok": "🚦 <b>{policy_name}</b>: Currently active on <code>{ip}</code>.",
+    "status_lb_ok": "<b>{policy_name}</b>: Currently active on <code>{ip}</code>.",
     "status_lb_all_down": "❌ <b>{policy_name}</b>: CRITICAL! All IPs in the pool are down.",
     "status_policy_disabled": "⚪️ <b>{policy_name}</b>: This policy is currently disabled.",
     "status_last_updated": "\n<i>Last health check: {time_diff} seconds ago.</i>",
@@ -434,9 +441,15 @@
     "maintenance_mode_enabled": "✅ Maintenance mode has been enabled for rule '{policy_name}'.",
     "maintenance_mode_disabled": "❌ Maintenance mode has been disabled for rule '{policy_name}'.",
     "clone_name_exists": "❌ A rule with this name already exists. Please choose another name.",
-    "clone_success": "✅ Rule '{original_name}' was successfully cloned as '{new_name}'."
+    "clone_success": "✅ Rule '{original_name}' was successfully cloned as '{new_name}'.",
+    "edit_ip_menu_header_with_status": "<b>Editing IP:</b> <code>{ip}</code>\n<b>Current Weight:</b> {weight}\n<b>Status:</b> {status}\n\nWhat would you like to do?",
+    "edit_lb_item_header": "<b>Editing Item:</b> <code>{value}</code>\n<b>Current Weight:</b> {weight}\n<b>Status:</b> {status}\n\nWhat would you like to do?",
+    "lb_add_item_prompt": "How would you like to add a new item to the pool?",
+    "lb_item_deleted_successfully": "✅ Item '{value}' was successfully deleted.",
+    "lb_edit_item_prompt": "How would you like to set the new address for this item?",
+    "wizard_expired": "Wizard has expired due to inactivity. Please start over with /wizard.",
+    "rotation_triggered": "Rotation triggered. Please wait a moment for the next health check cycle to apply it."
   },
-  
   "prompts": {
       "enter_ip": "📥 Please enter the new IP for <code>{name}</code>:",
       "enter_content": "📥 Please enter the new content for <code>{name}</code>:",
@@ -492,7 +505,24 @@
       "confirm_delete_ip": "⚠️ Are you sure you want to delete the IP <code>{ip}</code> from this pool?",
       "enter_new_ips_to_add": "Please enter the new IP(s). You can specify a weight for each (e.g., <code>4.4.4.4:3, 5.5.5.5</code>):",
       "enter_new_ip_for_entry": "Please enter the new IP to replace <code>{old_ip}</code>:",
-      "enter_clone_name": "Please enter a new and unique name for the cloned rule:"
+      "enter_clone_name": "Please enter a new and unique name for the cloned rule:",
+      "enter_new_lb_items": "Please enter the new IP(s) or Hostname(s).\nYou can specify a weight for each (e.g., `server1.com:3, 8.8.8.8:1`):",
+      "enter_new_lb_item_value": "Please enter the new address (IP or Hostname) to replace <code>{old_value}</code>:",
+      "select_records_for_lb_pool": "Please select the records you want to add to the pool as dynamic hostnames:",
+      "confirm_delete_lb_item": "⚠️ Are you sure you want to delete the item <code>{value}</code> from this pool?",
+      "continue_to_record_selection": "Great! Now, press the button below to select the records this policy will apply to.",
+      "select_primary_ip_method": "Great! Now, how would you like to select the Primary IP?",
+      "select_backup_ip_method": "Primary IP saved. Now, how would you like to select the Backup IP(s)?"
+  },
+  "errors": {
+    "edit_one_item_at_a_time": "Please provide only one IP or Hostname when editing.",
+    "no_valid_items_provided": "No valid items provided.",
+    "cannot_edit_weight_no_index": "Cannot edit weight, index not found.",
+    "invalid_weight_input": "Invalid weight: {weight}",
+    "invalid_hostname": "Invalid hostname: '{value}'",
+    "select_at_least_one_record": "Please select at least one record.",
+    "unsupported_policy_type": "Unsupported policy type for this flow.",
+    "select_only_one_primary": "Please select only one record for the primary IP."
   },
   "field_names": {
       "policy_name": "Name",

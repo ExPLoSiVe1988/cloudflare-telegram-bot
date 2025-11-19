@@ -23,6 +23,7 @@ from helpers import (
     get_text, get_user_lang, load_config, save_config, 
     send_or_edit, escape_html, send_notification
 )
+HTTP_CLIENT = httpx.AsyncClient(timeout=20.0)
 
 # --- Persistent Log File Management ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +32,12 @@ LOG_FILE = os.path.join(SCRIPT_DIR, "monitoring_log.json")
 def load_monitoring_log():
     """Loads the monitoring log from its dedicated JSON file, handling corrupted files."""
     if not os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                f.write("[]")
+            logger.info(f"Created a new empty log file at: {LOG_FILE}")
+        except IOError as e:
+            logger.error(f"Could not create a new log file: {e}")
         return []
     
     try:
@@ -136,6 +143,66 @@ def get_flag_emoji(country_code: str) -> str:
 # --- Helper Functions ---
 CONFIG_FILE = "config.json"
 
+def _clear_add_policy_state(context: ContextTypes.DEFAULT_TYPE):
+    """Clears all temporary data related to the add policy flow."""
+    for key in [
+        'add_policy_step', 'new_policy_data', 'add_policy_type', 'last_callback_query', 
+        'is_selecting_for_pool', 'policy_all_records', 'policy_selected_records', 
+        'current_selection_zone', 'lb_add_from_list_flow'
+    ]:
+        context.user_data.pop(key, None)
+
+async def resolve_dns_to_ips(hostname: str, recursion_depth=0) -> list[str]:
+    """
+    Recursively resolves a hostname to a list of its A and AAAA records,
+    following CNAME records.
+    """
+    if recursion_depth > 10:
+        logger.warning(f"DNS resolution for '{hostname}' exceeded max recursion depth.")
+        return []
+
+    if is_valid_ip(hostname):
+        return [hostname]
+
+    try:
+        loop = asyncio.get_running_loop()
+        
+        try:
+            addr_info = await loop.run_in_executor(
+                None, socket.getaddrinfo, hostname, None, socket.AF_INET
+            )
+            ips = sorted(list({info[4][0] for info in addr_info}))
+            if ips:
+                logger.info(f"Resolved '{hostname}' to IPs: {ips}")
+                return ips
+        except socket.gaierror:
+            pass
+
+        try:
+            canonical_name, aliases, ip_list = await loop.run_in_executor(
+                None, socket.gethostbyname_ex, hostname
+            )
+            
+            if ip_list:
+                logger.info(f"Resolved '{hostname}' via alias to IPs: {ip_list}")
+                return sorted(ip_list)
+
+            target_hostname = canonical_name
+            if target_hostname and target_hostname != hostname:
+                logger.info(f"'{hostname}' is a CNAME to '{target_hostname}'. Following redirect...")
+                return await resolve_dns_to_ips(target_hostname, recursion_depth + 1)
+
+        except socket.gaierror:
+            logger.warning(f"Could not resolve DNS for hostname: {hostname}")
+            return []
+
+        logger.warning(f"DNS resolution for '{hostname}' returned no IPs.")
+        return []
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during DNS resolution for {hostname}: {e}")
+        return []
+
 async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, parse_mode="HTML", force_new_message: bool = False):
     """
     Unified helper to send or edit messages, correctly handling real, dummy, and text-based updates.
@@ -190,7 +257,11 @@ def normalize_ip_list(ip_list: list) -> list:
         if isinstance(item, str):
             normalized.append({"ip": item, "weight": 1})
         elif isinstance(item, dict) and "ip" in item:
-            normalized.append({"ip": item["ip"], "weight": item.get("weight", 1)})
+            normalized.append({
+                "ip": item["ip"], 
+                "weight": item.get("weight", 1),
+                "enabled": item.get("enabled", True) 
+            })
     return normalized
 
 def is_valid_ip(ip: str) -> bool:
@@ -291,6 +362,28 @@ def load_config():
         if "record_aliases" not in config: config["record_aliases"] = {}; migrated = True
         if "log_retention_days" not in config: config["log_retention_days"] = 30; migrated = True
         config.setdefault("standalone_monitors", [])
+
+        # --- START OF NEW MIGRATION LOGIC ---
+        for policy in config.get("load_balancer_policies", []):
+            if "ips" in policy and isinstance(policy["ips"], list):
+                new_ip_list = []
+                needs_migration = False
+                for item in policy["ips"]:
+                    if isinstance(item, dict) and "type" not in item:
+                        needs_migration = True
+                        new_ip_list.append({
+                            "type": "ip",
+                            "value": item.get("ip"),
+                            "weight": item.get("weight", 1),
+                            "enabled": item.get("enabled", True)
+                        })
+                    else:
+                        new_ip_list.append(item)
+                
+                if needs_migration:
+                    policy["ips"] = new_ip_list
+                    migrated = True
+                    logger.info(f"Migrated IP structure for policy '{policy.get('policy_name')}' to support hostnames.")
 
         if migrated:
             logger.info("Migration process finished. Saving updated configuration file.")
@@ -428,10 +521,9 @@ async def api_request(token: str, method: str, url: str, **kwargs):
         return {"success": False, "errors": [{"message": "No API token selected."}]}
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.request(method, url, headers=headers, **kwargs)
-            r.raise_for_status()
-            return r.json()
+        r = await HTTP_CLIENT.request(method, url, headers=headers, **kwargs)
+        r.raise_for_status()
+        return r.json()
     except httpx.HTTPStatusError as e:
         try: return e.response.json()
         except json.JSONDecodeError: return {"success": False, "errors": [{"message": e.response.text or f"HTTP Error: {e.response.status_code}"}]}
@@ -582,37 +674,62 @@ async def get_ip_health_with_cache(context: ContextTypes.DEFAULT_TYPE, ip: str, 
 
 async def gather_all_ips_to_check(config: dict) -> dict:
     """
-    Gathers all unique IPs that need a health check from all policies and monitors.
-    Returns a dictionary of check details keyed by IP address.
+    Gathers all unique IPs/Hostnames, resolves hostnames, and prepares them for health checks.
     """
     unique_checks = {}
     all_policies = config.get("load_balancer_policies", []) + config.get("failover_policies", [])
     monitoring_groups = config.get("monitoring_groups", {})
 
-    # Process IPs from Failover and Load Balancer policies
+    items_to_resolve = []
+
     for policy in all_policies:
         if not policy.get('enabled', True):
             continue
 
         is_failover = 'primary_ip' in policy
         
-        ips_in_policy = []
         if is_failover:
-            ips_in_policy.append(policy.get('primary_ip'))
-            ips_in_policy.extend(policy.get('backup_ips', []))
+            items_to_resolve.append({'value': policy.get('primary_ip'), 'policy': policy, 'is_primary': True})
+            for backup_ip in policy.get('backup_ips', []):
+                items_to_resolve.append({'value': backup_ip, 'policy': policy, 'is_primary': False})
         else:
-            ips_in_policy.extend([item['ip'] for item in normalize_ip_list(policy.get('ips', []))])
+            for item in policy.get("ips", []):
+                if item.get('enabled', True):
+                    items_to_resolve.append({'value': item.get('value'), 'policy': policy})
 
-        for ip in set(filter(None, ips_in_policy)):
+    for monitor in config.get("standalone_monitors", []):
+        if monitor.get('enabled', True):
+            items_to_resolve.append({'value': monitor.get('ip'), 'policy': monitor})
+
+    resolve_tasks = [resolve_dns_to_ips(item['value']) for item in items_to_resolve if not is_valid_ip(item['value'])]
+    resolved_results = await asyncio.gather(*resolve_tasks)
+    
+    resolved_map = {}
+    hostname_items = [item for item in items_to_resolve if not is_valid_ip(item['value'])]
+    for i, item in enumerate(hostname_items):
+        resolved_map[item['value']] = resolved_results[i]
+
+    for item in items_to_resolve:
+        value = item['value']
+        policy = item['policy']
+        ips_to_add = []
+
+        if is_valid_ip(value):
+            ips_to_add.append(value)
+        else:
+            ips_to_add.extend(resolved_map.get(value, []))
+
+        for ip in ips_to_add:
             if ip in unique_checks:
                 continue
-            
+
             group_name = None
-            if is_failover:
-                group_name = policy.get('primary_monitoring_group') if ip == policy.get('primary_ip') else policy.get('backup_monitoring_group')
+            if 'primary_ip' in policy:
+                is_primary = item.get('is_primary', False)
+                group_name = policy.get('primary_monitoring_group') if is_primary else policy.get('backup_monitoring_group')
             else:
                 group_name = policy.get('monitoring_group')
-                
+
             if group_name and group_name in monitoring_groups:
                 group_data = monitoring_groups[group_name]
                 unique_checks[ip] = {
@@ -624,28 +741,6 @@ async def gather_all_ips_to_check(config: dict) -> dict:
                     "nodes": group_data.get("nodes", []),
                     "threshold": group_data.get("threshold", 1)
                 }
-
-    # Process IPs from Standalone Monitors
-    standalone_monitors = config.get("standalone_monitors", [])
-    for monitor in standalone_monitors:
-        if not monitor.get('enabled', True):
-            continue
-            
-        ip_to_check = monitor.get('ip')
-        group_name = monitor.get('monitoring_group')
-        
-        if ip_to_check and group_name and group_name in monitoring_groups and ip_to_check not in unique_checks:
-            group_data = monitoring_groups[group_name]
-            unique_checks[ip_to_check] = {
-                "ip": ip_to_check,
-                "check_port": monitor.get("check_port"),
-                "check_type": monitor.get("check_type", "tcp"),
-                "check_path": monitor.get("check_path", "/"),
-                "check_protocol": monitor.get("check_protocol", "https"),
-                "nodes": group_data.get("nodes", []),
-                "threshold": group_data.get("threshold", 1)
-            }
-
     return unique_checks
 
 async def perform_health_checks(context: ContextTypes.DEFAULT_TYPE, unique_checks: dict) -> tuple[dict, bool]:
@@ -744,7 +839,22 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 zone_name = policy.get('zone_name')
                 policy_status = status_data.setdefault(policy_name, {'lb_next_rotation_time': None})
                 
-                healthy_lb_ips_with_weights = [ip_info for ip_info in normalize_ip_list(policy.get('ips',[])) if health_results.get(ip_info['ip'], True)]
+                current_pool_with_weights = []
+                for item in policy.get("ips", []):
+                    if not item.get("enabled", True): continue
+                    
+                    value = item.get("value")
+                    weight = item.get("weight", 1)
+                    if not value: continue
+
+                    if item.get("type") == "hostname":
+                        resolved_ips = await resolve_dns_to_ips(value)
+                        for ip in resolved_ips:
+                            current_pool_with_weights.append({"ip": ip, "weight": weight})
+                    else:
+                        current_pool_with_weights.append({"ip": value, "weight": weight})
+                
+                healthy_lb_ips_with_weights = [ip_info for ip_info in current_pool_with_weights if health_results.get(ip_info['ip'], True)]
                 
                 if not healthy_lb_ips_with_weights:
                     logger.warning(f"All IPs for LB policy '{policy_name}' are down! No action taken.")
@@ -789,16 +899,25 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     if rotation_algo == 'round_robin':
                         policy_status.setdefault('wrr_state', {})
                         wrr_state = policy_status['wrr_state']
+                        
+                        current_healthy_ips = {ip_info['ip'] for ip_info in healthy_lb_ips_with_weights}
+                        for ip in list(wrr_state.keys()):
+                            if ip not in current_healthy_ips:
+                                del wrr_state[ip]
+
                         total_weight = sum(ip_info['weight'] for ip_info in healthy_lb_ips_with_weights)
                         if total_weight > 0:
+                            best_server_ip = None
+                            for ip_info in healthy_lb_ips_with_weights:
+                                if ip_info['ip'] not in wrr_state:
+                                    wrr_state[ip_info['ip']] = 0
+
                             for ip_info in healthy_lb_ips_with_weights:
                                 ip = ip_info['ip']
-                                wrr_state[ip] = wrr_state.get(ip, 0) + ip_info['weight']
-                            best_server_ip, max_weight = None, -1
-                            for ip_info in healthy_lb_ips_with_weights:
-                                ip = ip_info['ip']
-                                if wrr_state.get(ip, 0) > max_weight:
-                                    max_weight, best_server_ip = wrr_state[ip], ip
+                                wrr_state[ip] += ip_info['weight']
+                                if best_server_ip is None or wrr_state[ip] > wrr_state[best_server_ip]:
+                                    best_server_ip = ip
+                            
                             if best_server_ip:
                                 wrr_state[best_server_ip] -= total_weight
                                 chosen_ip = best_server_ip
@@ -847,6 +966,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     status_data[policy_name].pop('downtime_start', None)
                     status_data[policy_name].pop('uptime_start', None)
                     continue
+                
                 record_names = policy.get('record_names', [])
                 zone_name = policy.get('zone_name')
                 record_key = (zone_name, record_names[0]) if record_names else None
@@ -877,11 +997,21 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                             
                             await send_notification(context, recipients_to_notify, 'messages.failover_notification_message', policy_name=policy_name, from_ip=effective_primary_ip, to_ip=next_healthy_backup, add_settings_button=True)
                 else:
-                    primary_ip = policy.get('primary_ip')
+                    primary_ip_or_host = policy.get('primary_ip')
                     backup_ips = policy.get('backup_ips', [])
-                    if not all([primary_ip, backup_ips, record_names, zone_name]):
+                    if not all([primary_ip_or_host, backup_ips, record_names, zone_name]):
                         continue
                     
+                    primary_ips_resolved = await resolve_dns_to_ips(primary_ip_or_host)
+                    if not primary_ips_resolved:
+                        logger.warning(f"Could not resolve primary hostname '{primary_ip_or_host}' for policy '{policy_name}'. Treating as offline.")
+                        is_primary_online = False
+                        primary_ip_to_use_for_notification = primary_ip_or_host 
+                    else:
+                        primary_ip_to_use = primary_ips_resolved[0] 
+                        is_primary_online = health_results.get(primary_ip_to_use, True)
+                        primary_ip_to_use_for_notification = primary_ip_to_use
+
                     policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
                     
                     actual_ip_on_cf = None
@@ -900,8 +1030,6 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         logger.warning(f"Could not determine current IP for Failover policy '{policy_name}'. Skipping.")
                         continue
 
-                    is_primary_online = health_results.get(primary_ip, True)
-                    
                     recipients_to_notify = set(SUPER_ADMIN_IDS)
                     recipient_key = f"__policy__{policy_name}"
                     if recipient_key in recipients_map: recipients_to_notify.update(recipients_map[recipient_key])
@@ -909,12 +1037,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                     if is_primary_online:
                         if policy_status.get('downtime_start') or policy_status.get('critical_alert_sent'):
-                             await send_notification(context, recipients_to_notify, 'messages.server_recovered_notification', policy_name=policy_name, ip=primary_ip)
+                             await send_notification(context, recipients_to_notify, 'messages.server_recovered_notification', policy_name=policy_name, ip=primary_ip_to_use_for_notification)
                         
                         policy_status['downtime_start'] = None
                         policy_status['critical_alert_sent'] = False
 
-                        if actual_ip_on_cf != primary_ip:
+                        if actual_ip_on_cf != primary_ip_to_use:
                             is_on_valid_backup = actual_ip_on_cf in backup_ips
                             
                             if not policy.get('auto_failback', True):
@@ -925,22 +1053,22 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                                 if not policy_status.get('uptime_start'):
                                     policy_status['uptime_start'] = datetime.now().isoformat()
                                     await send_notification(context, recipients_to_notify, 'messages.failback_alert_notification', 
-                                                            policy_name=policy_name, primary_ip=primary_ip, 
+                                                            policy_name=policy_name, primary_ip=primary_ip_to_use_for_notification, 
                                                             failback_minutes=policy.get('failback_minutes', 5.0))
                                 
                                 uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
                                 if (datetime.now() - uptime_dt) >= timedelta(minutes=policy.get('failback_minutes', 5.0)):
-                                    logger.info(f"FAILBACK TRIGGERED for '{policy_name}'. Switching to primary IP {primary_ip}.")
-                                    monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip})
-                                    await switch_dns_ip(context, policy, to_ip=primary_ip)
+                                    logger.info(f"FAILBACK TRIGGERED for '{policy_name}'. Switching to primary IP {primary_ip_to_use}.")
+                                    monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip_to_use})
+                                    await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
                                     await send_notification(context, recipients_to_notify, 'messages.failback_executed_notification', 
-                                                            policy_name=policy_name, primary_ip=primary_ip, add_settings_button=True)
+                                                            policy_name=policy_name, primary_ip=primary_ip_to_use_for_notification, add_settings_button=True)
                                     policy_status.pop('uptime_start', None)
                             
                             else:
                                 logger.warning(f"SELF-HEALING: DNS for '{policy_name}' points to an invalid IP ({actual_ip_on_cf}) while primary is online. Correcting immediately.")
-                                monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip, "mode": "self-heal"})
-                                await switch_dns_ip(context, policy, to_ip=primary_ip)
+                                monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip_to_use, "mode": "self-heal"})
+                                await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
                                 policy_status.pop('uptime_start', None)
                         
                         else:
@@ -951,7 +1079,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         is_current_ip_online = health_results.get(actual_ip_on_cf, True)
                         is_on_valid_backup = actual_ip_on_cf in backup_ips
 
-                        if is_current_ip_online and not is_on_valid_backup and actual_ip_on_cf != primary_ip:
+                        if is_current_ip_online and not is_on_valid_backup and actual_ip_on_cf != primary_ip_or_host:
                             logger.warning(f"SELF-HEALING: DNS for '{policy_name}' points to an invalid IP ({actual_ip_on_cf}) while primary is offline. Finding a valid backup.")
                             is_current_ip_online = False 
 
@@ -961,10 +1089,10 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                             policy_status['critical_alert_sent'] = False
                         
                         else:
-                            if actual_ip_on_cf == primary_ip and not policy_status.get('downtime_start'):
+                            if actual_ip_on_cf == primary_ip_to_use and not policy_status.get('downtime_start'):
                                 policy_status['downtime_start'] = datetime.now().isoformat()
                                 await send_notification(context, recipients_to_notify, 'messages.server_alert_notification', 
-                                                        add_settings_button=True, policy_name=policy_name, ip=primary_ip)
+                                                        add_settings_button=True, policy_name=policy_name, ip=primary_ip_to_use_for_notification)
                             
                             downtime_start_str = policy_status.get('downtime_start')
                             if downtime_start_str:
@@ -992,7 +1120,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                                     logger.error(f"CRITICAL ALERT for '{policy_name}': Primary and all backup IPs are down.")
                                     await send_notification(context, recipients_to_notify, 'messages.failover_notification_all_down', 
                                                             add_settings_button=True, policy_name=policy_name, 
-                                                            primary_ip=primary_ip, backup_ips=", ".join(backup_ips))
+                                                            primary_ip=primary_ip_to_use_for_notification, backup_ips=", ".join(backup_ips))
                                     policy_status['critical_alert_sent'] = True
                     pass
 
@@ -1064,15 +1192,16 @@ async def manual_health_check_callback(update: Update, context: ContextTypes.DEF
         item_index = int(item_index_str)
         
         config = load_config()
-        ips_to_check = []
+        items_to_check = []
         policy_name = "N/A"
+        policy = {}
 
         if item_type == 'monitor':
             policy = config['standalone_monitors'][item_index]
             policy_name = policy.get("monitor_name", "N/A")
             ip = policy.get('ip')
             if ip:
-                ips_to_check.append({'ip': ip, 'group': policy.get('monitoring_group')})
+                items_to_check.append({'value': ip, 'type': 'ip', 'group': policy.get('monitoring_group')})
         else:
             policy_list_key = "load_balancer_policies" if item_type == 'lb' else "failover_policies"
             policy = config[policy_list_key][item_index]
@@ -1081,32 +1210,51 @@ async def manual_health_check_callback(update: Update, context: ContextTypes.DEF
             if item_type == 'failover':
                 primary_ip = policy.get('primary_ip')
                 if primary_ip:
-                    ips_to_check.append({'ip': primary_ip, 'group': policy.get('primary_monitoring_group')})
+                    items_to_check.append({'value': primary_ip, 'type': 'ip', 'group': policy.get('primary_monitoring_group')})
                 for backup_ip in policy.get('backup_ips', []):
-                    ips_to_check.append({'ip': backup_ip, 'group': policy.get('backup_monitoring_group')})
-            else:
-                for item in normalize_ip_list(policy.get('ips', [])):
-                    ips_to_check.append({'ip': item['ip'], 'group': policy.get('monitoring_group')})
+                    items_to_check.append({'value': backup_ip, 'type': 'ip', 'group': policy.get('backup_monitoring_group')})
+            
+            elif item_type == 'lb':
+                for item in policy.get('ips', []):
+                    items_to_check.append({
+                        'value': item.get('value'),
+                        'type': item.get('type', 'ip'),
+                        'group': policy.get('monitoring_group')
+                    })
 
-        if not ips_to_check:
+        final_ips_to_check = []
+        for item in items_to_check:
+            if item.get('type') == 'hostname':
+                resolved_ips = await resolve_dns_to_ips(item['value'])
+                for ip in resolved_ips:
+                    final_ips_to_check.append({'ip': ip, 'group': item['group']})
+            elif item.get('type') == 'ip':
+                final_ips_to_check.append({'ip': item['value'], 'group': item['group']})
+
+        if not final_ips_to_check:
             await query.edit_message_text(get_text('messages.manual_check_no_ips', lang))
             return
 
         monitoring_groups = config.get("monitoring_groups", {})
         results = []
         
-        for ip_info in ips_to_check:
+        for ip_info in final_ips_to_check:
             ip = ip_info.get('ip')
             if not ip: continue
 
             group_name = ip_info.get('group')
-            check_details = {"check_port": policy.get("check_port")}
+            check_details = {
+                "check_port": policy.get("check_port"),
+                "check_type": policy.get("check_type", "tcp"),
+                "check_path": policy.get("check_path", "/"),
+                "check_protocol": policy.get("check_protocol", "https")
+            }
             
             if group_name and group_name in monitoring_groups:
                 group_data = monitoring_groups[group_name]
                 check_details.update({"nodes": group_data.get("nodes", []), "threshold": group_data.get("threshold", 1)})
             elif group_name:
-                logger.warning(f"Monitoring group '{group_name}' not found for '{policy_name}'. Performing a simple check.")
+                logger.warning(f"Monitoring group '{group_name}' not found for '{policy_name}'.")
 
             is_online, _ = await get_ip_health_with_cache(context, ip, check_details)
             status_text = get_text('messages.manual_check_status_online', lang) if is_online else get_text('messages.manual_check_status_offline', lang)
@@ -1123,7 +1271,6 @@ async def manual_health_check_callback(update: Update, context: ContextTypes.DEF
             back_to_source_text_key = 'buttons.back_to_policy_details'
         
         buttons.append([InlineKeyboardButton(get_text(back_to_source_text_key, lang), callback_data=back_to_source_callback)])
-        
         buttons.append([InlineKeyboardButton(get_text('buttons.back_to_status_list', lang), callback_data="status_refresh")])
         
         await query.edit_message_text(result_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
@@ -1286,18 +1433,30 @@ def clear_state(context: ContextTypes.DEFAULT_TYPE, preserve=None):
 
 # --- Display Logic ---
 async def display_records_for_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
-    """Displays a paginated list of A/AAAA records for policy selection with robust error handling."""
+    """Displays a paginated list of records for policy selection."""
     query = update.callback_query
     lang = get_user_lang(context)
     
+    selection_purpose = context.user_data.get('record_selection_purpose', 'policy_records')
+    
+    if selection_purpose == 'pool_items':
+        prompt_key = 'prompts.select_records_for_lb_pool'
+        confirm_callback = "confirm_pool_selection"
+    elif selection_purpose == 'primary_ip':
+        prompt_key = 'prompts.select_primary_ip_method'
+        confirm_callback = "policy_confirm_records"
+    else:
+        prompt_key = 'prompts.select_records_for_policy'
+        confirm_callback = "policy_confirm_records"
+
     is_editing = context.user_data.get('is_editing_policy_records', False)
     policy_type = context.user_data.get('editing_policy_type') if is_editing else context.user_data.get('add_policy_type')
     
     try:
-        if is_editing:
+        if is_editing or context.user_data.get('editing_policy_type'):
             policy_index = context.user_data['edit_policy_index']
             config = load_config()
-            policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+            policy_list_key = 'load_balancer_policies' if context.user_data.get('editing_policy_type') == 'lb' else 'failover_policies'
             policy = config[policy_list_key][policy_index]
             account_nickname, zone_name = policy['account_nickname'], policy['zone_name']
         else:
@@ -1321,14 +1480,18 @@ async def display_records_for_selection(update: Update, context: ContextTypes.DE
             
         all_records_raw = await get_dns_records(token, zone_id)
         
-        context.user_data['policy_all_records'] = [r for r in all_records_raw if r['type'] in ['A', 'AAAA']]
+        if selection_purpose in ['pool_items', 'primary_ip', 'backup_ips']:
+            record_types = ['A', 'AAAA', 'CNAME']
+        else:
+            record_types = ['A', 'AAAA']
+        context.user_data['policy_all_records'] = [r for r in all_records_raw if r['type'] in record_types]
         context.user_data['current_selection_zone'] = zone_name
 
     all_records = context.user_data.get('policy_all_records', [])
     selected_records = context.user_data.get('policy_selected_records', [])
     
     if not all_records:
-        if query: await query.edit_message_text(f"No A or AAAA records found in zone '{zone_name}'. Cannot create/edit policy.")
+        await query.edit_message_text(get_text('errors.no_selectable_records', lang, zone_name=zone_name))
         return
 
     start_index = page * RECORDS_PER_PAGE
@@ -1349,11 +1512,11 @@ async def display_records_for_selection(update: Update, context: ContextTypes.DE
         pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next', lang), callback_data=f"policy_records_page|{page + 1}"))
     if pagination_buttons: buttons.append(pagination_buttons)
 
-    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection', lang, count=len(selected_records)), callback_data="policy_confirm_records")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection', lang, count=len(selected_records)), callback_data=confirm_callback)])
     
     try:
         if query:
-            await query.edit_message_text(get_text('prompts.select_records_for_policy', lang), reply_markup=InlineKeyboardMarkup(buttons))
+            await query.edit_message_text(get_text(prompt_key, lang), reply_markup=InlineKeyboardMarkup(buttons))
     except error.BadRequest as e:
         if "Message is not modified" not in str(e):
             logger.error("A BadRequest error occurred in display_records_for_selection", exc_info=True)
@@ -1697,6 +1860,142 @@ async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
 
 # --- Callback Handlers ---
+async def lb_force_rotate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forces an immediate rotation for a Load Balancer policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        config = load_config()
+        policy = config['load_balancer_policies'][policy_index]
+        policy_name = policy.get('policy_name')
+
+        if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+            context.bot_data['health_status'][policy_name].pop('lb_next_rotation_time', None)
+            logger.info(f"User forced a rotation for policy '{policy_name}'. Next rotation time cleared.")
+            
+            await query.answer(get_text('messages.rotation_triggered', lang, default="Rotation triggered. Please wait a moment for the next health check cycle to apply it."), show_alert=True)
+        else:
+            await query.answer("Bot state for this policy not found. It will rotate on the next cycle.", show_alert=True)
+
+    except (IndexError, KeyError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def add_policy_failover_manual_primary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles manual input for the primary IP in a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    context.user_data['add_policy_step'] = 'primary_ip'
+    await query.edit_message_text(get_text('prompts.enter_primary_ip', lang))
+
+
+async def add_policy_failover_from_list_primary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts record selection for the primary IP in a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['record_selection_purpose'] = 'primary_ip'
+    context.user_data['policy_selected_records'] = []
+    
+    await display_records_for_selection(update, context, page=0)
+
+
+async def add_policy_failover_select_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts record selection for the main records of a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['record_selection_purpose'] = 'policy_records'
+    context.user_data['policy_selected_records'] = []
+    
+    context.user_data['is_editing_policy_records'] = False
+    await display_records_for_selection(update, context, page=0)
+
+async def confirm_pool_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms the selection of records for the LB POOL and proceeds to the next step."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    selected_short_names = context.user_data.get('policy_selected_records', [])
+    if not selected_short_names:
+        await query.answer(get_text('errors.select_at_least_one_record', lang), show_alert=True)
+        return
+
+    new_items = []
+    zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+    if not zone_name:
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    for short_name in selected_short_names:
+        full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+        new_items.append({
+            "type": "hostname",
+            "value": full_name,
+            "weight": 1,
+            "enabled": True
+        })
+    
+    context.user_data['new_policy_data']['ips'] = new_items
+    
+    context.user_data.pop('record_selection_purpose', None)
+    context.user_data.pop('policy_selected_records', None)
+    context.user_data.pop('policy_all_records', None)
+    context.user_data.pop('current_selection_zone', None)
+    
+    context.user_data['add_policy_step'] = 'rotation_interval_hours'
+    await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
+
+async def add_policy_lb_select_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record selection for a new LB policy after port has been entered."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['is_selecting_for_pool'] = False
+    context.user_data['policy_selected_records'] = []
+    
+    context.user_data['is_editing_policy_records'] = False
+    await display_records_for_selection(update, context, page=0)
+
+async def add_policy_lb_from_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record selection process for the POOL of a new LB policy."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['record_selection_purpose'] = 'pool_items'
+    context.user_data['lb_pool_selected_records'] = [] 
+    
+    await display_records_for_selection(update, context, page=0)
+
+async def add_policy_lb_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' button during the add policy flow."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    context.user_data['add_policy_step'] = 'ips'
+    text = get_text('prompts.enter_new_lb_items', lang)
+    buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="settings_lb_policies")]]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def wizard_lb_add_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' button during the wizard."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    context.user_data['wizard_step'] = 'ask_lb_ips'
+    text = get_text('prompts.enter_new_lb_items', lang)
+    buttons = [[InlineKeyboardButton(get_text('buttons.wizard_cancel', lang), callback_data="wizard_cancel")]]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
 async def clone_policy_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the process of cloning a policy."""
     query = update.callback_query
@@ -3176,85 +3475,126 @@ async def policy_select_record_callback(update: Update, context: ContextTypes.DE
     _, short_name, page_str = query.data.split('|')
     page = int(page_str)
     
-    selected_records = context.user_data.get('policy_selected_records', [])
+    selected_records_key = 'policy_selected_records'
+
+    selected_records = context.user_data.get(selected_records_key, [])
+    
     if short_name in selected_records:
         selected_records.remove(short_name)
     else:
         selected_records.append(short_name)
-    context.user_data['policy_selected_records'] = selected_records
+        
+    context.user_data[selected_records_key] = selected_records
     
     await display_records_for_selection(update, context, page=page)
 
 async def policy_confirm_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Finalizes record selection for editing, wizard, and adding new policies."""
+    """Finalizes record selection for all scenarios."""
     query = update.callback_query
     context.user_data['last_callback_query'] = query
     await query.answer()
     lang = get_user_lang(context)
 
-    if context.user_data.get('wizard_step') == 'select_records':
-        selected_records = context.user_data.get('policy_selected_records', [])
-        if not selected_records:
-            await query.answer("Please select at least one record.", show_alert=True)
+    selected_short_names = context.user_data.get('policy_selected_records', [])
+    if not selected_short_names:
+        await query.answer(get_text('errors.select_at_least_one_record', lang), show_alert=True)
+        return
+
+    selection_purpose = context.user_data.pop('record_selection_purpose', 'policy_records')
+
+    if selection_purpose == 'pool_items':
+        new_items = []
+        zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+        if not zone_name:
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
             return
+
+        for short_name in selected_short_names:
+            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+            new_items.append({
+                "type": "hostname",
+                "value": full_name,
+                "weight": 1,
+                "enabled": True
+            })
         
-        context.user_data['wizard_data']['record_names'] = selected_records
-        
-        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone', 'add_policy_type', 'new_policy_data']:
-            context.user_data.pop(key, None)
-            
-        await wizard_final_step_ask_monitoring(update, context)
-        return
-    
-    selected_records = context.user_data.get('policy_selected_records', [])
-    is_editing = context.user_data.get('is_editing_policy_records', False)
-    
-    if is_editing:
-        policy_type = context.user_data.get('editing_policy_type')
-        policy_index = context.user_data.get('edit_policy_index')
-
-        if not all([policy_type, policy_index is not None]):
-            await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
-
-        config = load_config()
-        policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
-        
-        try:
-            config[policy_list_key][policy_index]['record_names'] = selected_records
-            save_config(config)
-        except IndexError:
-            await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
-        
-        policy_type_display = "LB" if policy_type == 'lb' else "Failover"
-        await send_or_edit(update, context, get_text('messages.policy_records_updated', lang, policy_type=policy_type_display))
-        await asyncio.sleep(1)
-
-        for key in ['is_editing_policy_records', 'policy_all_records', 'policy_selected_records', 'current_selection_zone']:
-            context.user_data.pop(key, None)
-
-        if policy_type == 'lb':
-            await lb_policy_view_callback(update, context)
-        else:
-            await failover_policy_view_callback(update, context)
-        return
-
-    else:
-        if not selected_records:
-            await query.answer("Please select at least one record.", show_alert=True); return
-
-        policy_type = context.user_data.get('add_policy_type')
-        data = context.user_data['new_policy_data']
-        data['record_names'] = selected_records
+        context.user_data['new_policy_data']['ips'] = new_items
         
         for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
             context.user_data.pop(key, None)
 
-        if policy_type == 'lb' or policy_type == 'failover':
-            context.user_data['add_policy_step'] = 'select_group'
-            await policy_add_step_ask_group(update, context)
-        else:
-            await query.edit_message_text("Unsupported policy type for this flow.")
+        context.user_data['add_policy_step'] = 'rotation_interval_hours'
+        await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
         return
+
+    elif selection_purpose == 'primary_ip':
+        if len(selected_short_names) > 1:
+            await query.answer(get_text('errors.select_only_one_primary', lang), show_alert=True)
+            context.user_data['record_selection_purpose'] = 'primary_ip'
+            return
+        
+        all_records = context.user_data.get('policy_all_records', [])
+        zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+        primary_ip_record = next((r for r in all_records if get_short_name(r['name'], zone_name) == selected_short_names[0]), None)
+        
+        if not primary_ip_record:
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
+            return
+            
+        context.user_data['new_policy_data']['primary_ip'] = primary_ip_record['content']
+        
+        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+            context.user_data.pop(key, None)
+
+        context.user_data['add_policy_step'] = 'backup_ips'
+        await send_or_edit(update, context, get_text('prompts.enter_backup_ip', lang))
+        return
+
+    elif context.user_data.get('wizard_step') == 'select_records':
+        context.user_data['wizard_data']['record_names'] = selected_short_names
+        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone', 'add_policy_type', 'new_policy_data']:
+            context.user_data.pop(key, None)
+        await wizard_final_step_ask_monitoring(update, context)
+        return
+    
+    elif selection_purpose == 'policy_records':
+        is_editing = context.user_data.get('is_editing_policy_records', False)
+        if is_editing:
+            policy_type = context.user_data.get('editing_policy_type')
+            policy_index = context.user_data.get('edit_policy_index')
+            if not all([policy_type, policy_index is not None]):
+                await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
+            config = load_config()
+            policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+            try:
+                config[policy_list_key][policy_index]['record_names'] = selected_short_names
+                save_config(config)
+            except IndexError:
+                await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
+            policy_type_display = "LB" if policy_type == 'lb' else "Failover"
+            await send_or_edit(update, context, get_text('messages.policy_records_updated', lang, policy_type=policy_type_display))
+            await asyncio.sleep(1)
+            for key in ['is_editing_policy_records', 'policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+                context.user_data.pop(key, None)
+            if policy_type == 'lb':
+                await lb_policy_view_callback(update, context)
+            else:
+                await failover_policy_view_callback(update, context)
+            return
+        else:
+            policy_type = context.user_data.get('add_policy_type')
+            data = context.user_data['new_policy_data']
+            data['record_names'] = selected_short_names
+            
+            for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+                context.user_data.pop(key, None)
+
+            if policy_type in ['lb', 'failover']:
+                context.user_data['add_policy_step'] = 'select_group'
+                await policy_add_step_ask_group(update, context)
+            else:
+                await query.edit_message_text(get_text('errors.unsupported_policy_type', lang))
+            return
 
 async def policy_set_failback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3454,7 +3794,7 @@ async def _handle_state_wizard_steps(update: Update, context: ContextTypes.DEFAU
     if not start_time or (datetime.now() - start_time) > timedelta(minutes=10):
         for key in ['wizard_data', 'wizard_step', 'wizard_start_time', 'last_callback_query']:
             context.user_data.pop(key, None)
-        await update.message.reply_text("فرآیند راه‌اندازی سریع به دلیل عدم فعالیت منقضی شد. لطفاً با /wizard دوباره شروع کنید.")
+        await update.message.reply_text(get_text('messages.wizard_expired', lang, default="Wizard has expired due to inactivity. Please start over with /wizard."))
         return
 
     if wizard_step == 'ask_name':
@@ -3483,25 +3823,35 @@ async def _handle_state_wizard_steps(update: Update, context: ContextTypes.DEFAU
         await wizard_step5_ask_port(update, context)
 
     elif wizard_step == 'ask_lb_ips':
-        new_ips_data = []
-        ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-        for entry in ip_entries:
-            ip, weight = (entry.strip(), 1)
+        new_items_data = []
+        entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+        for entry in entries:
+            value, weight = entry.strip(), 1
             if ':' in entry:
                 parts = entry.split(':', 1)
-                ip, weight_str = parts[0].strip(), parts[1].strip()
+                value, weight_str = parts[0].strip(), parts[1].strip()
                 if not (weight_str.isdigit() and int(weight_str) >= 1):
-                    error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_weight_positive', lang, ip=ip)}")
+                    error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_weight_positive', lang, ip=value)}")
                     await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
                     return
                 weight = int(weight_str)
-            if not is_valid_ip(ip):
-                error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
+            
+            item_type = "ip" if is_valid_ip(value) else "hostname"
+            
+            if item_type == "hostname" and '.' not in value:
+                error_msg = await update.message.reply_text(f"❌ {get_text('errors.invalid_hostname', lang, value=value, default=f'Invalid hostname: {value}')}")
                 await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
                 return
-            new_ips_data.append({"ip": ip, "weight": weight})
-        if not new_ips_data: return
-        context.user_data['wizard_data']['ips'] = new_ips_data
+
+            new_items_data.append({
+                "type": item_type,
+                "value": value,
+                "weight": weight,
+                "enabled": True
+            })
+
+        if not new_items_data: return
+        context.user_data['wizard_data']['ips'] = new_items_data
         await wizard_step5_ask_port(update, context)
 
     elif wizard_step == 'ask_port':
@@ -3546,11 +3896,16 @@ async def _handle_state_aliases(update: Update, context: ContextTypes.DEFAULT_TY
             temp_msg_text = get_text('messages.record_alias_set_success', lang, record_name=escape_html(alias_data['record_name']), alias=escape_html(text))
         
         save_config(config)
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(2)
+        try: await temp_msg.delete()
+        except Exception: pass
         context.user_data.pop('all_records', None)
         await display_records_list(update, context)
 
     # --- Handle Zone Alias ---
     elif 'awaiting_zone_alias' in context.user_data:
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
         alias_data = context.user_data.pop('awaiting_zone_alias')
         zone_id, zone_name = alias_data['zone_id'], alias_data['zone_name']
         
@@ -3565,14 +3920,56 @@ async def _handle_state_aliases(update: Update, context: ContextTypes.DEFAULT_TY
             temp_msg_text = get_text('messages.alias_set_success', lang, zone_name=escape_html(zone_name), alias=escape_html(text))
             
         save_config(config)
-        context.user_data.pop('all_zones_cache', None)
-        await display_zones_list(update, context)
-
-    if 'temp_msg_text' in locals():
         temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
         await asyncio.sleep(3)
         try: await temp_msg.delete()
         except Exception: pass
+        
+        if message_id_to_edit:
+            dummy_update = context.application.create_dummy_update(update, message_id_to_edit)
+            await display_zones_list(dummy_update, context)
+
+async def _handle_state_notification_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles adding new recipient IDs to a notification group."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    recipient_key = context.user_data.get('current_recipient_key')
+
+    if not recipient_key:
+        await update.message.reply_text(get_text('messages.session_expired_try_again', lang))
+        return
+
+    try:
+        await update.message.delete()
+        if context.user_data.get('last_menu_message_id'):
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('last_menu_message_id'))
+    except error.BadRequest:
+        pass
+
+    new_member_ids = set()
+    parts = [p.strip() for p in text.split(',') if p.strip()]
+    for part in parts:
+        try:
+            new_member_ids.add(int(part))
+        except ValueError:
+            await update.message.reply_text(get_text('messages.invalid_recipient_id', lang, part=escape_html(part)), parse_mode="HTML")
+            return
+
+    if not new_member_ids:
+        await update.message.reply_text(get_text('messages.no_valid_ids_entered', lang))
+        return
+        
+    config = load_config()
+    recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
+    current_members = set(recipients_map.get(recipient_key, []))
+    current_members.update(new_member_ids)
+    recipients_map[recipient_key] = sorted(list(current_members))
+    save_config(config)
+    
+    context.user_data.pop('state', None)
+    
+    dummy_update = context.application.create_dummy_update(update, update.message.message_id, callback_data=f"notification_edit_recipients|{recipient_key}")
+    await notification_edit_recipients_callback(dummy_update, context)
 
 async def _create_dummy_update_from_text(update: Update, callback_data: str):
     """Creates a dummy Update object with a CallbackQuery from a text message."""
@@ -3589,10 +3986,11 @@ async def _create_dummy_update_from_text(update: Update, callback_data: str):
     })
 
 async def _handle_state_lb_ip_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all text inputs for managing Load Balancer IP addresses and weights."""
+    """Handles all text inputs for managing Load Balancer IP addresses/hostnames and weights."""
     lang = get_user_lang(context)
     state = context.user_data.get('state')
     text = update.message.text.strip()
+    config = None
     try:
         await update.message.delete()
         if context.user_data.get('last_callback_query'):
@@ -3602,48 +4000,305 @@ async def _handle_state_lb_ip_management(update: Update, context: ContextTypes.D
     try:
         policy_index = context.user_data['edit_policy_index']
         config = load_config()
-        
-        if state == 'awaiting_lb_ip_address':
-            if not is_valid_ip(text): raise ValueError(f"Invalid IP: {text}")
-            ip_index = context.user_data['lb_ip_action_index']
-            config['load_balancer_policies'][policy_index]['ips'][ip_index]['ip'] = text
-            save_config(config)
+        policy = config['load_balancer_policies'][policy_index]
 
-        elif state == 'awaiting_lb_ip_weight':
-            if not text.isdigit() or int(text) < 1: raise ValueError(f"Invalid weight: {text}")
-            ip_index = context.user_data['lb_ip_action_index']
-            config['load_balancer_policies'][policy_index]['ips'][ip_index]['weight'] = int(text)
-            save_config(config)
+        if state in ['awaiting_lb_new_ip', 'awaiting_lb_ip_address']:
+            edit_index = context.user_data.get('lb_ip_action_index')
+            
+            if state == 'awaiting_lb_ip_address' and ',' in text:
+                raise ValueError(get_text('errors.edit_one_item_at_a_time', lang, default="Please provide only one IP or Hostname when editing."))
 
-        elif state == 'awaiting_lb_new_ip':
-            new_ips_data = []
-            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-            for entry in ip_entries:
-                ip, weight = (entry.strip(), 1)
+            new_items_data = []
+            entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in entries:
+                value, weight = entry.strip(), 1
                 if ':' in entry:
                     parts = entry.split(':', 1)
-                    ip, weight_str = parts[0].strip(), parts[1].strip()
-                    if not (weight_str.isdigit() and int(weight_str) >= 1): raise ValueError(f"Invalid weight for {ip}")
+                    value, weight_str = parts[0].strip(), parts[1].strip()
+                    if not (weight_str.isdigit() and int(weight_str) >= 1): raise ValueError(get_text('messages.invalid_weight_positive', lang, ip=value))
                     weight = int(weight_str)
-                if not is_valid_ip(ip): raise ValueError(f"Invalid IP: {ip}")
-                new_ips_data.append({"ip": ip, "weight": weight})
-            if new_ips_data:
-                config['load_balancer_policies'][policy_index]['ips'].extend(new_ips_data)
-                save_config(config)
+                
+                item_type = "ip" if is_valid_ip(value) else "hostname"
+                new_items_data.append({"type": item_type, "value": value, "weight": weight})
+
+            if not new_items_data:
+                raise ValueError(get_text('errors.no_valid_items_provided', lang, default="No valid items provided."))
+
+            if edit_index is not None:
+                old_item = policy['ips'][edit_index]
+                newly_parsed_item = new_items_data[0]
+                newly_parsed_item['enabled'] = old_item.get('enabled', True)
+                if ':' not in text:
+                    newly_parsed_item['weight'] = old_item.get('weight', 1)
+                policy['ips'][edit_index] = newly_parsed_item
+            else:
+                for item in new_items_data:
+                    item['enabled'] = True
+                policy.setdefault('ips', []).extend(new_items_data)
+
+        elif state == 'awaiting_lb_ip_weight':
+            ip_index = context.user_data.get('lb_ip_action_index')
+            if ip_index is None: raise KeyError(get_text('errors.cannot_edit_weight_no_index', lang, default="Cannot edit weight, index not found."))
+            if not text.isdigit() or int(text) < 1: raise ValueError(get_text('errors.invalid_weight_input', lang, weight=text))
+            policy['ips'][ip_index]['weight'] = int(text)
+
     except (IndexError, KeyError) as e:
         logger.error(f"Session error in LB IP management: {e}", exc_info=True)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.session_expired_error', lang))
+        config = None
     except ValueError as e:
         logger.warning(f"Invalid user input in LB IP management: {e}")
-        error_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ {e}. Please try again.")
+        error_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ {e}")
         await asyncio.sleep(4)
         try: await error_msg.delete() 
         except Exception: pass
+        config = None
     finally:
+        if config:
+            save_config(config)
+        
         context.user_data.pop('state', None)
         context.user_data.pop('lb_ip_action_index', None)
         
-        await lb_ip_list_menu(update, context, force_new_message=True)
+        dummy_update = await _create_dummy_update_from_text(update, "lb_ip_list_menu")
+        await lb_ip_list_menu(dummy_update, context, config_data=config)
+
+async def _handle_state_admin_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for adding a new bot admin."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+    context.user_data.pop('awaiting_admin_id_to_add', None)
+    
+    if not is_super_admin(update):
+        await update.message.reply_text(get_text('messages.not_a_super_admin', lang))
+        return
+        
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        admin_id = int(text)
+        config = load_config()
+        config.setdefault("admins", [])
+        if admin_id in config["admins"] or admin_id in SUPER_ADMIN_IDS:
+            temp_msg_text = get_text('messages.admin_already_exists', lang)
+        else:
+            config["admins"].append(admin_id)
+            save_config(config)
+            temp_msg_text = get_text('messages.admin_added_success', lang, user_id=admin_id)
+    except ValueError:
+        if message_id_to_edit:
+            error_text = f"{get_text('prompts.add_admin_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}"
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=error_text)
+            context.user_data.update({'awaiting_admin_id_to_add': True, 'last_menu_message_id': message_id_to_edit})
+        else:
+            await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
+        return
+    
+    temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+    await asyncio.sleep(3)
+    try: await temp_msg.delete()
+    except Exception: pass
+
+    if message_id_to_edit:
+        dummy_update = context.application.create_dummy_update(update, message_id_to_edit)
+        await user_management_menu_callback(dummy_update, context)
+
+async def _handle_state_monitor_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for adding and editing standalone monitors."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if 'monitor_add_step' in context.user_data:
+        monitor_add_step = context.user_data['monitor_add_step']
+        
+        async def edit_previous_prompt(new_text, new_markup):
+            if context.user_data.get('last_callback_query'):
+                try:
+                    await context.user_data['last_callback_query'].message.edit_text(new_text, reply_markup=new_markup, parse_mode="HTML")
+                except Exception:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=new_text, reply_markup=new_markup, parse_mode="HTML")
+
+        if monitor_add_step == 'ask_name':
+            context.user_data['new_monitor_data']['monitor_name'] = text
+            context.user_data['monitor_add_step'] = 'ask_ip'
+            text_to_send = get_text('messages.wizard_name_saved', lang) + get_text('messages.monitor_ask_ip', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
+        
+        elif monitor_add_step == 'ask_ip':
+            context.user_data['new_monitor_data']['ip'] = text
+            context.user_data['monitor_add_step'] = 'ask_port'
+            text_to_send = get_text('messages.monitor_ip_saved', lang) + get_text('messages.monitor_ask_port', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
+            
+        elif monitor_add_step == 'ask_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535):
+                error_text = get_text('messages.monitor_ask_port', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
+                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+                await edit_previous_prompt(error_text, InlineKeyboardMarkup(buttons))
+            else:
+                context.user_data['new_monitor_data']['check_port'] = int(text)
+                context.user_data['monitor_add_step'] = 'select_group'
+                await monitor_step_ask_group(update, context)
+
+    elif 'monitor_edit_step' in context.user_data:
+        field = context.user_data.pop('monitor_edit_step')
+        monitor_index = context.user_data.get('edit_monitor_index')
+        if monitor_index is None:
+            await update.message.reply_text(get_text('messages.session_expired_error', lang))
+            return
+
+        new_value = text.strip()
+        
+        if field == 'check_port':
+            if not new_value.isdigit() or not (1 <= int(new_value) <= 65535):
+                error_text = get_text('messages.monitor_ask_port_edit', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
+                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]]
+                if context.user_data.get('last_callback_query'):
+                    await context.user_data['last_callback_query'].message.edit_text(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+                context.user_data['monitor_edit_step'] = field
+                return
+            value_to_save = int(new_value)
+        else:
+            value_to_save = new_value
+        
+        config = load_config()
+        old_ip = None
+        try:
+            if field == 'ip': old_ip = config['standalone_monitors'][monitor_index].get('ip')
+            config['standalone_monitors'][monitor_index][field] = value_to_save
+            save_config(config)
+        except (IndexError, KeyError):
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.internal_error', lang))
+            return
+
+        if field == 'ip' and old_ip and old_ip != value_to_save:
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"monitor_purge_logs|{old_ip}")],
+                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]
+            ]
+            text_to_send = get_text('messages.monitor_ask_purge_logs', lang, old_ip=escape_html(old_ip))
+            if context.user_data.get('last_callback_query'):
+                await context.user_data['last_callback_query'].message.edit_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        else:
+            temp_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.value_updated_success', lang))
+            await asyncio.sleep(2)
+            await temp_msg.delete()
+            
+            if context.user_data.get('last_callback_query'):
+                await context.user_data.pop('last_callback_query').message.delete()
+            callback_data_for_menu = f"monitor_edit|{monitor_index}"
+            dummy_update = context.application.create_dummy_update(update, update.message.message_id, callback_data=callback_data_for_menu)
+            await monitor_edit_menu_callback(dummy_update, context)
+
+async def _handle_state_record_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs related to adding, editing, and bulk-modifying DNS records."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    if "add_step" in context.user_data:
+        step = context.user_data["add_step"]
+        zone_name = context.user_data.get('selected_zone_name', 'your_domain.com')
+        if step == "name":
+            new_name = zone_name if text.strip() == "@" else f"{text.strip()}.{zone_name}"
+            all_records = context.user_data.get('all_records', [])
+            existing_record = next((r for r in all_records if r['name'].lower() == new_name.lower()), None)
+            if existing_record:
+                context.user_data.pop("add_step", None)
+                buttons = [[InlineKeyboardButton(get_text('buttons.try_another_name', lang), callback_data="add_retry_name")],
+                           [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{existing_record['id']}")],
+                           [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+                await send_or_edit(update, context, get_text('messages.subdomain_exists', lang), InlineKeyboardMarkup(buttons))
+            else:
+                context.user_data["new_name"] = new_name
+                context.user_data["add_step"] = "content"
+                prompt_text_key = 'prompts.enter_ip' if context.user_data.get("new_type") in ['A', 'AAAA'] else 'prompts.enter_content'
+                await send_or_edit(update, context, get_text(prompt_text_key, lang, name=escape_html(text.strip())), parse_mode="HTML")
+        elif step == "content":
+            context.user_data["new_content"] = text
+            context.user_data.pop("add_step")
+            kb = [[InlineKeyboardButton("DNS Only", callback_data="add_proxied|false")], [InlineKeyboardButton("Proxied", callback_data="add_proxied|true")]]
+            await send_or_edit(update, context, get_text('prompts.choose_proxy', lang), InlineKeyboardMarkup(kb))
+
+    elif "edit" in context.user_data:
+        data = context.user_data.pop("edit")
+        record_id = data["id"]
+        context.user_data["confirm"] = {"id": record_id, "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
+        context.user_data['last_text_update'] = update
+        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
+              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{record_id}")]]
+        safe_old, safe_new = escape_html(data['old']), escape_html(text)
+        try:
+            await update.message.delete()
+            if context.user_data.get('last_callback_query'):
+                 await context.user_data.pop('last_callback_query').message.delete()
+        except Exception: pass
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔄 <code>{safe_old}</code> ➡️ <code>{safe_new}</code>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+    elif 'change_type_data' in context.user_data:
+        data = context.user_data.pop('change_type_data')
+        rid = data['rid']
+        new_type = data['new_type']
+        new_content = text
+
+        record = context.user_data.get("records", {}).get(rid)
+        if not record:
+            await send_or_edit(update, context, get_text('messages.internal_error', lang))
+            return
+        
+        proxied = record.get('proxied', False)
+        if new_type not in ['A', 'AAAA', 'CNAME']:
+            proxied = False
+
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+
+        res = await update_record(token, zone_id, rid, new_type, record['name'], new_content, proxied)
+
+        if res.get("success"):
+            temp_msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])),
+                parse_mode="HTML"
+            )
+            
+            context.user_data.pop('all_records', None)
+            context.user_data.pop('records_list_cache', None)
+            
+            await asyncio.sleep(2)
+            try: await temp_msg.delete()
+            except Exception: pass
+
+            context.user_data['selected_record_id_for_view'] = rid
+
+            all_records = await get_dns_records(token, zone_id)
+            if all_records is not None:
+                context.user_data['all_records'] = all_records
+                context.user_data["records"] = {r['id']: r for r in all_records}
+            
+            await select_callback(update, context, force_new_message=True)
+        else:
+            error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+            await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
+
+    elif context.user_data.get('is_bulk_ip_change'):
+        selected_ids = context.user_data.get('selected_records', [])
+        context.user_data.pop('is_bulk_ip_change')
+        context.user_data['bulk_ip_confirm_details'] = {'new_ip': text, 'record_ids': selected_ids}
+        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="bulk_change_ip_execute")],
+              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_cancel")]]
+        await send_or_edit(update, context, get_text('messages.bulk_confirm_change_ip', lang, count=len(selected_ids), new_ip=text), InlineKeyboardMarkup(kb))
 
 async def _handle_state_awaiting_clone_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles user input for a new policy clone name."""
@@ -3701,47 +4356,396 @@ async def _handle_state_awaiting_clone_name(update: Update, context: ContextType
     except (IndexError, KeyError):
         await update.message.reply_text(get_text('messages.session_expired_error', lang))
 
-async def _handle_state_awaiting_notification_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles adding new recipient IDs to a notification group."""
+async def _handle_state_add_policy_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs for the multi-step process of adding a new policy."""
     lang = get_user_lang(context)
     text = update.message.text.strip()
-    recipient_key = context.user_data.get('current_recipient_key')
+    
+    step = context.user_data['add_policy_step']
+    data = context.user_data['new_policy_data']
+    policy_type = context.user_data.get('add_policy_type')
 
-    if not recipient_key:
-        await update.message.reply_text(get_text('messages.session_expired_try_again', lang))
+    if policy_type == 'failover':
+        if step == 'name':
+            data['policy_name'] = text
+            context.user_data['add_policy_step'] = 'account_nickname'
+            buttons = [[InlineKeyboardButton(n, callback_data=f"failover_policy_set_account|{n}")] for n in CF_ACCOUNTS.keys()]
+            await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
+
+        elif step == 'primary_ip':
+            if not is_valid_ip(text): 
+                await send_or_edit(update, context, get_text('messages.invalid_ip', lang))
+                return
+            data['primary_ip'] = text
+            context.user_data['add_policy_step'] = 'backup_ips'
+            await send_or_edit(update, context, get_text('prompts.enter_backup_ip', lang))
+
+        elif step == 'backup_ips':
+            ips = [ip.strip() for ip in text.split(',') if ip.strip() and is_valid_ip(ip.strip())]
+            if not ips: 
+                await send_or_edit(update, context, get_text('messages.invalid_ip', lang))
+                return
+            data['backup_ips'] = ips
+            context.user_data['add_policy_step'] = 'check_port'
+            await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
+
+        elif step == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535): 
+                await send_or_edit(update, context, get_text('messages.invalid_port', lang))
+                return
+            data['check_port'] = int(text)
+            context.user_data['add_policy_step'] = 'failover_minutes'
+            await send_or_edit(update, context, get_text('prompts.enter_failover_minutes', lang))
+
+        elif step == 'failover_minutes':
+            if not text.replace('.', '', 1).isdigit() or float(text) <= 0: 
+                await send_or_edit(update, context, get_text('messages.invalid_number', lang))
+                return
+            data['failover_minutes'] = float(text)
+            context.user_data['add_policy_step'] = 'record_names'
+            text_to_send = get_text('prompts.continue_to_record_selection', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.select_records', lang), callback_data="add_policy_failover_select_records")]]
+            await send_or_edit(update, context, text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
+    
+    elif policy_type == 'lb':
+        if step == 'name':
+            data['policy_name'] = text
+            context.user_data['add_policy_step'] = 'account_nickname'
+            buttons = [[InlineKeyboardButton(n, callback_data=f"lb_policy_set_account|{n}")] for n in CF_ACCOUNTS.keys()]
+            await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
+
+        elif step == 'ips':
+            new_items_data = []
+            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in ip_entries:
+                value, weight = (entry.strip(), 1)
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    value, weight_str = parts[0].strip(), parts[1].strip()
+                    if not weight_str.isdigit() or int(weight_str) < 1: 
+                        await send_or_edit(update, context, get_text('messages.invalid_weight_positive', lang, ip=value)); return
+                    weight = int(weight_str)
+                
+                item_type = "ip" if is_valid_ip(value) else "hostname"
+                if item_type == "hostname" and '.' not in value:
+                    await send_or_edit(update, context, get_text('errors.invalid_hostname', lang, value=value, default=f'Invalid hostname: {value}')); return
+
+                new_items_data.append({"type": item_type, "value": value, "weight": weight, "enabled": True})
+
+            if not new_items_data: 
+                await send_or_edit(update, context, get_text('messages.bulk_no_selection', lang)); return
+            
+            data['ips'] = new_items_data
+            context.user_data['add_policy_step'] = 'rotation_interval_hours'
+            await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
+
+        elif step == 'rotation_interval_hours':
+            parts = [p.strip() for p in text.split(',')]
+            try:
+                if len(parts) == 1 and float(parts[0]) > 0: data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[0])})
+                elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]): data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[1])})
+                else: raise ValueError()
+            except (ValueError, IndexError): await send_or_edit(update, context, get_text('messages.invalid_number_range', lang)); return
+            context.user_data['add_policy_step'] = 'check_port'
+            await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
+            
+        elif step == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535): 
+                await send_or_edit(update, context, get_text('messages.invalid_port', lang))
+                return
+            data['check_port'] = int(text)
+            
+            context.user_data['add_policy_step'] = 'record_names' 
+            
+            text_to_send = get_text('prompts.continue_to_record_selection', lang, default="Great! Now, press the button below to select the records this policy will apply to.")
+            buttons = [[InlineKeyboardButton(get_text('buttons.select_records', lang, default="Select Records"), callback_data="add_policy_lb_select_records")]]
+            
+            await send_or_edit(update, context, text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def _handle_state_edit_policy_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for editing a specific field of a policy."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    field = context.user_data.pop('edit_policy_field')
+    policy_type = context.user_data.get('editing_policy_type')
+    policy_index = context.user_data.get('edit_policy_index')
+    
+    if policy_index is None or not policy_type:
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
         return
 
     try:
-        await update.message.delete()
-        if context.user_data.get('last_menu_message_id'):
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('last_menu_message_id'))
-    except error.BadRequest:
-        pass
+        value_to_save = None
+        
+        if field == 'ips' and policy_type == 'lb':
+            new_ips_data = []
+            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in ip_entries:
+                ip, weight = entry.strip(), 1
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    ip, weight_str = parts[0].strip(), parts[1].strip()
+                    if not weight_str.isdigit() or int(weight_str) < 1: 
+                        raise ValueError(get_text('messages.invalid_weight_positive', lang, ip=ip))
+                    weight = int(weight_str)
+                if not is_valid_ip(ip): 
+                    raise ValueError(get_text('messages.invalid_ip', lang))
+                new_ips_data.append({"ip": ip, "weight": weight})
+            if not new_ips_data: 
+                raise ValueError(get_text('messages.bulk_no_selection', lang))
+            value_to_save = new_ips_data
+        
+        elif field == 'rotation_interval_range':
+            parts = [p.strip() for p in text.split(',') if p.strip()]
+            min_h, max_h = 0, 0
+            if len(parts) == 1 and float(parts[0]) > 0: 
+                min_h = max_h = float(parts[0])
+            elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]): 
+                min_h, max_h = float(parts[0]), float(parts[1])
+            else: 
+                raise ValueError(get_text('messages.invalid_number_range', lang))
+            
+            config = load_config()
+            policy = config['load_balancer_policies'][policy_index]
+            policy_name = policy.get('policy_name')
+            policy.update({'rotation_min_hours': min_h, 'rotation_max_hours': max_h})
+            save_config(config)
 
-    new_member_ids = set()
-    parts = [p.strip() for p in text.split(',') if p.strip()]
-    for part in parts:
-        try:
-            new_member_ids.add(int(part))
-        except ValueError:
-            await update.message.reply_text(get_text('messages.invalid_recipient_id', lang, part=escape_html(part)), parse_mode="HTML")
+            if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+                context.bot_data['health_status'][policy_name].pop('lb_next_rotation_time', None)
+                logger.info(f"Reset 'lb_next_rotation_time' for policy '{policy_name}' due to interval change.")
+
+            await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=get_text('field_names.rotation_interval_hours', lang)))
+            await lb_policy_view_callback(update, context, force_new_message=True)
             return
+            
+        elif field == 'backup_ips':
+            ips = [ip.strip() for ip in text.split(',') if ip.strip()]
+            if not ips or not all(is_valid_ip(ip) for ip in ips): 
+                raise ValueError(get_text('messages.invalid_ip', lang))
+            value_to_save = ips
+        
+        elif field == 'primary_ip':
+             if not is_valid_ip(text): 
+                 raise ValueError(get_text('messages.invalid_ip', lang))
+             value_to_save = text
+        
+        elif field == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535): 
+                raise ValueError(get_text('messages.invalid_port', lang))
+            value_to_save = int(text)
+        
+        elif field in ['failover_minutes', 'failback_minutes']:
+             if not text.replace('.', '', 1).isdigit() or float(text) <= 0: 
+                 raise ValueError(get_text('messages.invalid_number', lang))
+             value_to_save = float(text)
+        
+        else:
+            value_to_save = text
 
-    if not new_member_ids:
-        await update.message.reply_text(get_text('messages.no_valid_ids_entered', lang))
+        config = load_config()
+        policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+        config[policy_list_key][policy_index][field] = value_to_save
+        save_config(config)
+        
+        field_name = get_text(f'field_names.{field}', lang)
+        await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=field_name))
+        
+        view_callback = lb_policy_view_callback if policy_type == 'lb' else failover_policy_view_callback
+        await view_callback(update, context, force_new_message=True)
+
+    except (ValueError, IndexError) as e:
+        context.user_data['edit_policy_field'] = field
+        await send_or_edit(update, context, f"❌ {e}")
+        return
+
+async def _handle_state_group_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for a new monitoring group name."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    group_name = text
+    config = load_config()
+    if group_name in config.get("monitoring_groups", {}):
+        error_text = get_text('messages.group_add_prompt_name', lang) + f"\n\n<b>❌ {get_text('messages.group_name_exists', lang)}</b>"
+        if context.user_data.get('last_callback_query'):
+            await context.user_data['last_callback_query'].message.edit_text(error_text, parse_mode="HTML")
         return
         
+    context.user_data.update({'new_group_name': group_name, 'editing_policy_type': 'group', 'policy_selected_nodes': []})
+    context.user_data.pop('group_add_step')
+    try: await update.message.delete()
+    except Exception: pass
+    if context.user_data.get('last_callback_query'): await context.user_data.pop('last_callback_query').message.delete()
+    await display_countries_for_selection(update, context, page=0)
+
+
+async def _handle_state_awaiting_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for the monitoring threshold value."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    if not text.isdigit() or int(text) < 1:
+        await send_or_edit(update, context, get_text('messages.threshold_invalid_message', lang))
+        return
+
+    threshold = int(text)
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+    
+    if not selected_nodes:
+        await send_or_edit(update, context, "No monitoring locations were selected. The process has been cancelled.")
+        for key in ['awaiting_threshold', 'editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes', 'is_wizard_manual_setup', 'new_group_name']:
+            context.user_data.pop(key, None)
+        return
+
+    if threshold > len(selected_nodes):
+        error_text = get_text('messages.nodes_updated_message', lang, count=len(selected_nodes), monitoring_type='selected') + \
+                     f"\n\n<b>❌ {get_text('messages.threshold_too_high_message', lang, threshold=threshold, count=len(selected_nodes))}</b>"
+        await send_or_edit(update, context, error_text, parse_mode="HTML")
+        context.user_data['awaiting_threshold'] = True
+        return
+
+    context.user_data.pop('awaiting_threshold')
     config = load_config()
-    recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
-    current_members = set(recipients_map.get(recipient_key, []))
-    current_members.update(new_member_ids)
-    recipients_map[recipient_key] = sorted(list(current_members))
-    save_config(config)
     
-    context.user_data.pop('state', None)
+    if context.user_data.get('editing_policy_type') == 'group':
+        group_name = context.user_data.pop('new_group_name')
+        config.setdefault("monitoring_groups", {})[group_name] = {"nodes": selected_nodes, "threshold": threshold}
+        save_config(config)
+        
+        for key in ['editing_policy_type', 'policy_selected_nodes', 'last_callback_query']:
+            context.user_data.pop(key, None)
+        
+        success_text = get_text('messages.group_created_success', lang, group_name=escape_html(group_name))
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="groups_menu")]]
+        await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    else:
+        is_wizard_flow = context.user_data.pop('is_wizard_manual_setup', False)
+        policy_type = context.user_data.get('editing_policy_type')
+        policy_index = context.user_data.get('edit_policy_index')
+        monitoring_type = context.user_data.get('monitoring_type')
+
+        if policy_type == 'lb':
+            config['load_balancer_policies'][policy_index]['monitoring_nodes'] = selected_nodes
+            config['load_balancer_policies'][policy_index]['threshold'] = threshold
+        elif policy_type == 'failover':
+            if is_wizard_flow or monitoring_type == 'primary':
+                config['failover_policies'][policy_index]['primary_monitoring_nodes'] = selected_nodes
+                config['failover_policies'][policy_index]['primary_threshold'] = threshold
+            if is_wizard_flow:
+                config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
+                config['failover_policies'][policy_index]['backup_threshold'] = threshold
+            elif monitoring_type == 'backup':
+                 config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
+                 config['failover_policies'][policy_index]['backup_threshold'] = threshold
+        
+        save_config(config)
+
+        for key in ['editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes']:
+            context.user_data.pop(key, None)
+
+        if is_wizard_flow:
+            policy_data = context.user_data.pop('wizard_data', {})
+            text_msg = get_text('messages.wizard_rule_created', lang, 
+                            type_display="Failover" if policy_type == 'failover' else "Load Balancer",
+                            policy_name=escape_html(policy_data.get('policy_name', 'N/A')))
+            buttons = [[InlineKeyboardButton(get_text('buttons.settings', lang), callback_data="go_to_settings")]]
+            await send_or_edit(update, context, text_msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        else:
+            type_text = get_text(f'messages.monitoring_type_{monitoring_type}', lang)
+            success_text = get_text('messages.threshold_updated_message', lang, monitoring_type=type_text, threshold=threshold)
+            back_callback = f"lb_policy_edit|{policy_index}" if policy_type == 'lb' else f"failover_policy_edit|{policy_index}"
+            buttons = [[InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=back_callback)]]
+            await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+
+async def _handle_state_searching(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for searching records by name or IP."""
+    text = update.message.text.strip()
     
-    dummy_update = await _create_dummy_update_from_text(update, f"notification_edit_recipients|{recipient_key}")
-    await notification_edit_recipients_callback(dummy_update, context)
+    if context.user_data.get('is_searching'):
+        context.user_data.pop('is_searching')
+        context.user_data['search_query'] = text
+        context.user_data['records_in_view'] = [r for r in context.user_data.get('all_records', []) if text.lower() in r['name'].lower()]
+        await display_records_list(update, context)
+
+    elif context.user_data.get('is_searching_ip'):
+        context.user_data.pop('is_searching_ip')
+        context.user_data['search_ip_query'] = text
+        context.user_data['records_in_view'] = [r for r in context.user_data.get('all_records', []) if r['content'] == text]
+        await display_records_list(update, context)
+
+async def _handle_state_change_record_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the final step of changing a record's type."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    data = context.user_data.pop('change_type_data')
+    rid = data['rid']
+    new_type = data['new_type']
+    new_content = text
+
+    record = context.user_data.get("records", {}).get(rid)
+    if not record:
+        await send_or_edit(update, context, get_text('messages.internal_error', lang))
+        return
+    
+    proxied = record.get('proxied', False)
+    if new_type not in ['A', 'AAAA', 'CNAME']:
+        proxied = False
+
+    token = get_current_token(context)
+    zone_id = context.user_data.get('selected_zone_id')
+
+    res = await update_record(token, zone_id, rid, new_type, record['name'], new_content, proxied)
+
+    if res.get("success"):
+        temp_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])),
+            parse_mode="HTML"
+        )
+        
+        context.user_data.pop('all_records', None)
+        context.user_data.pop('records_list_cache', None)
+        
+        await asyncio.sleep(2)
+        try: await temp_msg.delete()
+        except Exception: pass
+
+        context.user_data['selected_record_id_for_view'] = rid
+
+        all_records = await get_dns_records(token, zone_id)
+        if all_records is not None:
+            context.user_data['all_records'] = all_records
+            context.user_data["records"] = {r['id']: r for r in all_records}
+        
+        await select_callback(update, context, force_new_message=True)
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
+
+
+async def _handle_state_edit_record_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for editing a record's value."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    
+    data = context.user_data.pop("edit")
+    record_id = data["id"]
+    context.user_data["confirm"] = {"id": record_id, "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
+    context.user_data['last_text_update'] = update
+    kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{record_id}")]]
+    safe_old, safe_new = escape_html(data['old']), escape_html(text)
+    try:
+        await update.message.delete()
+        if context.user_data.get('last_callback_query'):
+             await context.user_data.pop('last_callback_query').message.delete()
+    except Exception: pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔄 <code>{safe_old}</code> ➡️ <code>{safe_new}</code>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 async def _create_dummy_update_from_text(update: Update, callback_data: str):
     """Creates a dummy Update object with a CallbackQuery from a text message."""
@@ -3757,745 +4761,78 @@ async def _create_dummy_update_from_text(update: Update, callback_data: str):
         'effective_chat': update.effective_chat
     })
 
-
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles all non-command text messages using a clean, sequential if/elif/else chain
-    to correctly dispatch to the appropriate state handler.
+    Handles all non-command text messages by dispatching to the appropriate state handler.
     """
     if not is_admin(update):
         return
 
-    lang = get_user_lang(context)
-    text = update.message.text.strip()
     state = context.user_data.get('state')
     
-    def create_dummy_update(message_id, original_update, bot):
-        async def dummy_answer(*args, **kwargs): return True
-        dummy_query = type('obj', (object,), {'is_dummy': True, 'answer': dummy_answer, 'edit_message_text': lambda *args, **kwargs: bot.edit_message_text(chat_id=original_update.effective_chat.id, message_id=message_id, *args, **kwargs), 'message': type('obj', (object,), {'message_id': message_id, 'chat': original_update.effective_chat})})
-        dummy_update = type('obj', (object,), {'callback_query': dummy_query, 'effective_user': original_update.effective_user, 'effective_chat': original_update.effective_chat})
-        return dummy_update
+    if 'add_policy_step' in context.user_data:
+        await _handle_state_add_policy_steps(update, context)
+        return
 
-    if state == 'awaiting_lb_ip_address' or state == 'awaiting_lb_ip_weight' or state == 'awaiting_lb_new_ip':
-        try:
-            await update.message.delete()
-            if context.user_data.get('last_callback_query'):
-                await context.user_data.pop('last_callback_query').message.delete()
-        except Exception: pass
-        try:
-            policy_index = context.user_data['edit_policy_index']
-            config = load_config()
-            
-            if state == 'awaiting_lb_ip_address':
-                if not is_valid_ip(text): raise ValueError(f"Invalid IP: {text}")
-                ip_index = context.user_data['lb_ip_action_index']
-                config['load_balancer_policies'][policy_index]['ips'][ip_index]['ip'] = text
-                save_config(config)
+    elif 'edit_policy_field' in context.user_data:
+        await _handle_state_edit_policy_field(update, context)
+        return
 
-            elif state == 'awaiting_lb_ip_weight':
-                if not text.isdigit() or int(text) < 1: raise ValueError(f"Invalid weight: {text}")
-                ip_index = context.user_data['lb_ip_action_index']
-                config['load_balancer_policies'][policy_index]['ips'][ip_index]['weight'] = int(text)
-                save_config(config)
+    elif state in ['awaiting_lb_ip_address', 'awaiting_lb_ip_weight', 'awaiting_lb_new_ip']:
+        await _handle_state_lb_ip_management(update, context)
+        return
+    
+    elif 'wizard_step' in context.user_data:
+        await _handle_state_wizard_steps(update, context)
+        return
+    
+    elif 'monitor_add_step' in context.user_data or 'monitor_edit_step' in context.user_data:
+        await _handle_state_monitor_management(update, context)
+        return
 
-            elif state == 'awaiting_lb_new_ip':
-                new_ips_data = []
-                ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-                for entry in ip_entries:
-                    ip, weight = (entry.strip(), 1)
-                    if ':' in entry:
-                        parts = entry.split(':', 1)
-                        ip, weight_str = parts[0].strip(), parts[1].strip()
-                        if not (weight_str.isdigit() and int(weight_str) >= 1): raise ValueError(f"Invalid weight for {ip}")
-                        weight = int(weight_str)
-                    if not is_valid_ip(ip): raise ValueError(f"Invalid IP: {ip}")
-                    new_ips_data.append({"ip": ip, "weight": weight})
-                if new_ips_data:
-                    config['load_balancer_policies'][policy_index]['ips'].extend(new_ips_data)
-                    save_config(config)
-        except (IndexError, KeyError) as e:
-            logger.error(f"Session error in LB IP management: {e}", exc_info=True)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.session_expired_error', lang))
-        except ValueError as e:
-            logger.warning(f"Invalid user input in LB IP management: {e}")
-            error_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ {e}. Please try again.")
-            await asyncio.sleep(4)
-            try: await error_msg.delete() 
-            except Exception: pass
-        finally:
-            context.user_data.pop('state', None)
-            context.user_data.pop('lb_ip_action_index', None)
-            dummy_update = await _create_dummy_update_from_text(update, "lb_ip_list_menu")
-            await lb_ip_list_menu(dummy_update, context)
+    elif context.user_data.get('awaiting_threshold'):
+        await _handle_state_awaiting_threshold(update, context)
+        return
+
+    elif context.user_data.get('group_add_step') == 'ask_name':
+        await _handle_state_group_add_name(update, context)
+        return
 
     elif state == 'awaiting_clone_name':
-        try:
-            if 'clone_start_message_id' in context.user_data:
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('clone_start_message_id'))
-            await update.message.delete()
-            
-            new_name = text
-            clone_info = context.user_data.pop('clone_info')
-            policy_type, policy_index = clone_info['type'], clone_info['index']
-            
-            config = load_config()
-            all_names = [p.get('policy_name') for p in config.get('failover_policies', [])] + \
-                        [p.get('policy_name') for p in config.get('load_balancer_policies', [])]
-            if new_name in all_names:
-                back_callback = f"{policy_type}_policy_view|{policy_index}"
-                buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=back_callback)]]
-                error_text = f"{get_text('prompts.enter_clone_name', lang)}\n\n<b>{get_text('messages.clone_name_exists', lang)}</b>"
-                error_msg = await update.effective_chat.send_message(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-                
-                context.user_data.update({'clone_info': clone_info, 'state': 'awaiting_clone_name', 'clone_start_message_id': error_msg.message_id})
-            else:
-                policy_list_key = "load_balancer_policies" if policy_type == 'lb' else "failover_policies"
-                original_policy = config[policy_list_key][policy_index]
-                cloned_policy = copy.deepcopy(original_policy)
-                original_name = cloned_policy.get('policy_name', 'N/A')
-                cloned_policy.update({'policy_name': new_name, 'enabled': False})
-                config[policy_list_key].append(cloned_policy)
-                save_config(config)
-                context.user_data.pop('state', None)
-                success_text = get_text('messages.clone_success', lang, original_name=escape_html(original_name), new_name=escape_html(new_name))
-                back_callback = "settings_lb_policies" if policy_type == 'lb' else "settings_failover_policies"
-                buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back_callback)]]
-                await update.effective_chat.send_message(success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-        except (IndexError, KeyError):
-            await update.message.reply_text(get_text('messages.session_expired_error', lang))
+        await _handle_state_awaiting_clone_name(update, context)
+        return
 
     elif state == 'awaiting_notification_recipient':
-        recipient_key = context.user_data.get('current_recipient_key')
-        if not recipient_key:
-            await update.message.reply_text(get_text('messages.session_expired_try_again', lang))
-            return
-        try:
-            await update.message.delete()
-            if context.user_data.get('last_menu_message_id'):
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('last_menu_message_id'))
-        except Exception: pass
-        
-        new_member_ids = set()
-        for part in [p.strip() for p in text.split(',') if p.strip()]:
-            try: new_member_ids.add(int(part))
-            except ValueError:
-                await update.message.reply_text(get_text('messages.invalid_recipient_id', lang, part=escape_html(part)), parse_mode="HTML")
-                return
-        if not new_member_ids:
-            await update.message.reply_text(get_text('messages.no_valid_ids_entered', lang))
-            return
-            
-        config = load_config()
-        recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
-        current_members = set(recipients_map.get(recipient_key, []))
-        current_members.update(new_member_ids)
-        recipients_map[recipient_key] = sorted(list(current_members))
-        save_config(config)
-        
-        context.user_data.pop('state', None)
-        await notification_edit_recipients_callback(update, context, force_new_message=True)
+        await _handle_state_notification_recipient(update, context)
+        return
 
-    elif 'wizard_step' in context.user_data:
-        start_time = context.user_data.get('wizard_start_time')
-        if not start_time or (datetime.now() - start_time) > timedelta(minutes=10):
-            for key in ['wizard_data', 'wizard_step', 'wizard_start_time', 'last_callback_query']:
-                context.user_data.pop(key, None)
-            await update.message.reply_text("فرآیند راه‌اندازی سریع به دلیل عدم فعالیت منقضی شد. لطفاً با /wizard دوباره شروع کنید.")
-            return
-
-        wizard_step = context.user_data.get('wizard_step')
-        if wizard_step == 'ask_name':
-            context.user_data['wizard_data']['policy_name'] = text
-            await wizard_step3_ask_ips(update, context)
-        
-        elif wizard_step == 'ask_primary_ip':
-            if not is_valid_ip(text):
-                error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
-                await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
-                return
-            context.user_data['wizard_data']['primary_ip'] = text
-            await wizard_step4_ask_backup_ips(update, context)
-
-        elif wizard_step == 'ask_backup_ips':
-            ips = [ip.strip() for ip in text.split(',') if ip.strip() and is_valid_ip(ip.strip())]
-            if not ips:
-                error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
-                await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
-                return
-            context.user_data['wizard_data']['backup_ips'] = ips
-            await wizard_step5_ask_port(update, context)
-
-        elif wizard_step == 'ask_lb_ips':
-            new_ips_data = []
-            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-            for entry in ip_entries:
-                ip, weight = (entry.strip(), 1)
-                if ':' in entry:
-                    parts = entry.split(':', 1)
-                    ip, weight_str = parts[0].strip(), parts[1].strip()
-                    if not (weight_str.isdigit() and int(weight_str) >= 1):
-                        error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_weight_positive', lang, ip=ip)}")
-                        await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
-                        return
-                    weight = int(weight_str)
-                if not is_valid_ip(ip):
-                    error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
-                    await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
-                    return
-                new_ips_data.append({"ip": ip, "weight": weight})
-            if not new_ips_data: return
-            context.user_data['wizard_data']['ips'] = new_ips_data
-            await wizard_step5_ask_port(update, context)
-
-        elif wizard_step == 'ask_port':
-            if not (text.isdigit() and 1 <= int(text) <= 65535):
-                error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_port', lang)}")
-                await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
-                return
-            context.user_data['wizard_data']['check_port'] = int(text)
-            await wizard_step6_ask_account(update, context)
-
-    elif 'awaiting_record_alias' in context.user_data:
-        alias_data = context.user_data.pop('awaiting_record_alias')
-        prompt_message_id = alias_data.get('prompt_message_id')
-        try:
-            await update.message.delete()
-            if prompt_message_id: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_message_id)
-        except Exception: pass
-            
-        config = load_config()
-        zone_id = context.user_data.get('selected_zone_id')
-        config.setdefault('record_aliases', {}).setdefault(zone_id, {})
-        alias_key = f"{alias_data['record_type']}:{alias_data['record_name']}"
-        
-        if text == '-':
-            config['record_aliases'][zone_id].pop(alias_key, None)
-            temp_msg_text = get_text('messages.record_alias_removed_success', lang, record_name=escape_html(alias_data['record_name']))
-        else:
-            config['record_aliases'][zone_id][alias_key] = text
-            temp_msg_text = get_text('messages.record_alias_set_success', lang, record_name=escape_html(alias_data['record_name']), alias=escape_html(text))
-        
-        save_config(config)
-        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
-        await asyncio.sleep(2)
-        try: await temp_msg.delete()
-        except Exception: pass
-        context.user_data.pop('all_records', None)
-        await display_records_list(update, context)
-
-    elif 'awaiting_zone_alias' in context.user_data:
-        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
-        alias_data = context.user_data.pop('awaiting_zone_alias')
-        zone_id, zone_name = alias_data['zone_id'], alias_data['zone_name']
-        try: await update.message.delete()
-        except Exception: pass
-            
-        config = load_config()
-        config.setdefault('zone_aliases', {})
-        if text == '-':
-            config['zone_aliases'].pop(zone_id, None)
-            temp_msg_text = get_text('messages.alias_removed_success', lang, zone_name=escape_html(zone_name))
-        else:
-            config['zone_aliases'][zone_id] = text
-            temp_msg_text = get_text('messages.alias_set_success', lang, zone_name=escape_html(zone_name), alias=escape_html(text))
-        save_config(config)
-        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
-        await asyncio.sleep(3)
-        try: await temp_msg.delete()
-        except Exception: pass
-        if message_id_to_edit:
-            dummy_update = create_dummy_update(message_id_to_edit, update, context.bot)
-            await display_zones_list(dummy_update, context)
-
-    elif context.user_data.get('awaiting_admin_id_to_add'):
-        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
-        context.user_data.pop('awaiting_admin_id_to_add')
-        if not is_super_admin(update):
-            await update.message.reply_text(get_text('messages.not_a_super_admin', lang))
-            return
-        try: await update.message.delete()
-        except Exception: pass
-        try:
-            admin_id = int(text)
-            config = load_config()
-            config.setdefault("admins", [])
-            if admin_id in config["admins"] or admin_id in SUPER_ADMIN_IDS:
-                temp_msg_text = get_text('messages.admin_already_exists', lang)
-            else:
-                config["admins"].append(admin_id)
-                save_config(config)
-                temp_msg_text = get_text('messages.admin_added_success', lang, user_id=admin_id)
-        except ValueError:
-            if message_id_to_edit:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"{get_text('prompts.add_admin_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}")
-                context.user_data.update({'awaiting_admin_id_to_add': True, 'last_menu_message_id': message_id_to_edit})
-            else:
-                await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
-            return
-        
-        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
-        await asyncio.sleep(3)
-        try: await temp_msg.delete()
-        except Exception: pass
-
-        if message_id_to_edit:
-            dummy_update = create_dummy_update(message_id_to_edit, update, context.bot)
-            await user_management_menu_callback(dummy_update, context)
+    elif 'awaiting_record_alias' in context.user_data or 'awaiting_zone_alias' in context.user_data:
+        await _handle_state_aliases(update, context)
+        return
     
-    elif context.user_data.get('group_add_step') == 'ask_name':
-        group_name = text
-        config = load_config()
-        if group_name in config.get("monitoring_groups", {}):
-            error_text = get_text('messages.group_add_prompt_name', lang) + f"\n\n<b>❌ {get_text('messages.group_name_exists', lang)}</b>"
-            if context.user_data.get('last_callback_query'):
-                await context.user_data['last_callback_query'].message.edit_text(error_text, parse_mode="HTML")
-            return
-        context.user_data.update({'new_group_name': group_name, 'editing_policy_type': 'group', 'policy_selected_nodes': []})
-        context.user_data.pop('group_add_step')
-        try: await update.message.delete()
-        except Exception: pass
-        if context.user_data.get('last_callback_query'): await context.user_data.pop('last_callback_query').message.delete()
-        await display_countries_for_selection(update, context, page=0)
-
-    elif 'monitor_add_step' in context.user_data:
-        monitor_add_step = context.user_data['monitor_add_step']
-        try: await update.message.delete()
-        except Exception: pass
+    elif context.user_data.get('awaiting_admin_id_to_add'):
+        await _handle_state_admin_management(update, context)
+        return
+    
+    elif 'add_step' in context.user_data or context.user_data.get('is_bulk_ip_change'):
+        await _handle_state_record_management(update, context)
+        return
         
-        async def edit_previous_prompt(new_text, new_markup):
-            if context.user_data.get('last_callback_query'):
-                try:
-                    await context.user_data['last_callback_query'].message.edit_text(new_text, reply_markup=new_markup, parse_mode="HTML")
-                except Exception:
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=new_text, reply_markup=new_markup, parse_mode="HTML")
-
-        if monitor_add_step == 'ask_name':
-            context.user_data['new_monitor_data']['monitor_name'] = text
-            context.user_data['monitor_add_step'] = 'ask_ip'
-            text_to_send = get_text('messages.wizard_name_saved', lang) + get_text('messages.monitor_ask_ip', lang)
-            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
-            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
-        
-        elif monitor_add_step == 'ask_ip':
-            context.user_data['new_monitor_data']['ip'] = text
-            context.user_data['monitor_add_step'] = 'ask_port'
-            text_to_send = get_text('messages.monitor_ip_saved', lang) + get_text('messages.monitor_ask_port', lang)
-            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
-            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
-            
-        elif monitor_add_step == 'ask_port':
-            if not text.isdigit() or not (1 <= int(text) <= 65535):
-                error_text = get_text('messages.monitor_ask_port', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
-                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
-                await edit_previous_prompt(error_text, InlineKeyboardMarkup(buttons))
-            else:
-                context.user_data['new_monitor_data']['check_port'] = int(text)
-                context.user_data['monitor_add_step'] = 'select_group'
-                await monitor_step_ask_group(update, context)
-
-    elif 'monitor_edit_step' in context.user_data:
-        field = context.user_data.pop('monitor_edit_step')
-        monitor_index = context.user_data.get('edit_monitor_index')
-        if monitor_index is None:
-            await update.message.reply_text(get_text('messages.session_expired_error', lang))
-            return
-        try: await update.message.delete()
-        except Exception: pass
-
-        new_value = text.strip()
-        
-        if field == 'check_port':
-            if not new_value.isdigit() or not (1 <= int(new_value) <= 65535):
-                error_text = get_text('messages.monitor_ask_port_edit', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
-                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]]
-                if context.user_data.get('last_callback_query'):
-                    await context.user_data['last_callback_query'].message.edit_text(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-                context.user_data['monitor_edit_step'] = field
-                return
-            value_to_save = int(new_value)
-        else:
-            value_to_save = new_value
-        
-        config = load_config()
-        old_ip = None
-        try:
-            if field == 'ip': old_ip = config['standalone_monitors'][monitor_index].get('ip')
-            config['standalone_monitors'][monitor_index][field] = value_to_save
-            save_config(config)
-        except (IndexError, KeyError):
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.internal_error', lang))
-            return
-
-        if field == 'ip' and old_ip and old_ip != value_to_save:
-            buttons = [
-                [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"monitor_purge_logs|{old_ip}")],
-                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]
-            ]
-            text_to_send = get_text('messages.monitor_ask_purge_logs', lang, old_ip=escape_html(old_ip))
-            if context.user_data.get('last_callback_query'):
-                await context.user_data['last_callback_query'].message.edit_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-        else:
-            temp_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.value_updated_success', lang))
-            await asyncio.sleep(2)
-            await temp_msg.delete()
-            
-            if context.user_data.get('last_callback_query'):
-                await context.user_data.pop('last_callback_query').message.delete()
-            dummy_update = await _create_dummy_update_from_text(update, f"monitor_edit|{monitor_index}")
-            await monitor_edit_menu_callback(dummy_update, context)
-
     elif 'change_type_data' in context.user_data:
-        data = context.user_data.pop('change_type_data')
-        rid = data['rid']
-        new_type = data['new_type']
-        new_content = text
-
-        record = context.user_data.get("records", {}).get(rid)
-        if not record:
-            await send_or_edit(update, context, get_text('messages.internal_error', lang))
-            return
-        
-        proxied = record.get('proxied', False)
-        if new_type not in ['A', 'AAAA', 'CNAME']:
-            proxied = False
-
-        token = get_current_token(context)
-        zone_id = context.user_data.get('selected_zone_id')
-
-        res = await update_record(token, zone_id, rid, new_type, record['name'], new_content, proxied)
-
-        if res.get("success"):
-            temp_msg = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])),
-                parse_mode="HTML"
-            )
-            
-            context.user_data.pop('all_records', None)
-            context.user_data.pop('records_list_cache', None)
-            
-            await asyncio.sleep(2)
-            try: await temp_msg.delete()
-            except Exception: pass
-
-            context.user_data['selected_record_id_for_view'] = rid
-
-            all_records = await get_dns_records(token, zone_id)
-            if all_records is not None:
-                context.user_data['all_records'] = all_records
-                context.user_data["records"] = {r['id']: r for r in all_records}
-            
-            await select_callback(update, context, force_new_message=True)
-        else:
-            error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
-            await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
-
-    elif 'add_policy_step' in context.user_data:
-        step = context.user_data['add_policy_step']
-        data = context.user_data['new_policy_data']
-        policy_type = context.user_data.get('add_policy_type')
-
-        if policy_type == 'failover':
-            if step == 'name':
-                data['policy_name'] = text
-                context.user_data['add_policy_step'] = 'primary_ip'
-                await send_or_edit(update, context, get_text('prompts.enter_primary_ip', lang))
-            elif step == 'primary_ip':
-                if not is_valid_ip(text): await send_or_edit(update, context, get_text('messages.invalid_ip', lang)); return
-                data['primary_ip'] = text
-                context.user_data['add_policy_step'] = 'backup_ips'
-                await send_or_edit(update, context, get_text('prompts.enter_backup_ip', lang))
-            elif step == 'backup_ips':
-                ips = [ip.strip() for ip in text.split(',') if ip.strip() and is_valid_ip(ip.strip())]
-                if not ips: await send_or_edit(update, context, get_text('messages.invalid_ip', lang)); return
-                data['backup_ips'] = ips
-                context.user_data['add_policy_step'] = 'check_port'
-                await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
-            elif step == 'check_port':
-                if not text.isdigit() or not (1 <= int(text) <= 65535): await send_or_edit(update, context, get_text('messages.invalid_port', lang)); return
-                data['check_port'] = int(text)
-                context.user_data['add_policy_step'] = 'failover_minutes'
-                await send_or_edit(update, context, get_text('prompts.enter_failover_minutes', lang))
-            elif step == 'failover_minutes':
-                if not text.replace('.', '', 1).isdigit() or float(text) <= 0: await send_or_edit(update, context, get_text('messages.invalid_number', lang)); return
-                data['failover_minutes'] = float(text)
-                context.user_data['add_policy_step'] = 'account_nickname'
-                buttons = [[InlineKeyboardButton(n, callback_data=f"failover_policy_set_account|{n}")] for n in CF_ACCOUNTS.keys()]
-                await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
-            elif step == 'failback_minutes':
-                if not text.replace('.', '', 1).isdigit() or float(text) <= 0: await send_or_edit(update, context, get_text('messages.invalid_number', lang)); return
-                data['failback_minutes'] = float(text)
-                await start_node_selection_for_new_failover(update, context, 'primary')
-        
-        elif policy_type == 'lb':
-            if step == 'name':
-                data['policy_name'] = text
-                context.user_data['add_policy_step'] = 'ips'
-                await send_or_edit(update, context, get_text('prompts.enter_lb_ips', lang))
-            elif step == 'ips':
-                new_ips_data = []
-                ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-                for entry in ip_entries:
-                    ip, weight = (entry.strip(), 1)
-                    if ':' in entry:
-                        parts = entry.split(':', 1)
-                        ip, weight_str = parts[0].strip(), parts[1].strip()
-                        if not weight_str.isdigit() or int(weight_str) < 1: await send_or_edit(update, context, get_text('messages.invalid_weight_positive', lang, ip=ip)); return
-                        weight = int(weight_str)
-                    if not is_valid_ip(ip): await send_or_edit(update, context, get_text('messages.invalid_ip', lang)); return
-                    new_ips_data.append({"ip": ip, "weight": weight})
-                if not new_ips_data: await send_or_edit(update, context, get_text('messages.bulk_no_selection', lang)); return
-                data['ips'] = new_ips_data
-                context.user_data['add_policy_step'] = 'rotation_interval_hours'
-                await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
-            elif step == 'rotation_interval_hours':
-                parts = [p.strip() for p in text.split(',')]
-                try:
-                    if len(parts) == 1 and float(parts[0]) > 0: data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[0])})
-                    elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]): data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[1])})
-                    else: raise ValueError()
-                except (ValueError, IndexError): await send_or_edit(update, context, get_text('messages.invalid_number_range', lang)); return
-                context.user_data['add_policy_step'] = 'check_port'
-                await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
-            elif step == 'check_port':
-                if not text.isdigit() or not (1 <= int(text) <= 65535): await send_or_edit(update, context, get_text('messages.invalid_port', lang)); return
-                data['check_port'] = int(text)
-                context.user_data['add_policy_step'] = 'account_nickname'
-                buttons = [[InlineKeyboardButton(n, callback_data=f"lb_policy_set_account|{n}")] for n in CF_ACCOUNTS.keys()]
-                await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
-        
-    elif 'edit_policy_field' in context.user_data:
-        field = context.user_data.pop('edit_policy_field')
-        policy_type = context.user_data.get('editing_policy_type')
-        policy_index = context.user_data.get('edit_policy_index')
-        
-        if policy_index is None or not policy_type:
-            await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
-            return
-
-        try:
-            value_to_save = None
-            
-            if field == 'ips' and policy_type == 'lb':
-                new_ips_data = []
-                ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
-                for entry in ip_entries:
-                    ip, weight = entry.strip(), 1
-                    if ':' in entry:
-                        parts = entry.split(':', 1)
-                        ip, weight_str = parts[0].strip(), parts[1].strip()
-                        if not weight_str.isdigit() or int(weight_str) < 1: 
-                            raise ValueError(get_text('messages.invalid_weight_positive', lang, ip=ip))
-                        weight = int(weight_str)
-                    if not is_valid_ip(ip): 
-                        raise ValueError(get_text('messages.invalid_ip', lang))
-                    new_ips_data.append({"ip": ip, "weight": weight})
-                if not new_ips_data: 
-                    raise ValueError(get_text('messages.bulk_no_selection', lang))
-                value_to_save = new_ips_data
-            
-            elif field == 'rotation_interval_range':
-                parts = [p.strip() for p in text.split(',') if p.strip()]
-                min_h, max_h = 0, 0
-                if len(parts) == 1 and float(parts[0]) > 0: 
-                    min_h = max_h = float(parts[0])
-                elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]): 
-                    min_h, max_h = float(parts[0]), float(parts[1])
-                else: 
-                    raise ValueError(get_text('messages.invalid_number_range', lang))
-                
-                config = load_config()
-                policy = config['load_balancer_policies'][policy_index]
-                policy_name = policy.get('policy_name')
-                policy.update({'rotation_min_hours': min_h, 'rotation_max_hours': max_h})
-                save_config(config)
-
-                if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
-                    context.bot_data['health_status'][policy_name].pop('lb_next_rotation_time', None)
-                    logger.info(f"Reset 'lb_next_rotation_time' for policy '{policy_name}' due to interval change.")
-
-                await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=get_text('field_names.rotation_interval_hours', lang)))
-                await lb_policy_view_callback(update, context, force_new_message=True)
-                return
-                
-            elif field == 'backup_ips':
-                ips = [ip.strip() for ip in text.split(',') if ip.strip()]
-                if not ips or not all(is_valid_ip(ip) for ip in ips): 
-                    raise ValueError(get_text('messages.invalid_ip', lang))
-                value_to_save = ips
-            
-            elif field == 'primary_ip':
-                 if not is_valid_ip(text): 
-                     raise ValueError(get_text('messages.invalid_ip', lang))
-                 value_to_save = text
-            
-            elif field == 'check_port':
-                if not text.isdigit() or not (1 <= int(text) <= 65535): 
-                    raise ValueError(get_text('messages.invalid_port', lang))
-                value_to_save = int(text)
-            
-            elif field in ['failover_minutes', 'failback_minutes']:
-                 if not text.replace('.', '', 1).isdigit() or float(text) <= 0: 
-                     raise ValueError(get_text('messages.invalid_number', lang))
-                 value_to_save = float(text)
-            
-            else:
-                value_to_save = text
-
-            config = load_config()
-            policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
-            config[policy_list_key][policy_index][field] = value_to_save
-            save_config(config)
-            
-            field_name = get_text(f'field_names.{field}', lang)
-            await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=field_name))
-            
-            view_callback = lb_policy_view_callback if policy_type == 'lb' else failover_policy_view_callback
-            await view_callback(update, context, force_new_message=True)
-
-        except (ValueError, IndexError) as e:
-            context.user_data['edit_policy_field'] = field
-            await send_or_edit(update, context, f"❌ {e}")
-            return
-        
-    elif context.user_data.get('awaiting_threshold'):
-        if not text.isdigit() or int(text) < 1:
-            await send_or_edit(update, context, get_text('messages.threshold_invalid_message', lang))
-            return
-
-        threshold = int(text)
-        selected_nodes = context.user_data.get('policy_selected_nodes', [])
-        
-        if not selected_nodes:
-            await send_or_edit(update, context, "No monitoring locations were selected. The process has been cancelled.")
-            for key in ['awaiting_threshold', 'editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes', 'is_wizard_manual_setup', 'new_group_name']:
-                context.user_data.pop(key, None)
-            return
-
-        if threshold > len(selected_nodes):
-            error_text = get_text('messages.nodes_updated_message', lang, count=len(selected_nodes), monitoring_type='selected') + \
-                         f"\n\n<b>❌ {get_text('messages.threshold_too_high_message', lang, threshold=threshold, count=len(selected_nodes))}</b>"
-            await send_or_edit(update, context, error_text, parse_mode="HTML")
-            context.user_data['awaiting_threshold'] = True
-            return
-
-        context.user_data.pop('awaiting_threshold')
-        config = load_config()
-        
-        if context.user_data.get('editing_policy_type') == 'group':
-            group_name = context.user_data.pop('new_group_name')
-            config.setdefault("monitoring_groups", {})[group_name] = {"nodes": selected_nodes, "threshold": threshold}
-            save_config(config)
-            
-            for key in ['editing_policy_type', 'policy_selected_nodes', 'last_callback_query']:
-                context.user_data.pop(key, None)
-            
-            success_text = get_text('messages.group_created_success', lang, group_name=escape_html(group_name))
-            buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="groups_menu")]]
-            await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-
-        else:
-            is_wizard_flow = context.user_data.pop('is_wizard_manual_setup', False)
-            policy_type = context.user_data.get('editing_policy_type')
-            policy_index = context.user_data.get('edit_policy_index')
-            monitoring_type = context.user_data.get('monitoring_type')
-
-            if policy_type == 'lb':
-                config['load_balancer_policies'][policy_index]['monitoring_nodes'] = selected_nodes
-                config['load_balancer_policies'][policy_index]['threshold'] = threshold
-            elif policy_type == 'failover':
-                if is_wizard_flow or monitoring_type == 'primary':
-                    config['failover_policies'][policy_index]['primary_monitoring_nodes'] = selected_nodes
-                    config['failover_policies'][policy_index]['primary_threshold'] = threshold
-                if is_wizard_flow:
-                    config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
-                    config['failover_policies'][policy_index]['backup_threshold'] = threshold
-                elif monitoring_type == 'backup':
-                     config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
-                     config['failover_policies'][policy_index]['backup_threshold'] = threshold
-            
-            save_config(config)
-
-            for key in ['editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes']:
-                context.user_data.pop(key, None)
-
-            if is_wizard_flow:
-                policy_data = context.user_data.pop('wizard_data', {})
-                text_msg = get_text('messages.wizard_rule_created', lang, 
-                                type_display="Failover" if policy_type == 'failover' else "Load Balancer",
-                                policy_name=escape_html(policy_data.get('policy_name', 'N/A')))
-                buttons = [[InlineKeyboardButton(get_text('buttons.settings', lang), callback_data="go_to_settings")]]
-                await send_or_edit(update, context, text_msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-            else:
-                type_text = get_text(f'messages.monitoring_type_{monitoring_type}', lang)
-                success_text = get_text('messages.threshold_updated_message', lang, monitoring_type=type_text, threshold=threshold)
-                back_callback = f"lb_policy_edit|{policy_index}" if policy_type == 'lb' else f"failover_policy_edit|{policy_index}"
-                buttons = [[InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=back_callback)]]
-                await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-
-    elif context.user_data.get('is_searching'):
-        context.user_data.pop('is_searching')
-        context.user_data['search_query'] = text
-        context.user_data['records_in_view'] = [r for r in context.user_data.get('all_records', []) if text.lower() in r['name'].lower()]
-        await display_records_list(update, context)
-
-    elif context.user_data.get('is_searching_ip'):
-        context.user_data.pop('is_searching_ip')
-        context.user_data['search_ip_query'] = text
-        context.user_data['records_in_view'] = [r for r in context.user_data.get('all_records', []) if r['content'] == text]
-        await display_records_list(update, context)
+        await _handle_state_change_record_type(update, context)
+        return
 
     elif "edit" in context.user_data:
-        data = context.user_data.pop("edit")
-        record_id = data["id"]
-        context.user_data["confirm"] = {"id": record_id, "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
-        context.user_data['last_text_update'] = update
-        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
-              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{record_id}")]]
-        safe_old, safe_new = escape_html(data['old']), escape_html(text)
-        try:
-            await update.message.delete()
-            if context.user_data.get('last_callback_query'):
-                 await context.user_data.pop('last_callback_query').message.delete()
-        except Exception: pass
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔄 <code>{safe_old}</code> ➡️ <code>{safe_new}</code>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-
-    elif "add_step" in context.user_data:
-        step = context.user_data["add_step"]
-        zone_name = context.user_data.get('selected_zone_name', 'your_domain.com')
-        if step == "name":
-            new_name = zone_name if text.strip() == "@" else f"{text.strip()}.{zone_name}"
-            all_records = context.user_data.get('all_records', [])
-            existing_record = next((r for r in all_records if r['name'].lower() == new_name.lower()), None)
-            if existing_record:
-                context.user_data.pop("add_step", None)
-                buttons = [[InlineKeyboardButton(get_text('buttons.try_another_name', lang), callback_data="add_retry_name")],
-                           [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{existing_record['id']}")],
-                           [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
-                await send_or_edit(update, context, get_text('messages.subdomain_exists', lang), InlineKeyboardMarkup(buttons))
-            else:
-                context.user_data["new_name"] = new_name
-                context.user_data["add_step"] = "content"
-                prompt_text_key = 'prompts.enter_ip' if context.user_data.get("new_type") in ['A', 'AAAA'] else 'prompts.enter_content'
-                await send_or_edit(update, context, get_text(prompt_text_key, lang, name=escape_html(text.strip())), parse_mode="HTML")
-        elif step == "content":
-            context.user_data["new_content"] = text
-            context.user_data.pop("add_step")
-            kb = [[InlineKeyboardButton("DNS Only", callback_data="add_proxied|false")], [InlineKeyboardButton("Proxied", callback_data="add_proxied|true")]]
-            await send_or_edit(update, context, get_text('prompts.choose_proxy', lang), InlineKeyboardMarkup(kb))
-
-    elif context.user_data.get('is_bulk_ip_change'):
-        selected_ids = context.user_data.get('selected_records', [])
-        context.user_data.pop('is_bulk_ip_change')
-        context.user_data['bulk_ip_confirm_details'] = {'new_ip': text, 'record_ids': selected_ids}
-        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="bulk_change_ip_execute")],
-              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_cancel")]]
-        await send_or_edit(update, context, get_text('messages.bulk_confirm_change_ip', lang, count=len(selected_ids), new_ip=text), InlineKeyboardMarkup(kb))
-            
+        await _handle_state_edit_record_value(update, context)
+        return
+        
+    elif context.user_data.get('is_searching') or context.user_data.get('is_searching_ip'):
+        await _handle_state_searching(update, context)
+        return
+        
     else:
         logger.warning(
-            f"User {update.effective_user.id} sent text '{text}' but no active state was found to handle it."
+            f"User {update.effective_user.id} sent text '{update.message.text.strip()}' but no active state was found to handle it."
         )
 
 async def zones_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5303,7 +5640,8 @@ async def settings_failover_policies_callback(update: Update, context: ContextTy
     query = update.callback_query
     if query: await query.answer()
     lang = get_user_lang(context)
-
+    _clear_add_policy_state(context)
+    
     try:
         if query: await query.answer()
     except error.BadRequest as e:
@@ -5348,6 +5686,30 @@ async def lb_policy_add_start_callback(update: Update, context: ContextTypes.DEF
     }
     context.user_data['add_policy_step'] = 'name'
     await query.edit_message_text(get_text('prompts.enter_lb_policy_name', lang))
+
+async def _display_lb_record_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper function to display the record selection menu for the LB add flow."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+    
+    all_records = context.user_data['lb_add_from_list_records_cache']
+    selected = context.user_data['lb_add_from_list_selected']
+    zone_name = context.user_data['lb_add_from_list_zone_name']
+    
+    buttons = []
+    for record in all_records:
+        short_name = get_short_name(record['name'], zone_name)
+        check_icon = "✅" if record['name'] in selected else "▫️"
+        button_text = f"{check_icon} {record['type']} {short_name}"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"lb_add_item_list_toggle_record|{record['name']}")])
+        
+    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection', lang, count=len(selected)), callback_data="lb_add_item_list_confirm")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="lb_ip_list_menu")])
+    
+    await query.edit_message_text(
+        get_text('prompts.select_records_for_lb_pool', lang),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 async def lb_policy_set_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles account selection when adding a new LB policy."""
@@ -5430,145 +5792,475 @@ async def display_lb_ip_management_menu(update: Update, context: ContextTypes.DE
     
     await send_or_edit(update, context, "\n".join(message_parts), reply_markup=InlineKeyboardMarkup(buttons))
 
-async def lb_ip_list_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
-    """(Step 1) Displays a list of IPs in the pool, where each IP is a button."""
+async def lb_ip_list_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False, config_data: dict = None):
+    """(Step 1) Displays a list of IPs/Hostnames in the pool."""
     query = update.callback_query
     if query and not getattr(query, 'is_dummy', False):
         await query.answer()
-        
+    
     lang = get_user_lang(context)
     try:
         policy_index = context.user_data['edit_policy_index']
-        config = load_config()
+        config = config_data if config_data is not None else load_config()
         policy = config['load_balancer_policies'][policy_index]
         policy_name = policy.get('policy_name', 'N/A')
-        ips_with_weights = normalize_ip_list(policy.get('ips', []))
+        ip_items = policy.get('ips', [])
     except (IndexError, KeyError):
         await send_or_edit(update, context, get_text('messages.error_policy_not_found', lang), force_new_message=force_new_message)
         return
 
     message = get_text('messages.lb_ip_management_header', lang, policy_name=escape_html(policy_name))
     buttons = []
-    if not ips_with_weights:
+    if not ip_items:
         message += "\n" + get_text('messages.lb_ip_management_no_ips', lang)
     else:
-        sorted_ips = sorted(ips_with_weights, key=lambda x: x['ip'])
-        for ip_info in sorted_ips:
+        sorted_items = sorted(ip_items, key=lambda x: x.get('value', ''))
+        for item in sorted_items:
             original_index = -1
-            for i, original_ip_info in enumerate(ips_with_weights):
-                if original_ip_info == ip_info:
-                    original_index = i
-                    break
+            try:
+                original_index = ip_items.index(item)
+            except ValueError:
+                continue
+
+            status_icon = "✅" if item.get('enabled', True) else "❌"
+            type_icon = "🌐" if item.get('type') == 'hostname' else "🔌"
+            value = item.get('value', 'N/A')
+            weight = item.get('weight', 1)
             
-            if original_index != -1:
-                buttons.append([InlineKeyboardButton(f"{ip_info['ip']} (Weight: {ip_info['weight']})", callback_data=f"lb_ip_select|{original_index}")])
+            button_text = f"{status_icon} {type_icon} {value} (Weight: {weight})"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"lb_ip_select|{original_index}")])
     
     buttons.append([InlineKeyboardButton(get_text('buttons.add_new_ip', lang), callback_data="lb_ip_add_start")])
     buttons.append([InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=f"lb_policy_edit|{policy_index}")])
     
     await send_or_edit(update, context, message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML", force_new_message=force_new_message)
-
-async def lb_ip_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Step 2) Displays the edit menu for a specific selected IP."""
+    
+async def lb_ip_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    """(Step 2) Displays the edit menu for a specific selected IP/Hostname."""
     query = update.callback_query
-    await query.answer()
+    if query and not getattr(query, 'is_dummy', False):
+        await query.answer()
+    
     lang = get_user_lang(context)
     try:
-        ip_index = int(query.data.split('|')[1])
+        ip_index = -1
+        if query and query.data and "lb_ip_select|" in query.data:
+            ip_index = int(query.data.split('|')[1])
+        
+        if ip_index == -1: raise KeyError("Could not determine which item to edit.")
+
         policy_index = context.user_data['edit_policy_index']
         config = load_config()
-        ip_info = config['load_balancer_policies'][policy_index]['ips'][ip_index]
+        item_info = config['load_balancer_policies'][policy_index]['ips'][ip_index]
+        
         context.user_data['lb_ip_action_index'] = ip_index
-        text = get_text('messages.edit_ip_menu_header', lang, ip=ip_info['ip'], weight=ip_info['weight'])
+        
+        is_enabled = item_info.get('enabled', True)
+        status_text = "Enabled" if is_enabled else "Disabled"
+        toggle_button_text = "❌ Disable" if is_enabled else "✅ Enable"
+        
+        value = item_info.get('value', 'N/A')
+        weight = item_info.get('weight', 1)
+        text = get_text('messages.edit_lb_item_header', lang, value=value, weight=weight, status=status_text)
+        
         buttons = [
-            [InlineKeyboardButton(get_text('buttons.edit_ip_address', lang), callback_data=f"lb_ip_edit_start|address")],
+            [InlineKeyboardButton(toggle_button_text, callback_data="lb_ip_toggle_enable")],
+            [InlineKeyboardButton(get_text('buttons.edit_lb_item_value', lang), callback_data=f"lb_ip_edit_start|address")],
             [InlineKeyboardButton(get_text('buttons.edit_ip_weight', lang), callback_data=f"lb_ip_edit_start|weight")],
-            [InlineKeyboardButton(get_text('buttons.delete_this_ip', lang), callback_data="lb_ip_delete_prompt")],
+            [InlineKeyboardButton(get_text('buttons.delete_this_ip', lang), callback_data=f"lb_ip_delete_prompt|{ip_index}")],
             [InlineKeyboardButton(get_text('buttons.back_to_ip_list', lang), callback_data="lb_ip_list_menu")]
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        
+        await send_or_edit(update, context, text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML", force_new_message=force_new_message)
+
     except (IndexError, KeyError, ValueError):
-        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
 
 async def lb_ip_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Step 2 - Add) Prompts the user to enter new IP(s) to add to the pool."""
+    """Presents options for adding a new item to the pool: manually or from a list."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    context.user_data['lb_selection_is_editing'] = False
+    context.user_data.pop('lb_ip_action_index', None)
+
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.lb_add_manual', lang), callback_data="lb_add_item_manual")],
+        [InlineKeyboardButton(get_text('buttons.lb_add_from_list', lang), callback_data="lb_add_item_list_start_account")],
+        [InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="lb_ip_list_menu")]
+    ]
+    
+    await query.edit_message_text(
+        get_text('messages.lb_add_item_prompt', lang),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def lb_add_item_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' option, prompting the user for text input."""
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
 
     try:
-        for key in ['add_step', 'edit_policy_field', 'state']:
+        for key in ['add_step', 'edit_policy_field', 'state', 'lb_ip_action_index']:
             context.user_data.pop(key, None)
         
         context.user_data['state'] = 'awaiting_lb_new_ip'
         
-        text = get_text('prompts.enter_new_ips_to_add', lang)
+        text = get_text('prompts.enter_new_lb_items', lang)
         buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="lb_ip_list_menu")]]
+        
+        context.user_data['last_callback_query'] = query
+        
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
     except KeyError:
         await query.edit_message_text(get_text('messages.session_expired_error', lang))
 
-async def lb_ip_edit_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Step 3) Prompts the user for a new value (IP or weight)."""
+async def lb_add_item_list_start_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the 'Select from Records' flow for both adding and editing."""
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
+    
+    try:
+        policy_index = context.user_data['edit_policy_index']
+        context.user_data['lb_add_from_list_policy_index'] = policy_index
+        
+        context.user_data['record_selection_purpose'] = 'pool_items'
+        context.user_data['policy_selected_records'] = []
+
+    except KeyError:
+        logger.error("KeyError for 'edit_policy_index' at the start of lb_add_item_list_start_account_callback.")
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    context.user_data['lb_selection_mode'] = 'edit'
+    context.user_data['lb_add_from_list_flow'] = 'selecting_account'
+    
+    buttons = []
+    for nickname in CF_ACCOUNTS.keys():
+        buttons.append([InlineKeyboardButton(nickname, callback_data=f"lb_add_item_list_select_account|{nickname}")])
+    
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="lb_ip_list_menu")])
+    
+    text = get_text('prompts.choose_cf_account', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def lb_add_item_list_select_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles account selection and shows the list of zones for that account."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        nickname = query.data.split('|')[1]
+        token = CF_ACCOUNTS.get(nickname)
+        if not token:
+            await query.edit_message_text("Error: Account token not found.")
+            return
+            
+        await query.edit_message_text(get_text('messages.fetching_zones', lang))
+        zones = await get_all_zones(token)
+        if not zones:
+            await query.edit_message_text("No zones found for this account.")
+            return
+            
+        context.user_data['lb_add_from_list_flow'] = 'selecting_zone'
+        context.user_data['lb_add_from_list_token'] = token
+        context.user_data['lb_add_from_list_zones_cache'] = zones
+        
+        config = load_config()
+        aliases = config.get('zone_aliases', {})
+        sorted_zones = sorted(zones, key=lambda z: aliases.get(z['id'], z['name']))
+
+        buttons = []
+        for zone in sorted_zones:
+            button_text = aliases.get(zone['id'], zone['name'])
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"lb_add_item_list_select_zone|{zone['id']}")])
+        
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="lb_ip_list_menu")])
+        
+        await query.edit_message_text(get_text('prompts.choose_zone_for_policy', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_add_item_list_select_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles zone selection and displays the records for that zone."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        zone_id = query.data.split('|')[1]
+        token = context.user_data['lb_add_from_list_token']
+        
+        zones_cache = context.user_data.get('lb_add_from_list_zones_cache', [])
+        zone_name = next((z['name'] for z in zones_cache if z['id'] == zone_id), None)
+        if not zone_name:
+            raise ValueError("Zone name not found in cache.")
+        
+        await query.edit_message_text(get_text('messages.fetching_records', lang))
+        
+        all_records_raw = await get_dns_records(token, zone_id)
+        selectable_records = [r for r in all_records_raw if r['type'] in ['A', 'AAAA', 'CNAME']]
+        
+        if not selectable_records:
+            await query.edit_message_text(f"No A, AAAA, or CNAME records found in zone '{zone_name}'.")
+            return
+
+        context.user_data['lb_add_from_list_flow'] = 'selecting_records'
+        context.user_data['lb_add_from_list_records_cache'] = selectable_records
+        context.user_data['lb_add_from_list_selected'] = []
+        context.user_data['lb_add_from_list_zone_name'] = zone_name
+        
+        await _display_lb_record_selection(update, context)
+
+    except (IndexError, KeyError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_add_item_list_toggle_record_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the selection of a record."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        record_name = query.data.split('|', 1)[1]
+        selected = context.user_data.get('lb_add_from_list_selected', [])
+        
+        if record_name in selected:
+            selected.remove(record_name)
+        else:
+            selected.append(record_name)
+        
+        context.user_data['lb_add_from_list_selected'] = selected
+        
+        await _display_lb_record_selection(update, context)
+        
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_add_item_list_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms record selection and adds/updates them in the config."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
+    try:
+        selected_short_names = context.user_data.get('lb_add_from_list_selected', [])
+        if not selected_short_names:
+            await query.answer(get_text('errors.select_at_least_one_record', lang), show_alert=True)
+            return
+
+        policy_index = context.user_data.get('lb_add_from_list_policy_index')
+        if policy_index is None:
+            policy_index = context.user_data.get('edit_policy_index')
+        if policy_index is None:
+            raise KeyError("Policy index not found in context.")
+
+        config = load_config()
+        policy = config['load_balancer_policies'][policy_index]
+        
+        zone_name = policy.get('zone_name')
+        if not zone_name:
+            raise ValueError("Zone name not found in the policy being edited.")
+
+        is_editing = context.user_data.get('lb_selection_is_editing', False)
+        
+        if is_editing:
+            edit_index = context.user_data.get('lb_ip_action_index')
+            if edit_index is None:
+                raise KeyError("Edit mode is active but no edit_index was found.")
+            if len(selected_short_names) > 1:
+                await query.answer(get_text('errors.edit_one_record_from_list', lang), show_alert=True)
+                return
+            
+            short_name = selected_short_names[0]
+            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+
+            old_item = policy['ips'][edit_index]
+            new_item = {
+                "type": "hostname",
+                "value": full_name,
+                "weight": old_item.get('weight', 1),
+                "enabled": old_item.get('enabled', True)
+            }
+            policy['ips'][edit_index] = new_item
+        else:
+            new_items = []
+            for short_name in selected_short_names:
+                full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+                new_items.append({
+                    "type": "hostname",
+                    "value": full_name,
+                    "weight": 1,
+                    "enabled": True
+                })
+            policy.setdefault('ips', []).extend(new_items)
+
+        save_config(config)
+        
+        for key in list(context.user_data.keys()):
+            if key.startswith('lb_add_from_list_') or key == 'lb_ip_action_index' or key == 'lb_selection_is_editing':
+                del context.user_data[key]
+        
+        await query.answer(get_text('messages.pool_updated_successfully', lang), show_alert=True)
+        await lb_ip_list_menu(update, context, config_data=config)
+
+    except (IndexError, KeyError, ValueError) as e:
+        logger.error(f"Error in lb_add_item_list_confirm_callback: {e}", exc_info=True)
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_ip_edit_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Presents options for editing an item's value: manually or from a list."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
     edit_type = query.data.split('|')[1]
+    
+    if edit_type == 'address':
+        try:
+            ip_index = context.user_data['lb_ip_action_index']
+            context.user_data['lb_selection_is_editing'] = True
+            
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.lb_add_manual', lang), callback_data="lb_edit_item_manual")],
+                [InlineKeyboardButton(get_text('buttons.lb_add_from_list', lang), callback_data="lb_add_item_list_start_account")],
+                [InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"lb_ip_select|{ip_index}")]
+            ]
+            
+            await query.edit_message_text(
+                get_text('messages.lb_edit_item_prompt', lang),
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except KeyError:
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
+    
+    elif edit_type == 'weight':
+        try:
+            ip_index = context.user_data['lb_ip_action_index']
+            policy_index = context.user_data['edit_policy_index']
+            config = load_config()
+            item_info = config['load_balancer_policies'][policy_index]['ips'][ip_index]
+            
+            context.user_data.pop('state', None)
+            context.user_data['state'] = 'awaiting_lb_ip_weight'
+            
+            text = get_text('prompts.enter_new_weight_for_ip', lang, ip=item_info.get('value'))
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"lb_ip_select|{ip_index}")]]
+            
+            context.user_data['last_callback_query'] = query
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        except (IndexError, KeyError):
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_edit_item_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' option for editing an item."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    
     try:
         ip_index = context.user_data['lb_ip_action_index']
         policy_index = context.user_data['edit_policy_index']
         config = load_config()
-        ip_info = config['load_balancer_policies'][policy_index]['ips'][ip_index]
+        item_info = config['load_balancer_policies'][policy_index]['ips'][ip_index]
         
-        for key in ['add_step', 'edit_policy_field', 'state']: context.user_data.pop(key, None)
+        context.user_data.pop('state', None)
         
-        if edit_type == 'address':
-            context.user_data['state'] = 'awaiting_lb_ip_address'
-            prompt_key = 'prompts.enter_new_ip_for_entry'
-            text = get_text(prompt_key, lang, old_ip=ip_info['ip'])
-        else:
-            context.user_data['state'] = 'awaiting_lb_ip_weight'
-            prompt_key = 'prompts.enter_new_weight_for_ip'
-            text = get_text(prompt_key, lang, ip=ip_info['ip'])
-            
+        context.user_data['state'] = 'awaiting_lb_ip_address'
+        
+        text = get_text('prompts.enter_new_lb_item_value', lang, old_value=item_info.get('value'))
         buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"lb_ip_select|{ip_index}")]]
+        
+        context.user_data['last_callback_query'] = query
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
     except (IndexError, KeyError):
         await query.edit_message_text(get_text('messages.session_expired_error', lang))
 
 async def lb_ip_delete_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Step 3 - Delete) Asks for confirmation before deleting an IP."""
+    """Asks for confirmation before deleting an IP/Hostname from the pool."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    try:
+        ip_index_to_delete = int(query.data.split('|')[1])
+
+        policy_index = context.user_data['edit_policy_index']
+        config = load_config()
+        
+        item_to_delete = config['load_balancer_policies'][policy_index]['ips'][ip_index_to_delete]
+        value_to_delete = item_to_delete.get('value', 'N/A')
+        
+        text = get_text('prompts.confirm_delete_lb_item', lang, value=value_to_delete)
+        
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"lb_ip_delete_confirm|{ip_index_to_delete}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"lb_ip_select|{ip_index_to_delete}")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+    except (IndexError, KeyError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def lb_ip_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the selected IP/Hostname, sends a temporary message, and refreshes the list."""
+    query = update.callback_query
+    await query.answer()
+    
+    lang = get_user_lang(context)
+    
+    try:
+        ip_index_to_delete = int(query.data.split('|')[1])
+        policy_index = context.user_data.get('edit_policy_index')
+
+        if policy_index is None: 
+            raise KeyError("Session data missing.")
+        config = load_config()
+        deleted_item = config['load_balancer_policies'][policy_index]['ips'].pop(ip_index_to_delete)
+        save_config(config)
+        success_text = get_text('messages.lb_item_deleted_successfully', lang, value=deleted_item.get('value'))
+        temp_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ {success_text}"
+        )
+
+        await asyncio.sleep(3)
+
+        try:
+            await temp_msg.delete()
+        except Exception:
+            pass
+        await lb_ip_list_menu(update, context, config_data=config)
+
+    except (IndexError, KeyError, ValueError) as e:
+        logger.error(f"Error in lb_ip_delete_confirm_callback: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.session_expired_error', lang))
+
+async def lb_ip_toggle_enable_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the enabled status of a specific IP in a Load Balancer pool."""
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
     try:
         ip_index = context.user_data['lb_ip_action_index']
         policy_index = context.user_data['edit_policy_index']
+        
         config = load_config()
-        ip_to_delete = config['load_balancer_policies'][policy_index]['ips'][ip_index]['ip']
-        text = get_text('prompts.confirm_delete_ip', lang, ip=ip_to_delete)
-        buttons = [
-            [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="lb_ip_delete_confirm")],
-            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"lb_ip_select|{ip_index}")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-    except (IndexError, KeyError):
-        await query.edit_message_text(get_text('messages.session_expired_error', lang))
-
-async def lb_ip_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Step 4 - Delete) Deletes the IP and refreshes the list."""
-    query = update.callback_query
-    lang = get_user_lang(context)
-    try:
-        ip_index = context.user_data.pop('lb_ip_action_index')
-        policy_index = context.user_data['edit_policy_index']
-        config = load_config()
-        config['load_balancer_policies'][policy_index]['ips'].pop(ip_index)
+        policy = config['load_balancer_policies'][policy_index]
+        ip_info = policy['ips'][ip_index]
+        
+        current_status = ip_info.get('enabled', True)
+        new_status = not current_status
+        ip_info['enabled'] = new_status
+        
         save_config(config)
-        await query.answer(get_text('messages.ip_deleted_successfully', lang), show_alert=True)
-        await lb_ip_list_menu(update, context)
+        
+        await query.message.delete()
+        await lb_ip_list_menu(update, context, force_new_message=True, config_data=config)
+
     except (IndexError, KeyError):
-        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.session_expired_error', lang))
 
 async def lb_policy_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
     query = update.callback_query
@@ -5651,25 +6343,31 @@ async def lb_policy_edit_field_callback(update: Update, context: ContextTypes.DE
     await send_or_edit(update, context, text_to_send)
 
 async def lb_policy_set_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles zone selection when adding a new LB policy."""
+    """Handles zone selection when adding a new LB policy and proceeds to the IP/Hostname input method selection."""
     query = update.callback_query
     await query.answer()
+    lang = get_user_lang(context)
     
     if context.user_data.get('add_policy_type') != 'lb':
-        await query.edit_message_text(get_text('messages.session_expired_error', get_user_lang(context)))
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
         return
 
     zone_name = query.data.split('|')[1]
     context.user_data['new_policy_data']['zone_name'] = zone_name
     
-    context.user_data['policy_selected_records'] = []
-    context.user_data.pop('policy_all_records', None)
-    context.user_data.pop('current_selection_zone', None)
+    context.user_data['add_policy_step'] = 'ask_lb_ips_method'
     
-    await display_records_for_selection(update, context, page=0)
+    text_to_send = get_text('messages.lb_add_item_prompt', lang)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.lb_add_manual', lang), callback_data="add_policy_lb_manual")],
+        [InlineKeyboardButton(get_text('buttons.lb_add_from_list', lang), callback_data="add_policy_lb_from_list")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="settings_lb_policies")]
+    ]
+    await query.edit_message_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def settings_lb_policies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(context)
+    _clear_add_policy_state(context)    
     context.user_data.pop('edit_policy_index', None)
     context.user_data.pop('editing_policy_type', None)
 
@@ -5723,8 +6421,17 @@ async def lb_policy_view_callback(update: Update, context: ContextTypes.DEFAULT_
         else: interval_text = f"<code>{get_text('messages.interval_display_random', lang, min_hours=min_h, max_hours=max_h)}</code>"
     else: interval_text = f"<code>{policy.get('rotation_interval_hours', 'N/A')} hours</code>"
 
-    ips_with_weights = normalize_ip_list(policy.get('ips', []))
-    ips_str = "\n".join([f"<code>{escape_html(ip['ip'])}</code> (Weight: {ip['weight']})" for ip in ips_with_weights]) or f"<code>{get_text('messages.not_set', lang)}</code>"
+    items_in_pool = policy.get('ips', [])
+    items_str_list = []
+    for item in items_in_pool:
+        item_type = item.get('type', 'ip')
+        value = item.get('value', 'N/A')
+        weight = item.get('weight', 1)
+        icon = "🌐" if item_type == 'hostname' else "🔌"
+        items_str_list.append(f"{icon} <code>{escape_html(value)}</code> (Weight: {weight})")
+    
+    ips_str = "\n".join(items_str_list) or f"<code>{get_text('messages.not_set', lang)}</code>"
+
     records_str = f"<code>{escape_html(', '.join(policy.get('record_names', [])))}</code>" if policy.get('record_names') else f"<code>{get_text('messages.not_set', lang)}</code>"
     
     current_algo = policy.get('rotation_algorithm', 'random')
@@ -5755,6 +6462,7 @@ async def lb_policy_view_callback(update: Update, context: ContextTypes.DEFAULT_
     buttons = [
         [InlineKeyboardButton(get_text('buttons.edit_policy', lang), callback_data=f"lb_policy_edit|{policy_index}"),
          InlineKeyboardButton(toggle_btn_text, callback_data=f"lb_policy_toggle|{policy_index}")],
+        [InlineKeyboardButton(get_text('buttons.force_rotate', lang, default="🔄 Force Rotate Now"), callback_data=f"lb_force_rotate|{policy_index}")],
         [InlineKeyboardButton(toggle_maint_btn, callback_data=f"toggle_maintenance|lb|{policy_index}")],
         [InlineKeyboardButton(get_text('buttons.clone_policy', lang), callback_data=f"clone_policy_start|lb|{policy_index}")],
         [InlineKeyboardButton(get_text('buttons.delete_policy', lang), callback_data=f"lb_policy_delete|{policy_index}")],
@@ -5762,7 +6470,7 @@ async def lb_policy_view_callback(update: Update, context: ContextTypes.DEFAULT_
         [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="settings_lb_policies")]
     ]
     
-    await send_or_edit(update, context, details_text, InlineKeyboardMarkup(buttons))
+    await send_or_edit(update, context, details_text, InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
 
 async def lb_policy_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggles the enabled status of a Load Balancing policy."""
@@ -6045,19 +6753,24 @@ async def failover_policy_set_zone_callback(update: Update, context: ContextType
     """Handles zone selection when adding a new Failover policy."""
     query = update.callback_query
     await query.answer()
+    lang = get_user_lang(context)
     
     if context.user_data.get('add_policy_type') != 'failover':
-        await query.edit_message_text(get_text('messages.session_expired_error', get_user_lang(context)))
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
         return
 
     zone_name = query.data.split('|')[1]
     context.user_data['new_policy_data']['zone_name'] = zone_name
     
-    context.user_data['policy_selected_records'] = []
-    context.user_data.pop('policy_all_records', None)
-    context.user_data.pop('current_selection_zone', None)
+    context.user_data['add_policy_step'] = 'primary_ip'
     
-    await display_records_for_selection(update, context, page=0)
+    text_to_send = get_text('prompts.select_primary_ip_method', lang, default="Great! Now, how would you like to select the Primary IP?")
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.type_ip_manually', lang, default="⌨️ Type IP Manually"), callback_data="add_policy_failover_manual_primary")],
+        [InlineKeyboardButton(get_text('buttons.select_ip_from_records', lang, default="📋 Select from Existing Records"), callback_data="add_policy_failover_from_list_primary")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="settings_failover_policies")]
+    ]
+    await query.edit_message_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def failover_policy_set_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles account selection when adding a new Failover policy."""
@@ -6626,36 +7339,51 @@ async def wizard_edit_last_message(context: ContextTypes.DEFAULT_TYPE, text: str
 
 
 async def wizard_step3_ask_ips(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Wizard Step 3: Ask for the primary IP (Failover) or IP pool (LB)."""
-    start_time = context.user_data.get('wizard_start_time')
-    if not start_time or (datetime.now() - start_time) > timedelta(minutes=10):
-        context.user_data.pop('wizard_data', None)
-        context.user_data.pop('wizard_step', None)
-        context.user_data.pop('wizard_start_time', None)
-        query = update.callback_query
-        await query.answer("فرآیند راه‌اندازی سریع منقضی شده است.", show_alert=True)
-        await query.edit_message_text("فرآیند لغو شد. لطفاً با /wizard دوباره شروع کنید.")
-        return
+    """Wizard Step 3: Asks for the IP after receiving the name."""
     lang = get_user_lang(context)
     try:
-        if context.user_data.get('last_callback_query'):
+        await update.message.delete()
+    except Exception:
+        pass
+    try:
+        if 'last_callback_query' in context.user_data and context.user_data['last_callback_query']:
             await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
                 message_id=context.user_data['last_callback_query'].message.message_id
             )
+            context.user_data.pop('last_callback_query', None) 
     except Exception:
         pass
+
     policy_type = context.user_data['wizard_data']['type']
+    
     if policy_type == 'failover':
         context.user_data['wizard_step'] = 'ask_primary_ip'
-        text = get_text('messages.wizard_name_saved', lang) + get_text('messages.wizard_ask_primary_ip', lang)
+        text_to_send = get_text('messages.wizard_name_saved', lang) + get_text('messages.wizard_ask_primary_ip', lang)
+        buttons = [[InlineKeyboardButton(get_text('buttons.wizard_cancel', lang), callback_data="wizard_cancel")]]
+        reply_markup = InlineKeyboardMarkup(buttons)
+        
+        await update.effective_chat.send_message(
+            text=text_to_send,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
     else:
-        context.user_data['wizard_step'] = 'ask_lb_ips'
-        text = get_text('messages.wizard_name_saved', lang) + get_text('messages.wizard_ask_lb_ips', lang)
-    buttons = [[InlineKeyboardButton(get_text('buttons.wizard_cancel', lang), callback_data="wizard_cancel")]]
-    reply_markup = InlineKeyboardMarkup(buttons)
-    
-    await context.bot.send_message(chat_id=update.effective_chat.id,text=text,reply_markup=reply_markup,parse_mode="HTML")
+        context.user_data['wizard_step'] = 'ask_lb_ips_method'
+        text_to_send = get_text('messages.wizard_name_saved', lang) + get_text('messages.lb_add_item_prompt', lang)
+
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.lb_add_manual', lang), callback_data="wizard_lb_add_manual")],
+            [InlineKeyboardButton(get_text('buttons.wizard_cancel', lang), callback_data="wizard_cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(buttons)
+        
+        msg = await update.effective_chat.send_message(
+            text=text_to_send,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        context.user_data['last_callback_query'] = type('obj', (object,), {'message': msg})
 
 async def wizard_step4_ask_backup_ips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wizard Step 4 (Failover only): Ask for backup IPs."""
@@ -6862,40 +7590,59 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     direction_char = "\u200F" if lang == 'fa' else "\u200E"
     message_parts = [direction_char + get_text('messages.status_header', lang)]
     
-    for i, (policy_type, policy) in enumerate(all_policies):
-        index = i + 1
-        policy_name = policy.get('policy_name', 'Unnamed')
-        line = ""
-        icon = "🛡️" if policy_type == 'failover' else "🚦"
+    lb_active_ips_map = {} 
 
+    async def get_policy_status_line(policy_type, policy, health_results, s_data, l_map):
+        policy_name = policy.get('policy_name', 'Unnamed')
+        
         if policy.get('maintenance_mode', False):
             maintenance_text = get_text('messages.status_in_maintenance', lang)
-            line = f"{escape_html(policy_name)}: {maintenance_text}"
+            return f"{escape_html(policy_name)}: {maintenance_text}"
         
-        elif not policy.get('enabled', True):
-            line = get_text('messages.status_policy_disabled', lang, policy_name=escape_html(policy_name))
-        elif policy_type == 'failover':
-            primary_ip = policy.get('primary_ip')
+        if not policy.get('enabled', True):
+            return get_text('messages.status_policy_disabled', lang, policy_name=escape_html(policy_name))
+
+        if policy_type == 'failover':
+            primary_ip_or_host = policy.get('primary_ip')
             backup_ips = policy.get('backup_ips', [])
-            policy_status = status_data.get(policy_name, {})
-            is_primary_online = last_health_results.get(primary_ip, True)
+            policy_status = s_data.get(policy_name, {})
+            
+            primary_ips_resolved = await resolve_dns_to_ips(primary_ip_or_host)
+            primary_ip_to_check = primary_ips_resolved[0] if primary_ips_resolved else None
+            is_primary_online = health_results.get(primary_ip_to_check, False)
+
             if policy_status.get('downtime_start') and not is_primary_online:
-                line = get_text('messages.status_failover_grace_period', lang, policy_name=escape_html(policy_name), ip=primary_ip)
+                return get_text('messages.status_failover_grace_period', lang, policy_name=escape_html(policy_name), ip=primary_ip_or_host)
             elif not is_primary_online:
-                healthy_backup = next((ip for ip in backup_ips if last_health_results.get(ip, True)), None)
-                line = get_text('messages.status_failover_active', lang, policy_name=escape_html(policy_name), ip=healthy_backup) if healthy_backup else get_text('messages.status_failover_all_down', lang, policy_name=escape_html(policy_name))
+                healthy_backup = next((ip for ip in backup_ips if health_results.get(ip, True)), None)
+                return get_text('messages.status_failover_active', lang, policy_name=escape_html(policy_name), ip=healthy_backup) if healthy_backup else get_text('messages.status_failover_all_down', lang, policy_name=escape_html(policy_name))
             else:
-                line = get_text('messages.status_failover_ok', lang, policy_name=escape_html(policy_name), ip=primary_ip)
-        else:
-            ips = [item['ip'] for item in normalize_ip_list(policy.get('ips', []))]
-            healthy_ips = [ip for ip in ips if last_health_results.get(ip, True)]
-            if not healthy_ips:
-                line = get_text('messages.status_lb_all_down', lang, policy_name=escape_html(policy_name))
-            else:
-                active_ip = status_data.get(policy_name, {}).get('active_ip', 'Unknown')
-                line = get_text('messages.status_lb_ok', lang, policy_name=escape_html(policy_name), ip=active_ip)
+                return get_text('messages.status_failover_ok', lang, policy_name=escape_html(policy_name), ip=primary_ip_or_host)
         
-        message_parts.append(f"{direction_char}<b>{index}.</b> {icon} {line}")
+        else:
+            pool_ips = []
+            for item in policy.get('ips', []):
+                if item.get('type') == 'hostname':
+                    resolved = await resolve_dns_to_ips(item.get('value'))
+                    pool_ips.extend(resolved)
+                elif item.get('type') == 'ip':
+                    pool_ips.append(item.get('value'))
+            
+            healthy_ips = [ip for ip in pool_ips if health_results.get(ip, True)]
+            
+            if not healthy_ips:
+                return get_text('messages.status_lb_all_down', lang, policy_name=escape_html(policy_name))
+            else:
+                active_ip = s_data.get(policy_name, {}).get('active_ip', 'Unknown')
+                return get_text('messages.status_lb_ok', lang, policy_name=escape_html(policy_name), ip=active_ip)
+
+    status_lines_tasks = [get_policy_status_line(ptype, p, last_health_results, status_data, lb_active_ips_map) for ptype, p in all_policies]
+    status_lines = await asyncio.gather(*status_lines_tasks)
+
+    for i, line in enumerate(status_lines):
+        policy_type, _ = all_policies[i]
+        icon = "🛡️" if policy_type == 'failover' else "🚦"
+        message_parts.append(f"{direction_char}<b>{i+1}.</b> {icon} {line}")
 
     last_check_time = context.bot_data.get('last_health_check_time')
     if last_check_time:
@@ -7288,7 +8035,21 @@ def main():
         .persistence(persistence) \
         .post_init(post_startup_tasks) \
         .build()
-       
+    
+    def create_dummy_update_func(original_update, message_id, callback_data=None):
+        return type('obj', (object,), {
+            'callback_query': type('obj', (object,), {
+                'is_dummy': True,
+                'data': callback_data,
+                'answer': (lambda *args, **kwargs: asyncio.sleep(0)),
+                'edit_message_text': (lambda *args, **kwargs: application.bot.edit_message_text(chat_id=original_update.effective_chat.id, message_id=message_id, *args, **kwargs)),
+                'message': type('obj', (object,), {'message_id': message_id, 'chat': original_update.effective_chat})
+            }),
+            'effective_user': original_update.effective_user,
+            'effective_chat': original_update.effective_chat
+        })
+    application.create_dummy_update = create_dummy_update_func
+
     # Command Handlers
     application.add_handler(CommandHandler("clearcommands", clear_commands_command))
     application.add_handler(CommandHandler("start", start_command))
@@ -7378,6 +8139,7 @@ def main():
     application.add_handler(CallbackQueryHandler(wizard_start_callback, pattern="^wizard_start$"))
     application.add_handler(CallbackQueryHandler(wizard_set_type_callback, pattern="^wizard_set_type\|"))
     application.add_handler(CallbackQueryHandler(wizard_cancel_callback, pattern="^wizard_cancel$"))
+    application.add_handler(CallbackQueryHandler(wizard_lb_add_manual_callback, pattern="^wizard_lb_add_manual$"))
 
     # --- Bulk Actions ---
     application.add_handler(CallbackQueryHandler(bulk_start_callback, pattern="^bulk_start$"))
@@ -7429,6 +8191,9 @@ def main():
     application.add_handler(CallbackQueryHandler(failover_policy_toggle_failback_callback, pattern="^failover_policy_toggle_failback\|"))
     application.add_handler(CallbackQueryHandler(failover_policy_set_account_callback, pattern="^failover_policy_set_account\|"))
     application.add_handler(CallbackQueryHandler(failover_policy_set_zone_callback, pattern="^failover_policy_set_zone\|"))
+    application.add_handler(CallbackQueryHandler(add_policy_failover_manual_primary_callback, pattern="^add_policy_failover_manual_primary$"))
+    application.add_handler(CallbackQueryHandler(add_policy_failover_from_list_primary_callback, pattern="^add_policy_failover_from_list_primary$"))
+    application.add_handler(CallbackQueryHandler(add_policy_failover_select_records_callback, pattern="^add_policy_failover_select_records$"))
 
     # --- Load Balancer Policy Management ---
     application.add_handler(CallbackQueryHandler(settings_lb_policies_callback, pattern="^settings_lb_policies$"))
@@ -7446,9 +8211,22 @@ def main():
     application.add_handler(CallbackQueryHandler(lb_ip_list_menu, pattern="^lb_ip_list_menu$"))
     application.add_handler(CallbackQueryHandler(lb_ip_edit_menu, pattern="^lb_ip_select\|"))
     application.add_handler(CallbackQueryHandler(lb_ip_edit_start_callback, pattern="^lb_ip_edit_start\|"))
-    application.add_handler(CallbackQueryHandler(lb_ip_delete_prompt_callback, pattern="^lb_ip_delete_prompt$"))
-    application.add_handler(CallbackQueryHandler(lb_ip_delete_confirm_callback, pattern="^lb_ip_delete_confirm$"))
+    application.add_handler(CallbackQueryHandler(lb_ip_delete_prompt_callback, pattern="^lb_ip_delete_prompt\|"))
+    application.add_handler(CallbackQueryHandler(lb_ip_delete_confirm_callback, pattern="^lb_ip_delete_confirm\|"))
     application.add_handler(CallbackQueryHandler(lb_ip_add_start_callback, pattern="^lb_ip_add_start$"))
+    application.add_handler(CallbackQueryHandler(lb_ip_toggle_enable_callback, pattern="^lb_ip_toggle_enable$"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_manual_callback, pattern="^lb_add_item_manual$"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_list_start_account_callback, pattern="^lb_add_item_list_start_account$"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_list_select_account_callback, pattern="^lb_add_item_list_select_account\|"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_list_select_zone_callback, pattern="^lb_add_item_list_select_zone\|"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_list_toggle_record_callback, pattern="^lb_add_item_list_toggle_record\|"))
+    application.add_handler(CallbackQueryHandler(lb_add_item_list_confirm_callback, pattern="^lb_add_item_list_confirm$"))
+    application.add_handler(CallbackQueryHandler(lb_edit_item_manual_callback, pattern="^lb_edit_item_manual$"))
+    application.add_handler(CallbackQueryHandler(add_policy_lb_manual_callback, pattern="^add_policy_lb_manual$"))
+    application.add_handler(CallbackQueryHandler(add_policy_lb_from_list_callback, pattern="^add_policy_lb_from_list$"))
+    application.add_handler(CallbackQueryHandler(add_policy_lb_select_records_callback, pattern="^add_policy_lb_select_records$"))
+    application.add_handler(CallbackQueryHandler(confirm_pool_selection_callback, pattern="^confirm_pool_selection$"))
+    application.add_handler(CallbackQueryHandler(lb_force_rotate_callback, pattern="^lb_force_rotate\|"))
 
     # --- Shared/Generic Policy Handlers (Nodes & Records Selection) ---
     application.add_handler(CallbackQueryHandler(policy_force_update_nodes_callback, pattern="^policy_force_update_nodes$"))
