@@ -1125,7 +1125,9 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             # === STAGE 3: PROCESS STANDALONE MONITORS AND SEND ALERTS ===
+            # === STAGE 3: PROCESS STANDALONE MONITORS AND SEND ALERTS ===
             logger.info("--- [HEALTH CHECK] Stage 3: Processing Standalone Monitors ---")
+            
             if 'monitor_status' not in context.bot_data:
                 context.bot_data['monitor_status'] = {}
 
@@ -1137,13 +1139,29 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 if not monitor.get('enabled', True): continue
                 
                 monitor_name = monitor.get("monitor_name")
-                ip = monitor.get("ip")
+                input_addr = monitor.get("ip")
                 port = monitor.get("check_port")
                 
-                if not all([monitor_name, ip, port]):
+                if not all([monitor_name, input_addr, port]):
                     continue
 
-                is_currently_online = health_results.get(ip, True)
+                is_currently_online = True 
+
+                if is_valid_ip(input_addr):
+                    is_currently_online = health_results.get(input_addr, True)
+                else:
+                    resolved_monitor_ips = await resolve_dns_to_ips(input_addr)
+                    if not resolved_monitor_ips:
+                        is_currently_online = False
+                        logger.warning(f"Monitor '{monitor_name}': Could not resolve domain '{input_addr}'. Treating as DOWN.")
+                    else:
+                        statuses = [health_results.get(rip, False) for rip in resolved_monitor_ips if rip in health_results]
+                        
+                        if statuses:
+                            is_currently_online = any(statuses)
+                        else:
+                            is_currently_online = True
+
                 was_previously_online = context.bot_data['monitor_status'].get(monitor_name, True)
 
                 if (is_currently_online and not was_previously_online) or (not is_currently_online and was_previously_online):
@@ -1151,19 +1169,18 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     recipients_to_notify = set(SUPER_ADMIN_IDS)
                     recipient_key = f"__monitor__{monitor_name}"
 
-                    logger.info(f"--- Building recipients for monitor '{monitor_name}' ---")
-                    logger.info(f"  - Looking for specific key: '{recipient_key}'")
+                    logger.info(f"--- Monitor Alert '{monitor_name}': Status Changed {was_previously_online} -> {is_currently_online} ---")
+                    logger.info(f"  - Building recipients for monitor '{monitor_name}' with key '{recipient_key}'")
                     
                     if recipient_key in recipients_map:
-                        logger.info(f"  - SUCCESS: Found specific list. Members: {recipients_map[recipient_key]}")
+                        logger.info(f"  - Using specific list. Members: {recipients_map[recipient_key]}")
                         recipients_to_notify.update(recipients_map[recipient_key])
                     else:
-                        logger.info(f"  - FAILURE: Key not found. Falling back to default. Members: {recipients_map['__default__']}")
+                        logger.info(f"  - Using default list. Members: {recipients_map['__default__']}")
                         recipients_to_notify.update(recipients_map["__default__"])
                     
-                    logger.info(f"  - FINAL LIST to notify for '{monitor_name}': {recipients_to_notify}")
                     await send_notification(context, recipients_to_notify, message_key, 
-                                            monitor_name=monitor_name, ip=ip, port=port)
+                                            monitor_name=monitor_name, ip=input_addr, port=port)
                 
                 context.bot_data['monitor_status'][monitor_name] = is_currently_online
 
