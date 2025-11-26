@@ -3576,20 +3576,99 @@ async def policy_confirm_records_callback(update: Update, context: ContextTypes.
     
     elif selection_purpose == 'policy_records':
         is_editing = context.user_data.get('is_editing_policy_records', False)
+        
+        policy_type = context.user_data.get('editing_policy_type') if is_editing else context.user_data.get('add_policy_type')
+        config = load_config()
+        
         if is_editing:
-            policy_type = context.user_data.get('editing_policy_type')
             policy_index = context.user_data.get('edit_policy_index')
             if not all([policy_type, policy_index is not None]):
                 await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
-            config = load_config()
             policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+            
             try:
                 config[policy_list_key][policy_index]['record_names'] = selected_short_names
                 save_config(config)
+                
+                current_policy = config[policy_list_key][policy_index]
+                account_nickname = current_policy.get('account_nickname')
             except IndexError:
                 await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
+
             policy_type_display = "LB" if policy_type == 'lb' else "Failover"
             await send_or_edit(update, context, get_text('messages.policy_records_updated', lang, policy_type=policy_type_display))
+
+            if policy_type == 'failover':
+                best_ip_to_use = current_policy.get('primary_ip')
+                backup_ips = current_policy.get('backup_ips', [])
+                check_port = current_policy.get('check_port')
+                
+                mon_group_name = current_policy.get('primary_monitoring_group')
+                mon_group = config.get('monitoring_groups', {}).get(mon_group_name, {})
+                nodes = mon_group.get('nodes', [])
+                threshold = mon_group.get('threshold', 1)
+                
+                check_details = {
+                    'check_port': check_port,
+                    'nodes': nodes,
+                    'threshold': threshold
+                }
+
+                await send_or_edit(update, context, get_text('messages.checking_primary_health', lang, ip=best_ip_to_use))
+                
+                is_primary_up, _ = await get_ip_health_with_cache(context, best_ip_to_use, check_details)
+                
+                if is_primary_up:
+                    await send_or_edit(update, context, get_text('messages.primary_online_applying', lang, ip=best_ip_to_use))
+                else:
+                    if backup_ips:
+                        await send_or_edit(update, context, get_text('messages.primary_down_checking_backups', lang, count=len(backup_ips)))
+                        found_backup = False
+                        
+                        for bip in backup_ips:
+                            is_backup_up, _ = await get_ip_health_with_cache(context, bip, check_details)
+                            if is_backup_up:
+                                best_ip_to_use = bip
+                                found_backup = True
+                                await send_or_edit(update, context, get_text('messages.backup_online_applying', lang, ip=bip))
+                                break
+                        
+                        if not found_backup:
+                            await send_or_edit(update, context, get_text('messages.all_backups_down_force_primary', lang))
+                    else:
+                        await send_or_edit(update, context, get_text('messages.primary_down_no_backup', lang))
+
+                token = CF_ACCOUNTS.get(account_nickname)
+                cached_records = context.user_data.get('policy_all_records', [])
+                zone_name = context.user_data.get('current_selection_zone') or current_policy.get('zone_name')
+                
+                if best_ip_to_use and token and zone_name:
+                    all_zones_fetched = await get_all_zones(token)
+                    target_zone_id = next((z['id'] for z in all_zones_fetched if z['name'] == zone_name), None)
+                    
+                    if target_zone_id:
+                        update_count = 0
+                        for short_name in selected_short_names:
+                            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+                            target_record = next((r for r in cached_records if r['name'] == full_name), None)
+                            
+                            if target_record and target_record['content'] != best_ip_to_use:
+                                 await update_record(
+                                     token=token, 
+                                     zone_id=target_zone_id, 
+                                     rid=target_record['id'], 
+                                     rtype=target_record['type'], 
+                                     name=full_name, 
+                                     content=best_ip_to_use, 
+                                     proxied=target_record.get('proxied', False)
+                                 )
+                                 update_count += 1
+                        
+                        if update_count > 0:
+                            await send_or_edit(update, context, get_text('messages.ip_sync_success', lang, count=update_count, ip=best_ip_to_use))
+                    else:
+                        await send_or_edit(update, context, get_text('messages.error_zone_id_missing', lang))
+            
             await asyncio.sleep(1)
             for key in ['is_editing_policy_records', 'policy_all_records', 'policy_selected_records', 'current_selection_zone']:
                 context.user_data.pop(key, None)
@@ -3598,11 +3677,35 @@ async def policy_confirm_records_callback(update: Update, context: ContextTypes.
             else:
                 await failover_policy_view_callback(update, context)
             return
+
         else:
-            policy_type = context.user_data.get('add_policy_type')
             data = context.user_data['new_policy_data']
             data['record_names'] = selected_short_names
             
+            if policy_type == 'failover':
+                target_ip_to_sync = data.get('primary_ip')
+                account_nickname = data.get('account_nickname')
+                token = CF_ACCOUNTS.get(account_nickname)
+                cached_records = context.user_data.get('policy_all_records', [])
+                zone_name = context.user_data.get('current_selection_zone')
+                
+                if target_ip_to_sync and token and zone_name:
+                     await send_or_edit(update, context, get_text('messages.setting_initial_records', lang))
+                     
+                     all_zones_fetched = await get_all_zones(token)
+                     target_zone_id = next((z['id'] for z in all_zones_fetched if z['name'] == zone_name), None)
+
+                     if target_zone_id:
+                         for short_name in selected_short_names:
+                            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+                            target_record = next((r for r in cached_records if r['name'] == full_name), None)
+                            if target_record and target_record['content'] != target_ip_to_sync:
+                                await update_record(
+                                    token, target_zone_id, target_record['id'], 
+                                    target_record['type'], full_name, target_ip_to_sync, 
+                                    target_record.get('proxied', False)
+                                )
+
             for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
                 context.user_data.pop(key, None)
 

@@ -265,7 +265,7 @@
     "move_record_copy_complete": "✅ Copy complete. The original record was kept.",
     "daily_report_header": "📊 <b>Daily Monitoring Report</b> 📊\n<i>(Last 24 Hours)</i>",
     "daily_report_no_events": "✅ All monitored services remained stable. No downtime or significant events detected.",
-    "daily_report_summary": "<b>Overall Summary:</b>\n- <b>{total_outages}</b> total outages detected.\n- <b>{lb_rotations}</b> load balancer rotations performed.",
+    "daily_report_summary": "<b>Overall Summary:</b>\n- <b>{failovers}</b> Failover events\n- <b>{failbacks}</b> Failback events\n- <b>{rotations}</b> Load Balancer rotations",
     "daily_report_failover_header": "\n🚨 <b>Failover Events:</b>",
     "daily_report_failover_entry": "- Policy '<code>{policy_name}</code>' failed over from <code>{from_ip}</code> to <code>{to_ip}</code>.",
     "daily_report_uptime_header": "\n📈 <b>Server Uptime:</b>",
