@@ -448,7 +448,16 @@
     "lb_item_deleted_successfully": "✅ Item '{value}' was successfully deleted.",
     "lb_edit_item_prompt": "How would you like to set the new address for this item?",
     "wizard_expired": "Wizard has expired due to inactivity. Please start over with /wizard.",
-    "rotation_triggered": "Rotation triggered. Please wait a moment for the next health check cycle to apply it."
+    "rotation_triggered": "Rotation triggered. Please wait a moment for the next health check cycle to apply it.",
+    "checking_primary_health": "🩺 Checking health of Primary Server ({ip})...",
+    "primary_online_applying": "✅ Primary Server is online. Applying IP {ip}...",
+    "primary_down_checking_backups": "⚠️ Primary Server is unreachable. Checking {count} backups...",
+    "backup_online_applying": "✅ Backup Server {ip} is online. Switching to backup.",
+    "all_backups_down_force_primary": "❌ All backups are down! Forcing Primary IP.",
+    "primary_down_no_backup": "❌ Primary Server is down and no backups are defined.",
+    "ip_sync_success": "🔄 Successfully updated {count} records to <code>{ip}</code>.",
+    "error_zone_id_missing": "❌ Internal Error: Zone ID not found. Settings saved but IP was not updated.",
+    "setting_initial_records": "⏳ Setting selected records to the Primary IP..."
   },
   "prompts": {
       "enter_ip": "📥 Please enter the new IP for <code>{name}</code>:",
