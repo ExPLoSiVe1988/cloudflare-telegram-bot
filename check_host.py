@@ -2,262 +2,309 @@ import httpx
 import asyncio
 import logging
 import json
-import re
 import os
+import random
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://check-host.net"
 REQUEST_HEADERS = {
-    'Accept': 'application/json',
-    'User-Agent': 'CloudflareMonitoringBot/1.1'
+    "Accept": "application/json",
+    "User-Agent": "CloudflareMonitoringBot/1.1"
 }
 NODES_CACHE_FILE = "nodes_cache.json"
-CACHE_EXPIRATION_HOURS = 24
+CACHE_EXPIRATION_HOURS = int(os.getenv("CHECK_HOST_NODES_CACHE_HOURS", "6"))
 
-STATIC_NODES_DATA = {
-    "us1.node.check-host.net": {"country": "USA", "city": "New York", "location": "us"},
-    "us2.node.check-host.net": {"country": "USA", "city": "Los Angeles", "location": "us"},
-    "us3.node.check-host.net": {"country": "USA", "city": "Dallas", "location": "us"},
-    "us4.node.check-host.net": {"country": "USA", "city": "Miami", "location": "us"},
-    "us5.node.check-host.net": {"country": "USA", "city": "Chicago", "location": "us"},
-    "us6.node.check-host.net": {"country": "USA", "city": "Seattle", "location": "us"},
-    "us7.node.check-host.net": {"country": "USA", "city": "Atlanta", "location": "us"},
-    "us8.node.check-host.net": {"country": "USA", "city": "Denver", "location": "us"},
-    "ca1.node.check-host.net": {"country": "Canada", "city": "Beauharnois", "location": "ca"},
-    "ca2.node.check-host.net": {"country": "Canada", "city": "Toronto", "location": "ca"},
-    "ca3.node.check-host.net": {"country": "Canada", "city": "Vancouver", "location": "ca"},
-    "de1.node.check-host.net": {"country": "Germany", "city": "Frankfurt", "location": "de"},
-    "de2.node.check-host.net": {"country": "Germany", "city": "Nuremberg", "location": "de"},
-    "de3.node.check-host.net": {"country": "Germany", "city": "Falkenstein", "location": "de"},
-    "fr1.node.check-host.net": {"country": "France", "city": "Strasbourg", "location": "fr"},
-    "fr2.node.check-host.net": {"country": "France", "city": "Paris", "location": "fr"},
-    "gb1.node.check-host.net": {"country": "Great Britain", "city": "London", "location": "gb"},
-    "gb2.node.check-host.net": {"country": "Great Britain", "city": "Manchester", "location": "gb"},
-    "nl1.node.check-host.net": {"country": "Netherlands", "city": "Amsterdam", "location": "nl"},
-    "pl1.node.check-host.net": {"country": "Poland", "city": "Warsaw", "location": "pl"},
-    "es1.node.check-host.net": {"country": "Spain", "city": "Madrid", "location": "es"},
-    "it1.node.check-host.net": {"country": "Italy", "city": "Milan", "location": "it"},
-    "ru1.node.check-host.net": {"country": "Russia", "city": "Moscow", "location": "ru"},
-    "ru2.node.check-host.net": {"country": "Russia", "city": "St. Petersburg", "location": "ru"},
-    "ru3.node.check-host.net": {"country": "Russia", "city": "Novosibirsk", "location": "ru"},
-    "ru4.node.check-host.net": {"country": "Russia", "city": "Khabarovsk", "location": "ru"},
-    "ua1.node.check-host.net": {"country": "Ukraine", "city": "Kyiv", "location": "ua"},
-    "kz1.node.check-host.net": {"country": "Kazakhstan", "city": "Almaty", "location": "kz"},
-    "by1.node.check-host.net": {"country": "Belarus", "city": "Minsk", "location": "by"},
-    "ir1.node.check-host.net": {"country": "Iran", "city": "Tehran", "location": "ir"},
-    "ir3.node.check-host.net": {"country": "Iran", "city": "Shiraz", "location": "ir"},
-    "tr1.node.check-host.net": {"country": "Turkey", "city": "Istanbul", "location": "tr"},
-    "hk1.node.check-host.net": {"country": "Hong Kong", "city": "Hong Kong", "location": "hk"},
-    "sg1.node.check-host.net": {"country": "Singapore", "city": "Singapore", "location": "sg"},
-    "jp1.node.check-host.net": {"country": "Japan", "city": "Tokyo", "location": "jp"},
-    "md1.node.check-host.net": {"country": "Moldova", "city": "Chisinau", "location": "md"},
-    "br1.node.check-host.net": {"country": "Brazil", "city": "Sao Paulo", "location": "br"},
-    "au1.node.check-host.net": {"country": "Australia", "city": "Sydney", "location": "au"},
-    "ch1.node.check-host.net": {"country": "Switzerland", "city": "Zurich", "location": "ch"},
-    "se1.node.check-host.net": {"country": "Sweden", "city": "Stockholm", "location": "se"},
-    "fi1.node.check-host.net": {"country": "Finland", "city": "Helsinki", "location": "fi"},
-    "cl1.node.check-host.net": {"country": "Chile", "city": "Santiago", "location": "cl"},
-    "za1.node.check-host.net": {"country": "South Africa", "city": "Johannesburg", "location": "za"},
-    "in1.node.check-host.net": {"country": "India", "city": "Mumbai", "location": "in"},
-    "kr1.node.check-host.net": {"country": "South Korea", "city": "Seoul", "location": "kr"},
-    "vn1.node.check-host.net": {"country": "Vietnam", "city": "Ho Chi Minh", "location": "vn"},
-    "id1.node.check-host.net": {"country": "Indonesia", "city": "Jakarta", "location": "id"},
-    "ae1.node.check-host.net": {"country": "United Arab Emirates", "city": "Dubai", "location": "ae"},
-    "bg1.node.check-host.net": {"country": "Bulgaria", "city": "Sofia", "location": "bg"},
-    "cz1.node.check-host.net": {"country": "Czech Republic", "city": "Prague", "location": "cz"},
-    "at1.node.check-host.net": {"country": "Austria", "city": "Vienna", "location": "at"},
-    "ro1.node.check-host.net": {"country": "Romania", "city": "Bucharest", "location": "ro"},
-    "rs1.node.check-host.net": {"country": "Serbia", "city": "Belgrade", "location": "rs"},
-    "lt1.node.check-host.net": {"country": "Lithuania", "city": "Vilnius", "location": "lt"},
-    "lv1.node.check-host.net": {"country": "Latvia", "city": "Riga", "location": "lv"},
-    "ee1.node.check-host.net": {"country": "Estonia", "city": "Tallinn", "location": "ee"},
-    "ge1.node.check-host.net": {"country": "Georgia", "city": "Tbilisi", "location": "ge"},
-    "uz1.node.check-host.net": {"country": "Uzbekistan", "city": "Tashkent", "location": "uz"},
-    "kg1.node.check-host.net": {"country": "Kyrgyzstan", "city": "Bishkek", "location": "kg"},
-    "th1.node.check-host.net": {"country": "Thailand", "city": "Bangkok", "location": "th"},
-    "my1.node.check-host.net": {"country": "Malaysia", "city": "Kuala Lumpur", "location": "my"},
-    "ph1.node.check-host.net": {"country": "Philippines", "city": "Manila", "location": "ph"},
-    "mx1.node.check-host.net": {"country": "Mexico", "city": "Mexico City", "location": "mx"},
-    "ar1.node.check-host.net": {"country": "Argentina", "city": "Buenos Aires", "location": "ar"},
-    "co1.node.check-host.net": {"country": "Colombia", "city": "Bogota", "location": "co"},
-    "pe1.node.check-host.net": {"country": "Peru", "city": "Lima", "location": "pe"},
-    "ng1.node.check-host.net": {"country": "Nigeria", "city": "Lagos", "location": "ng"},
-    "eg1.node.check-host.net": {"country": "Egypt", "city": "Cairo", "location": "eg"},
-    "il1.node.check-host.net": {"country": "Israel", "city": "Tel Aviv", "location": "il"},
-    "sa1.node.check-host.net": {"country": "Saudi Arabia", "city": "Riyadh", "location": "sa"},
-    "pt1.node.check-host.net": {"country": "Portugal", "city": "Lisbon", "location": "pt"},
-    "ie1.node.check-host.net": {"country": "Ireland", "city": "Dublin", "location": "ie"},
-    "no1.node.check-host.net": {"country": "Norway", "city": "Oslo", "location": "no"},
-    "dk1.node.check-host.net": {"country": "Denmark", "city": "Copenhagen", "location": "dk"},
-    "gr1.node.check-host.net": {"country": "Greece", "city": "Athens", "location": "gr"},
-    "hu1.node.check-host.net": {"country": "Hungary", "city": "Budapest", "location": "hu"},
-    "be1.node.check-host.net": {"country": "Belgium", "city": "Brussels", "location": "be"},
-    "cn1.node.check-host.net": {"country": "China", "city": "Shanghai", "location": "cn"},
-    "cn2.node.check-host.net": {"country": "China", "city": "Beijing", "location": "cn"},
-    "tw1.node.check-host.net": {"country": "Taiwan", "city": "Taipei", "location": "tw"},
-    "nz1.node.check-host.net": {"country": "New Zealand", "city": "Auckland", "location": "nz"}
-}
+# Check-Host can keep results pending when too many jobs are created at once.
+CHECK_HOST_CONCURRENCY = max(1, int(os.getenv("CHECK_HOST_CONCURRENCY", "1")))
+CHECK_HOST_MAX_WAIT = max(30, int(os.getenv("CHECK_HOST_MAX_WAIT", "180")))
+CHECK_HOST_POLL_INTERVAL = max(3, int(os.getenv("CHECK_HOST_POLL_INTERVAL", "7")))
+CHECK_HOST_MAX_RETRIES = max(1, int(os.getenv("CHECK_HOST_MAX_RETRIES", "3")))
+CHECK_HOST_AUTO_FALLBACK = os.getenv("CHECK_HOST_AUTO_FALLBACK", "1").lower() not in {"0", "false", "no"}
+CHECK_HOST_AUTO_MAX_NODES = max(1, int(os.getenv("CHECK_HOST_AUTO_MAX_NODES", "3")))
 
-async def _fetch_nodes_dynamically() -> Optional[Dict[str, Any]]:
-    """Tries to fetch nodes by parsing the website's JS, with a strict timeout."""
-    url = f"{API_BASE_URL}/check-ping"
+_CHECK_HOST_SEMAPHORE = asyncio.Semaphore(CHECK_HOST_CONCURRENCY)
+
+
+async def _fetch_nodes_from_api() -> Optional[Dict[str, Any]]:
+    """Fetch current Check-Host nodes from the official API endpoint only.
+
+    This function intentionally does not scrape any website JavaScript. If this fails,
+    the caller should keep using the user-configured node list rather than falling back
+    to an old hard-coded list.
+    """
+    url = f"{API_BASE_URL}/nodes/hosts"
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            response = await asyncio.wait_for(client.get(url, headers=REQUEST_HEADERS), timeout=15.0)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=REQUEST_HEADERS)
             response.raise_for_status()
-            
-        match = re.search(r'var\s+permanent_nodes\s*=\s*({.*?});', response.text)
-        if not match:
-            logger.error("Could not find 'permanent_nodes' variable in page content.")
+            payload = response.json()
+
+        raw_nodes = payload.get("nodes", {})
+        if not isinstance(raw_nodes, dict) or not raw_nodes:
+            logger.warning(f"Official Check-Host nodes API returned no usable nodes: {payload}")
             return None
 
-        nodes_data = json.loads(match.group(1))
-        formatted_nodes = {}
-        for node_key, info in nodes_data.items():
-            if info and isinstance(info, dict) and all(k in info for k in ['country', 'city', 'location']):
-                node_id = f"{node_key}.node.check-host.net"
-                formatted_nodes[node_id] = {"country": info["country"], "city": info["city"], "location": info["location"]}
-        
-        logger.info(f"Successfully parsed {len(formatted_nodes)} nodes from website.")
-        return formatted_nodes
-    except asyncio.TimeoutError:
-        logger.error("Dynamic node fetch timed out.")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to fetch or parse nodes page dynamically: {e}")
+        formatted: Dict[str, Any] = {}
+        for node_id, info in raw_nodes.items():
+            if not isinstance(info, dict):
+                continue
+            location = info.get("location")
+            if not isinstance(location, list) or len(location) < 3:
+                continue
+            formatted[node_id] = {
+                "location": location[0],
+                "country": location[1],
+                "city": location[2],
+                "ip": info.get("ip"),
+                "asn": info.get("asn"),
+            }
+
+        logger.info(f"Fetched {len(formatted)} Check-Host nodes from official API.")
+        return formatted or None
+
+    except Exception as exc:
+        logger.warning(f"Could not fetch Check-Host nodes from official API: {exc}")
         return None
 
+
 async def get_nodes() -> Dict[str, Any]:
-    """
-    Gets the list of nodes, prioritizing a recent cache, then a dynamic fetch,
-    and finally falling back to a static list.
+    """Return Check-Host nodes from cache or official API.
+
+    No scraping and no stale built-in static node table are used in this version.
     """
     if os.path.exists(NODES_CACHE_FILE):
         try:
-            with open(NODES_CACHE_FILE, 'r', encoding='utf-8') as f:
+            with open(NODES_CACHE_FILE, "r", encoding="utf-8") as f:
                 cache_data = json.load(f)
-            timestamp = datetime.fromisoformat(cache_data['timestamp'])
-            if datetime.now() - timestamp < timedelta(hours=CACHE_EXPIRATION_HOURS):
-                logger.info("Using recent cache of nodes.")
-                return cache_data['nodes']
+            timestamp = datetime.fromisoformat(cache_data["timestamp"])
+            nodes = cache_data.get("nodes", {})
+            if isinstance(nodes, dict) and nodes and datetime.now() - timestamp < timedelta(hours=CACHE_EXPIRATION_HOURS):
+                logger.info(f"Using cached Check-Host nodes: {len(nodes)} node(s).")
+                return nodes
         except Exception:
-            logger.warning("Cache file is corrupted or invalid. Will fetch fresh data.")
+            logger.warning("Check-Host nodes cache is invalid. Fetching fresh nodes.")
 
-    logger.info("Cache is old or missing. Attempting to fetch fresh nodes list.")
-    fresh_nodes = await _fetch_nodes_dynamically()
-    
-    nodes_to_use = fresh_nodes
-    source = "dynamically fetched"
+    fresh = await _fetch_nodes_from_api()
+    if fresh:
+        try:
+            with open(NODES_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"timestamp": datetime.now().isoformat(), "nodes": fresh}, f, indent=2)
+            logger.info("Updated Check-Host nodes cache from official API.")
+        except IOError as exc:
+            logger.warning(f"Could not write Check-Host nodes cache: {exc}")
+        return fresh
 
-    if not fresh_nodes:
-        logger.warning("Dynamic fetch failed. Falling back to the static nodes list.")
-        nodes_to_use = STATIC_NODES_DATA
-        source = "static fallback"
+    logger.warning("No fresh Check-Host nodes list is available. Continuing with configured nodes only.")
+    return {}
 
+
+def _dedupe(items: List[str]) -> List[str]:
+    return list(dict.fromkeys([x for x in items if x]))
+
+
+def _tcp_node_result_finished(result_data: Any) -> bool:
+    """Return True if a TCP node has produced a final success/failure result.
+
+    Check-Host TCP examples:
+      success: [{"time": 0.03, "address": "1.2.3.4"}]
+      failure: [{"error": "Connection timed out"}]
+      pending: null
+    """
+    if result_data is None:
+        return False
+    if result_data in ([], [None], [[None]]):
+        return False
+    if isinstance(result_data, list) and result_data:
+        first = result_data[0]
+        if first is None or first == [None]:
+            return False
+        if isinstance(first, dict):
+            return "time" in first or "error" in first
+    return True
+
+
+def _tcp_node_result_ok(result_data: Any) -> bool:
+    if not _tcp_node_result_finished(result_data):
+        return False
+    if isinstance(result_data, list) and result_data and isinstance(result_data[0], dict):
+        first = result_data[0]
+        return "time" in first and "error" not in first
+    return False
+
+
+def _summarize_snapshot(snapshot: Optional[Dict[str, Any]], limit: int = 1200) -> str:
     try:
-        with open(NODES_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'timestamp': datetime.now().isoformat(), 'nodes': nodes_to_use}, f, indent=2)
-        logger.info(f"Updated cache file with {source} data.")
-    except IOError as e:
-        logger.error(f"Could not write to cache file: {e}")
-    
-    return nodes_to_use
+        text = json.dumps(snapshot, ensure_ascii=False)
+    except Exception:
+        text = repr(snapshot)
+    return text[:limit] + ("..." if len(text) > limit else "")
+
 
 async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str, bool]]:
-    """
-    Performs a full TCP check with intelligent polling, result stability checks,
-    and a retry mechanism for server-side errors (e.g., 503).
-    """
-    if not nodes:
-        return {}
-        
-    target = f"{host}:{port}"
-    unique_nodes = list(set(nodes))
-    node_params = "&".join([f"node={node}" for node in unique_nodes])
-    check_url = f"{API_BASE_URL}/check-tcp?host={target}&{node_params}"
-    
-    max_retries = 3
-    retry_delay = 5
+    """Perform a TCP check with Check-Host.
 
-    for attempt in range(max_retries):
+    This version:
+      - never scrapes the website page;
+      - validates nodes using the official nodes API when available;
+      - polls only nodes accepted by Check-Host in the initial response;
+      - accepts partial final results;
+      - throttles concurrent Check-Host jobs;
+      - falls back to Check-Host auto-selected nodes if configured nodes stay pending.
+    """
+    async with _CHECK_HOST_SEMAPHORE:
+        return await _perform_check_limited(host, port, nodes)
+
+
+async def _perform_check_limited(host: str, port: int, nodes: list) -> Optional[Dict[str, bool]]:
+    target = f"{host}:{port}"
+    requested_nodes = _dedupe(list(nodes or []))
+
+    # Validate selected nodes if the official list is available. Do not hard-fail if it is unavailable.
+    try:
+        live_nodes = await get_nodes()
+        if live_nodes and requested_nodes:
+            valid_nodes = [node for node in requested_nodes if node in live_nodes]
+            stale_nodes = [node for node in requested_nodes if node not in live_nodes]
+            if stale_nodes:
+                logger.warning(f"Ignoring stale/unknown Check-Host nodes for {target}: {stale_nodes}")
+            requested_nodes = valid_nodes
+    except Exception as exc:
+        logger.warning(f"Could not validate Check-Host nodes for {target}: {exc}")
+
+    modes: List[Tuple[str, Optional[List[str]]]] = []
+    if requested_nodes:
+        modes.append(("configured_nodes", requested_nodes))
+    if CHECK_HOST_AUTO_FALLBACK:
+        modes.append(("auto_nodes", None))
+
+    if not modes:
+        logger.error(f"No Check-Host nodes available for {target}.")
+        return None
+
+    for mode_name, mode_nodes in modes:
+        result = await _attempt_check_mode(target, mode_name, mode_nodes)
+        if result is not None:
+            return result
+        if mode_name == "configured_nodes" and CHECK_HOST_AUTO_FALLBACK:
+            logger.warning(f"Configured Check-Host nodes did not produce usable results for {target}; trying auto-selected nodes.")
+
+    return None
+
+
+async def _attempt_check_mode(target: str, mode_name: str, mode_nodes: Optional[List[str]]) -> Optional[Dict[str, bool]]:
+    retry_delay = 8
+
+    for attempt in range(CHECK_HOST_MAX_RETRIES):
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(check_url, headers=REQUEST_HEADERS, timeout=30)
+            await asyncio.sleep(random.uniform(0.4, 1.5))
+
+            async with httpx.AsyncClient(timeout=40.0, follow_redirects=True) as client:
+                if mode_nodes:
+                    params = [("host", target)] + [("node", node) for node in mode_nodes]
+                else:
+                    params = [("host", target), ("max_nodes", str(CHECK_HOST_AUTO_MAX_NODES))]
+
+                logger.info(
+                    f"Starting Check-Host TCP check for {target} using {mode_name} "
+                    f"(attempt {attempt + 1}/{CHECK_HOST_MAX_RETRIES}, params={params})."
+                )
+
+                response = await client.get(f"{API_BASE_URL}/check-tcp", headers=REQUEST_HEADERS, params=params)
                 response.raise_for_status()
-                
                 initial_data = response.json()
-                request_id = initial_data.get('request_id')
+
+                if not initial_data.get("ok"):
+                    logger.warning(f"Check-Host initial response not ok for {target}: {initial_data}")
+
+                request_id = initial_data.get("request_id")
                 if not request_id:
-                    logger.error(f"No request_id from Check-Host for {target}.")
+                    logger.error(f"No request_id from Check-Host for {target}. Response: {initial_data}")
                     return None
 
-                result_url = f"{API_BASE_URL}/check-result/{request_id}"
-                results = None
-                max_wait_time = 20
-                poll_interval = 5
-                
-                logger.info(f"Check-Host task for {target} (ID: {request_id}). Polling for results...")
+                initial_nodes = initial_data.get("nodes") or {}
+                actual_nodes = list(initial_nodes.keys()) if isinstance(initial_nodes, dict) else []
+                if not actual_nodes and mode_nodes:
+                    actual_nodes = mode_nodes
 
-                for _ in range(max_wait_time // poll_interval):
-                    await asyncio.sleep(poll_interval)
-                    
-                    result_response = await client.get(result_url, headers=REQUEST_HEADERS, timeout=20)
+                if not actual_nodes:
+                    logger.warning(f"Check-Host accepted no nodes for {target}. Initial response: {initial_data}")
+                    return None
+
+                logger.info(
+                    f"Check-Host task for {target} created: request_id={request_id}, "
+                    f"mode={mode_name}, accepted_nodes={actual_nodes}"
+                )
+
+                result_url = f"{API_BASE_URL}/check-result/{request_id}"
+                results: Optional[Dict[str, Any]] = None
+                last_snapshot: Optional[Dict[str, Any]] = None
+                best_completed_count = 0
+
+                for _ in range(max(1, CHECK_HOST_MAX_WAIT // CHECK_HOST_POLL_INTERVAL)):
+                    await asyncio.sleep(CHECK_HOST_POLL_INTERVAL)
+
+                    result_response = await client.get(result_url, headers=REQUEST_HEADERS, timeout=40.0)
                     if result_response.status_code != 200:
+                        logger.warning(f"Polling {request_id} returned HTTP {result_response.status_code}.")
                         continue
-                    
+
                     current_results = result_response.json()
-                    
-                    if all(current_results.get(node) is not None for node in unique_nodes):
+                    last_snapshot = current_results
+                    completed_count = sum(
+                        1 for node in actual_nodes
+                        if _tcp_node_result_finished(current_results.get(node))
+                    )
+
+                    if completed_count > best_completed_count:
+                        best_completed_count = completed_count
                         results = current_results
+                        logger.info(
+                            f"Check-Host progress for {target} request_id={request_id}: "
+                            f"{completed_count}/{len(actual_nodes)} node(s) finished."
+                        )
+
+                    if completed_count == len(actual_nodes):
                         break
 
                 if not results:
-                    logger.warning(f"Could not get a final result for request {request_id}.")
-                    if attempt < max_retries - 1:
-                        logger.info(f"Retrying entire check for {target} due to incomplete results.")
+                    logger.warning(
+                        f"Check-Host request_id={request_id} for {target} produced no usable TCP result after "
+                        f"{CHECK_HOST_MAX_WAIT}s in mode={mode_name}. Last raw snapshot: {_summarize_snapshot(last_snapshot)}"
+                    )
+                    if attempt < CHECK_HOST_MAX_RETRIES - 1:
+                        logger.info(f"Retrying {target} in {retry_delay}s.")
                         await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
                         continue
-                    else:
-                        logger.error(f"All retries failed to get complete results for {target}.")
-                        return None
+                    return None
 
+                logger.info(
+                    f"FINAL Check-Host TCP result for {target} request_id={request_id}: "
+                    f"{_summarize_snapshot(results, limit=2000)}"
+                )
 
-                logger.info(f"FINAL RAW API RESULT for request_id {request_id} on host {target} -> {results}")
+                final_statuses: Dict[str, bool] = {}
+                for node_id in actual_nodes:
+                    # Missing/pending nodes are treated as failed from that node, not as a global failure.
+                    final_statuses[node_id] = _tcp_node_result_ok(results.get(node_id))
 
-                final_statuses = {}
-                for node_id in unique_nodes:
-                    result_data = results.get(node_id)
-                    is_ok = (result_data and isinstance(result_data, list) and len(result_data) > 0 and 
-                             isinstance(result_data[0], dict) and 'time' in result_data[0])
-                    final_statuses[node_id] = is_ok
-                
                 return final_statuses
 
-        except httpx.ReadTimeout as e:
-            logger.warning(f"Attempt {attempt + 1}/{max_retries} for {target} failed with ReadTimeout.")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                logger.error(f"All {max_retries} retries failed for {target} due to ReadTimeout. Giving up.")
-        except httpx.HTTPStatusError as e:
-            if 500 <= e.response.status_code < 600:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries} for {target} failed with server error {e.response.status_code}.")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay}s...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    logger.error(f"All {max_retries} retries failed for {target}. Giving up.")
-            else:
-                logger.error(f"A non-retriable HTTP error occurred for {target}: {e}", exc_info=True)
-                return None
-        except Exception as e:
-            logger.error(f"An unexpected generic error in perform_check for {target}: {e}", exc_info=True)
+        except httpx.ReadTimeout:
+            logger.warning(f"Attempt {attempt + 1}/{CHECK_HOST_MAX_RETRIES} for {target} failed with ReadTimeout.")
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.warning(f"Attempt {attempt + 1}/{CHECK_HOST_MAX_RETRIES} for {target} failed with HTTP {status_code}.")
+        except Exception as exc:
+            logger.error(f"Unexpected error during Check-Host check for {target}: {exc}", exc_info=True)
             return None
+
+        if attempt < CHECK_HOST_MAX_RETRIES - 1:
+            logger.info(f"Retrying {target} in {retry_delay}s.")
+            await asyncio.sleep(retry_delay)
+            retry_delay *= 2
 
     return None
