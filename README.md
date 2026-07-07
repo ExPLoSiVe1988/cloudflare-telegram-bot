@@ -3,132 +3,133 @@
 </div>
 <br>
 
-# Cloudflare Management Bot 🐳
-A powerful Telegram bot for complete DNS record management and intelligent monitoring. Equipped with **Standalone Monitoring**, **Automatic Failover**, and **Smart Load Balancing**, this bot is your all-in-one solution for ensuring maximum uptime and performance.
+# ربات مدیریت کلادفلر 🐳
+یک ربات تلگرامی قدرتمند برای مدیریت کامل رکوردهای DNS و مانیتورینگ هوشمند. این ربات با مجهز بودن به سه سیستم **مانیتورینگ مستقل**، **Failover خودکار** و **Load Balancing هوشمند**، راه حل جامع شما برای تضمین حداکثر آپ‌تایم و بهترین عملکرد است.
 
 ---
 <div align="center">
   <a href="https://www.youtube.com/watch?v=OOQ9rtHqeFQ" target="_blank">
-    <img src="https://img.youtube.com/vi/OOQ9rtHqeFQ/hqdefault.jpg" alt="Watch the video tutorial" width="320">
+    <img src="https://img.youtube.com/vi/OOQ9rtHqeFQ/hqdefault.jpg" alt="ویدیوی آموزش کامل" width="320">
   </a>
-  <p><strong>Click the image above to watch the full video tutorial on YouTube</strong></p>
+  <p><strong>برای مشاهده ویدیوی کامل آموزش، روی تصویر بالا کلیک کنید</strong></p>
 </div>
 
-## ✨ Features
+## ✨ قابلیت‌ها
 
-### 🚀 Universal & Advanced Monitoring
-*   👁️ **Standalone Monitoring**: Monitor any IP or domain (like a database server or a third-party API) independently of your Cloudflare DNS, with instant up/down alerts.
-*   🎯 **Targeted Notification System**:
-    *   Define specific alert recipients (individual users or entire Telegram groups) for **each individual Failover/LB Rule or Standalone Monitor**.
-    *   Alerts are delivered only to the responsible teams, preventing alert fatigue and spam.
-*   📍 **Centralized Monitoring Groups**: Create reusable groups of monitoring locations (e.g., "Europe," "Asia") with a defined failure threshold. Assign these groups to any monitor or policy for fast, consistent, and easily manageable setups.
-*   🛡️ **Automatic Failover (High Availability)**: If a primary server goes down, the bot automatically switches DNS records to a healthy backup IP from your predefined list.
-*   🚦 **Advanced Weighted Load Balancing**:
-    *   **Weighted IP Pools**: Distribute traffic proportionally based on server capacity (e.g., `1.1.1.1:2, 2.2.2.2:1`).
-    *   **Two Intelligent Algorithms**: Choose between **Weighted Random** and **Weighted Round-Robin** (default).
-*   📊 **Advanced Reporting & Analytics**:
-    *   **Time-Based Analytics**: Load Balancer reports now show the **total time (hours) and percentage** each IP was active, providing a true reflection of traffic distribution.
-    *   Generate on-demand reports for custom timeframes and manage log retention policies.
+### 🚀 مانیتورینگ جامع و پیشرفته
+*   👁️ **مانیتورینگ مستقل**: هر IP یا دامنه‌ای (مانند سرور دیتابیس) را به صورت مستقل مانیتور کرده و در صورت قطعی، هشدار فوری دریافت کنید.
+*   🎯 **سیستم اطلاع‌رسانی هدفمند:**
+    *   برای **هر قانون (Failover/LB) یا هر مانیتور مستقل**، گیرندگان هشدار (کاربران شخصی یا گروه‌های تلگرام) را به صورت **کاملاً مجزا** تعریف کنید.
+    *   هشدارها فقط به دست افراد و تیم‌های مسئول می‌رسد و از اسپم و خستگی از هشدار جلوگیری می‌شود.
+*   📍 **گروه‌های مانیتورینگ متمرکز**: مجموعه‌های قابل استفاده مجدد از شهرهای مانیتورینگ (مثلاً "اروپا"، "آسیا") را به همراه آستانه خطا تعریف کنید و به راحتی به هر مانیتور یا قانونی اختصاص دهید.
+*   🛡️ **Failover خودکار (High Availability)**: در صورت قطعی سرور اصلی، ربات به صورت خودکار رکوردهای DNS را به یک IP بکاپ سالم تغییر می‌دهد.
+*   🚦 **لود بالانسینگ وزن‌دار پیشرفته**:
+    *   **تعیین وزن برای IPها**: ترافیک را بر اساس ظرفیت سرورها توزیع کنید (مثال: `1.1.1.1:2`).
+    *   **دو الگوریتم هوشمند**: بین الگوریتم‌های **تصادفی وزن‌دار** و **چرخشی وزن‌دار** (پیش‌فرض) انتخاب کنید.
+*   📊 **گزارش‌گیری و تحلیل پیشرفته**:
+    *   **تحلیل مبتنی بر زمان**: گزارش‌های لود بالانسر اکنون **مجموع زمان (به ساعت) و درصد** فعال بودن هر IP را نمایش می‌دهند.
+    *   گزارش‌های مانیتورینگ را برای بازه‌های زمانی دلخواه تولید کرده و قوانین حذف خودکار لاگ‌ها را مدیریت کنید.
 
-### ⚙️ Advanced DNS & User Management
-*   **🏷️ Zone & Record Aliases**: Assign friendly display names to both your zones (domains) and individual records for much easier identification and management.
-*   **👥 Advanced In-Bot User Management**:
-    *   **Super Admins** (from `.env`) can manage **Regular Admins** directly within the bot.
-*   **📤 Move & Copy Records**: Easily migrate DNS records between different zones, even across different Cloudflare accounts.
-*   **🔄 Convert Record Types**: Change a record's type (e.g., from `A` to `CNAME`) on the fly.
-*   **👥 Bulk Actions**: Delete or change the IP for multiple records at once.
-*   **💾 Backup & Restore**: Create and restore `.json` backups for any of your zones.
+### ⚙️ مدیریت پیشرفته DNS و کاربران
+*   **🏷️ نام نمایشی (Alias) برای دامنه‌ها و رکوردها**: برای شناسایی و مدیریت آسان‌تر، به دامنه‌ها و رکوردهای خود نام‌های نمایشی دلخواه اختصاص دهید.
+*   **👥 مدیریت پیشرفته کاربران از داخل ربات**:
+    *   **ادمین‌های اصلی** (تعریف شده در فایل `.env`) می‌توانند **ادمین‌های عادی** را مستقیماً از داخل ربات مدیریت کنند.
+*   **📤 انتقال و کپی رکورد**: رکوردهای DNS را به راحتی بین دامنه‌های مختلف یا حتی اکانت‌های مختلف کلادفلر جابجا کنید.
+*   **🔄 تبدیل نوع رکورد**: نوع یک رکورد را (مثلاً از `A` به `CNAME`) به صورت آنی تغییر دهید.
+*   **👥 عملیات گروهی**: چندین رکورد را به صورت همزمان حذف یا IP آن‌ها را تغییر دهید.
+*   **💾 پشتیبان‌گیری و بازیابی**: از رکوردهای دامنه‌های خود بکاپ `.json` تهیه و بازیابی کنید.
 
-### 🤖 General Bot & UX
-*   **📄 Zone List Pagination**: No more endless scrolling if you manage many domains. The zone list (`/list`) is now paginated for easier and faster navigation.
-*   **🚀 Quick Setup Wizard**: A step-by-step wizard guides new users through creating their first monitoring rule effortlessly.
-*   **📊 `/status` Command**: Get an instant, real-time overview of the health of all your configured policies and monitors.
-*   **🧠 Automatic Data Migration**: The bot intelligently detects old `config.json` files (including old notification structures) and automatically updates them to the new format without deleting user data.
-*   **🐳 Smart & Safe Installation Script**: The management script warns you before overwriting settings on reinstall and offers to back up `config.json`.
-*   **🎨 Revamped UI (HTML)**, **Multi-Account Support**, and **Multi-Language**.
+### 🤖 قابلیت‌های عمومی و تجربه کاربری
+*   **📄 صفحه‌بندی لیست دامنه‌ها**: اگر تعداد زیادی دامنه دارید، دیگر با یک لیست طولانی مواجه نخواهید شد. لیست دامنه‌ها (`/list`) حالا به صورت صفحه‌بندی شده نمایش داده می‌شود.
+*   **🚀 راه‌انداز سریع (Wizard)**: یک راهنمای قدم به قدم، کاربران تازه‌وارد را برای ساخت اولین قانون مانیتورینگ خود به سادگی هدایت می‌کند.
+*   **📊 دستور `/status`**: با یک دستور ساده، خلاصه‌ای از وضعیت آنلاین/آفلاین تمام قوانین و مانیتورهای خود را در لحظه دریافت کنید.
+*   **🧠 مهاجرت خودکار داده‌ها**: ربات به صورت هوشمند فایل‌های `config.json` قدیمی (شامل ساختار اطلاع‌رسانی قدیمی) را شناسایی کرده و بدون حذف داده‌های کاربر، آن‌ها را به ساختار جدید ارتقا می‌دهد.
+*   **🐳 اسکریپت نصب هوشمند و امن**: اسکریپت مدیریت اکنون قبل از بازنویسی تنظیمات در هنگام نصب مجدد، به شما هشدار داده و گزینه تهیه پشتیبان از `config.json` را ارائه می‌دهد.
+*   **🎨 رابط کاربری بازطراحی شده (HTML)**، **پشتیبانی از چند اکانت** و **چند زبانه**.
 
 ---
 
 <div align="center">
-  <h3>💖 Show Your Support</h3>
-  <p>If this project has been helpful, please give it a star on GitHub to show your appreciation!</p>
+  <h3>💖 حمایت از پروژه</h3>
+  <p>اگر این پروژه برای شما مفید بوده است، لطفاً با دادن یک ستاره در گیت‌هاب از آن حمایت کنید!</p>
   <a href="https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot/stargazers">
-    <img src="https://img.shields.io/github/stars/ExPLoSiVe1988/cloudflare-telegram-bot?style=for-the-badge&logo=github&color=FFDD00&logoColor=black" alt="Star the project on GitHub">
+    <img src="https://img.shields.io/github/stars/ExPLoSiVe1988/cloudflare-telegram-bot?style=for-the-badge&logo=github&color=FFDD00&logoColor=black" alt="به پروژه در گیت‌هاب ستاره دهید">
   </a>
 </div>
 
-## 🚀 Installation
+## 🚀 نصب و راه‌اندازی
 
-This bot is designed to run with Docker. The provided script automates the entire setup process.
+این ربات برای اجرا با داکر طراحی شده است. اسکریپت ارائه شده، تمام مراحل راه‌اندازی را به صورت خودکار انجام می‌دهد.
 
-### Automated Installation
+### نصب اتوماتیک
 
-You can install either the latest stable version or the development version. For most users, **installing the latest stable version** is recommended.
-
-To install the latest development version from the `main` branch, run:
+شما می‌توانید آخرین نسخه پایدار یا نسخه در حال توسعه را نصب کنید. برای اکثر کاربران، **نصب آخرین نسخه پایدار** توصیه می‌شود.
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/main/install.sh)
 ```
-To install a specific stable version, please replace `<VERSION>` with the latest version number from the [Releases](https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot/releases) page (e.g., `v4.1.2`).
+دستور زیر را در ترمینال سرور خود اجرا کنید. لطفاً `<VERSION>` را با آخرین شماره نسخه موجود در صفحه [Releases](https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot/releases) جایگزین کنید (مثلاً `v4.1.2`).
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/<VERSION>/install.sh)
 ```
-The script provides a full management menu:
-*   **Install or Reinstall Bot:** Clones the repository, allows you to choose the desired version (latest or stable), prompts for initial configuration (`.env`), and installs/runs the bot using Docker Compose.
-*   **Update Bot from GitHub:** Fetches the latest code from GitHub. To apply the update, you should then run the "Install or Reinstall Bot" option again.
-*   **Edit Core Configuration (.env):** Opens a text editor to let you modify the bot's essential settings (tokens and admins) at any time.
-*   **View Live Logs:** Shows the real-time output of the bot for monitoring and debugging.
-*   **Stop Bot / Start Bot:** Allows you to stop or start the bot's container without removing any data.
-*   **Remove Bot Completely:** Stops the container and completely removes all associated data, config files, containers, and images.
+اسکریپت یک منوی مدیریتی کامل در اختیار شما قرار می‌دهد:
+*   **Install or Reinstall Bot:** ریپازیتوری را دانلود کرده، به شما اجازه می‌دهد نسخه مورد نظر (آخرین یا پایدار) را انتخاب کنید، تنظیمات اولیه (`.env`) را از شما می‌پرسد و ربات را با Docker Compose نصب و اجرا می‌کند.
+*   **Update Bot from GitHub:** آخرین کدها را از گیت‌هاب دریافت می‌کند. برای اعمال آپدیت، شما باید پس از آن گزینه "Install or Reinstall Bot" را مجدداً اجرا کنید.
+*   **Edit Core Configuration (.env):** یک ویرایشگر متنی باز می‌کند تا بتوانید تنظیمات اصلی ربات (توکن‌ها و ادمین‌ها) را در هر زمان ویرایش کنید.
+*   **View Live Logs:** لاگ‌های زنده ربات را برای نظارت و اشکال‌زدایی نمایش می‌دهد.
+*   **Stop Bot / Start Bot:** به شما اجازه می‌دهد کانتینر ربات را بدون حذف داده‌ها، متوقف یا راه‌اندازی مجدد کنید.
+*   **Remove Bot Completely:** کانتینر را متوقف کرده و تمام داده‌ها، فایل‌های کانفیگ، کانتینرها و ایمیج‌های مرتبط را به طور کامل حذف می‌کند.
 
 ---
 
-## ⚙️ Configuration
+## ⚙️ تنظیمات
 
-The installation script will create an `.env` file for you with the following structure. You can manage it later using the "Edit Core Configuration" option in the script.
+اسکریپت نصب یک فایل `.env` با ساختار زیر برای شما ایجاد می‌کند. شما می‌توانید بعداً با استفاده از گزینه "Edit Configuration" در اسکریپت، آن را مدیریت کنید.
 
-*   `TELEGRAM_ADMIN_IDS`:  A comma-separated list of Super Admin User IDs. These users have full control, including the ability to manage other admins from within the bot.
-*   `CF_ACCOUNTS`: A comma-separated list of your Cloudflare accounts in the format `Nickname1:Token1,Nickname2:Token2`. The nickname is a friendly name you choose for each account.
-*   `TELEGRAM_BOT_TOKEN`: The API token for your Telegram bot from @BotFather.
-
----
-
-## 🤖 Bot Management
-
-If you prefer to use commands directly, `cd` into the project directory (`cloudflare-telegram-bot`) and use these `docker-compose` commands:
-
-| Action                      | Command                                   |
-| :-------------------------- | :---------------------------------------- |
-| **View Live Logs**          | `docker-compose logs -f`                  |
-| **Update to Latest Version**| `docker-compose pull && docker-compose up -d` |
-| **Stop and Remove Container** | `docker-compose down`                     |
+*   `TELEGRAM_ADMIN_IDS`:  لیستی از آیدی‌های عددی ادمین‌های اصلی (Super Admins). این کاربران کنترل کامل بر ربات، از جمله توانایی مدیریت سایر ادمین‌ها از داخل ربات را دارند.
+*   `CF_ACCOUNTS`: لیستی از اکانت‌های کلادفلر شما (جدا شده با کاما) با فرمت `Nickname1:Token1,Nickname2:Token2`. نیک‌نیم یک نام دلخواه است که شما برای هر اکانت انتخاب می‌کنید.
+*   `TELEGRAM_BOT_TOKEN`: توکن API ربات تلگرام شما از @BotFather.
 
 ---
 
-### Cloudflare API Token Permissions
-For each Cloudflare account, your API token needs the following permissions:
+## 🤖 مدیریت ربات
 
-| Type | Resource | Access |
-| :--- | :---     | :---   |
-| **Zone** | **DNS**    | `Edit` |
-| **Zone** | **Zone**   | `Read` |
+اگر ترجیح می‌دهید مستقیماً از دستورات استفاده کنید، وارد پوشه پروژه (`cloudflare-telegram-bot`) شده و از دستورات `docker-compose` زیر استفاده کنید:
 
-Go to [API Tokens](https://dash.cloudflare.com/profile/api-tokens) and create a custom token with these two permissions applied to `All zones`.
+| عملکرد | دستور |
+| :--- | :--- |
+| **مشاهده لاگ زنده** | `docker-compose logs -f` |
+| **آپدیت به آخرین نسخه** | `docker-compose pull && docker-compose up -d` |
+| **توقف و حذف کانتینر** | `docker-compose down` |
 
 ---
 
-### 👨‍💻 Developer & Support
-*   GitHub: [@ExPLoSiVe1988](https://github.com/ExPLoSiVe1988/cloudflare-telegram-bot)
-*   Telegram: [@H_ExPLoSiVe](https://t.me/H_ExPLoSiVe)
-*   Channel: [@Botgineer](https://t.me/Botgineer)
+### دسترسی‌های مورد نیاز توکن API
+برای هر اکانت کلادفلر، توکن API شما به دسترسی‌های زیر نیاز دارد:
+
+| نوع (Type) | منبع (Resource) | دسترسی (Access) |
+| :--- | :--- | :--- |
+| **Zone** | **DNS** | `Edit` |
+| **Zone** | **Zone** | `Read` |
+
+به صفحه [API Tokens](https://dash.cloudflare.com/profile/api-tokens) بروید و یک توکن سفارشی با این دو دسترسی که برای `All zones` فعال شده باشد، بسازید.
+
 ---
-### 💖 Support / Donate
-If you find this project useful, please consider supporting its development:
 
-| Cryptocurrency            | Address                                      |
-|:--------------------------|:---------------------------------------------|
-| 🟣 **Ethereum (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
-| 🔵 **Tron (TRX - TRC20)**     | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk`         |
-| 🟢 **Tether (USDT - TRC20)**  | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR`         |
+### 👨‍💻 توسعه‌دهنده و حمایت مالی
+*   گیت‌هاب: [@ExPLoSiVe1988](https://www.google.com/url?sa=E&q=https%3A%2F%2Fgithub.com%2FExPLoSiVe1988%2Fcloudflare-telegram-bot)
+*   تلگرام: [@H_ExPLoSiVe](https://t.me/H_ExPLoSiVe)
+*   کانال تلگرام: [@Botgineer](https://t.me/Botgineer)
+---
+### 💖 حمایت مالی (Donate)
+اگر این پروژه برای شما مفید بوده است، با حمایت مالی خود به توسعه آن کمک کنید:
 
-🙏 Thank you for your support! 🚀
+### [حمایت از طریق لینک پرداخت ريالی ](https://reymit.ir/botgineer)
+
+
+| نوع ارز | آدرس |
+|:---|:---|
+| 🟣 **اتریوم (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
+| 🔵 **ترون (TRX - TRC20)** | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk` |
+| 🟢 **تتر (USDT - TRC20)** | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR` |
+
+🙏 از حمایت شما سپاسگزارم! 🚀
