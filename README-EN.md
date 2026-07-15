@@ -129,6 +129,6 @@ If you find this project useful, please consider supporting its development:
 |:--------------------------|:---------------------------------------------|
 | 🟣 **Ethereum (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **Tron (TRX - TRC20)**     | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk`         |
-| 🟢 **Tether (USDT - TRC20)**  | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR`         |
+| 🟢 **Tether (USDT - BEP20)**  | `0x78C406B501c4895627CC22F6653AD66163294D60`         |
 
 🙏 Thank you for your support! 🚀
