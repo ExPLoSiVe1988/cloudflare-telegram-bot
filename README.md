@@ -130,6 +130,6 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 |:---|:---|
 | 🟣 **اتریوم (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **ترون (TRX - TRC20)** | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk` |
-| 🟢 **تتر (USDT - TRC20)** | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR` |
+| 🟢 **تتر (USDT - BEP20)** | `0x78C406B501c4895627CC22F6653AD66163294D60` |
 
 🙏 از حمایت شما سپاسگزارم! 🚀
