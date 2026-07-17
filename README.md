@@ -101,7 +101,7 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 
 ## ⚙️ تنظیمات
 
-تمام تنظیمات اصلی ربات از طریق اسکریپت نصب و منوی مدیریتی انجام می‌شود. برای اضافه کردن یا ویرایش اکانت‌های Cloudflare، ArvanCloud و Hetzner Cloud نیازی به ویرایش دستی فایل‌های تنظیمات نیست.
+تمام تنظیمات اصلی ربات از طریق اسکریپت نصب و منوی مدیریتی انجام می‌شود. برای اضافه کردن یا ویرایش اکانت‌های Cloudflare و ArvanCloud نیازی به ویرایش دستی فایل‌های تنظیمات نیست.
 
 مسیرهای مهم داخل اسکریپت:
 
@@ -109,9 +109,6 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 Manage DNS Provider Accounts
 ├── Cloudflare
 └── ArvanCloud
-
-Manage Server Provider Accounts
-└── Hetzner Cloud
 ```
 
 ---
@@ -154,6 +151,6 @@ Manage Server Provider Accounts
 |:---|:---|
 | 🟣 **اتریوم (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **ترون (TRX - TRC20)** | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk` |
-| 🟢 **تتر (USDT - TRC20)** | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR` |
+| 🟢 **تتر (USDT - BEP20)** | `0x78C406B501c4895627CC22F6653AD66163294D60` |
 
 🙏 از حمایت شما سپاسگزارم! 🚀
