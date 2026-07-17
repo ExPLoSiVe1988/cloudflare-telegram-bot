@@ -39,7 +39,7 @@ def load_config():
         if not os.path.exists(CONFIG_FILE):
             default_config = {
                 "notifications": {
-                    "enabled": True, 
+                    "enabled": True,
                     "recipients": {"__default__": []},
                     "chat_ids": []
                 },
@@ -60,11 +60,11 @@ def load_config():
         config.setdefault("notification_groups", {})
         notifs = config.setdefault("notifications", {})
         notifs.setdefault("enabled", True)
-        
+
         notifs.setdefault("chat_ids", [])
-        
+
         notifs.setdefault("recipients", {"__default__": []})
-        
+
         return config
     except (json.JSONDecodeError, FileNotFoundError) as e:
         logger.fatal(f"FATAL: Could not read or decode {CONFIG_FILE}. Error: {e}")
@@ -80,7 +80,7 @@ def save_config(config_data):
 async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, parse_mode="HTML", force_new_message: bool = False):
     chat_id = update.effective_chat.id
     query = update.callback_query
-    
+
     if force_new_message or not query:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -95,7 +95,7 @@ async def send_or_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     except error.BadRequest as e:
         if "Message is not modified" in str(e):
-            pass 
+            pass
         else:
             try:
                 await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -123,7 +123,7 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, chat_ids_to_noti
     logger.info(f"DUMB SENDER: Preparing to send '{message_key}' to: {chat_ids_to_notify}")
 
     safe_kwargs = {k: escape_html(str(v)) for k, v in kwargs.items()}
-    
+
     try:
         user_data_db = await context.application.persistence.get_user_data()
     except Exception:
@@ -133,9 +133,9 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, chat_ids_to_noti
         lang = 'fa'
         if chat_id in user_data_db:
             lang = user_data_db[chat_id].get('language', 'fa')
-        
+
         message = get_text(message_key, lang, **safe_kwargs)
-        
+
         reply_markup = None
         if add_settings_button:
             button_text = get_text('buttons.go_to_settings', lang)
@@ -143,18 +143,18 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, chat_ids_to_noti
 
         try:
             await context.bot.send_message(
-                chat_id=chat_id, 
-                text=message, 
+                chat_id=chat_id,
+                text=message,
                 parse_mode="HTML",
                 reply_markup=reply_markup
             )
-        
+
         except Forbidden:
             logger.warning(f"⚠️ Alert skipped for user {chat_id}: User blocked the bot (Forbidden).")
-        
+
         except BadRequest as e:
             logger.warning(f"⚠️ Alert skipped for user {chat_id}: Invalid Chat ID or Chat not found. Error: {e}")
-        
+
         except Exception as e:
             logger.error(f"DUMB SENDER: Failed to send notification to {chat_id}: {e}", exc_info=True)
 

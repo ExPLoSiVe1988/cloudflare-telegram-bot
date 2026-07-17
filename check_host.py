@@ -9,6 +9,9 @@ from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
+CHECK_HOST_MODULE_VERSION = "2026-07-16-fast-parallel-forced-v2"
+logger.warning(f"Loaded check_host.py version: {CHECK_HOST_MODULE_VERSION}")
+
 API_BASE_URL = "https://check-host.net"
 REQUEST_HEADERS = {
     "Accept": "application/json",
@@ -17,16 +20,18 @@ REQUEST_HEADERS = {
 NODES_CACHE_FILE = "nodes_cache.json"
 CACHE_EXPIRATION_HOURS = int(os.getenv("CHECK_HOST_NODES_CACHE_HOURS", "6"))
 
-# Check-Host can keep results pending when too many jobs are created at once.
-CHECK_HOST_CONCURRENCY = max(1, int(os.getenv("CHECK_HOST_CONCURRENCY", "1")))
-CHECK_HOST_MAX_WAIT = max(30, int(os.getenv("CHECK_HOST_MAX_WAIT", "180")))
-CHECK_HOST_POLL_INTERVAL = max(3, int(os.getenv("CHECK_HOST_POLL_INTERVAL", "7")))
-CHECK_HOST_MAX_RETRIES = max(1, int(os.getenv("CHECK_HOST_MAX_RETRIES", "3")))
+CHECK_HOST_CONCURRENCY = max(4, int(os.getenv("CHECK_HOST_CONCURRENCY", "8")))
+CHECK_HOST_MAX_WAIT = max(15, int(os.getenv("CHECK_HOST_MAX_WAIT", "35")))
+CHECK_HOST_POLL_INTERVAL = max(2, int(os.getenv("CHECK_HOST_POLL_INTERVAL", "2")))
+CHECK_HOST_MAX_RETRIES = max(1, int(os.getenv("CHECK_HOST_MAX_RETRIES", "1")))
 CHECK_HOST_AUTO_FALLBACK = os.getenv("CHECK_HOST_AUTO_FALLBACK", "1").lower() not in {"0", "false", "no"}
 CHECK_HOST_AUTO_MAX_NODES = max(1, int(os.getenv("CHECK_HOST_AUTO_MAX_NODES", "3")))
+CHECK_HOST_EARLY_RETURN = os.getenv("CHECK_HOST_EARLY_RETURN", "1").lower() not in {"0", "false", "no"}
+CHECK_HOST_MIN_COMPLETED = max(1, int(os.getenv("CHECK_HOST_MIN_COMPLETED", "2")))
+CHECK_HOST_EARLY_RATIO = min(1.0, max(0.1, float(os.getenv("CHECK_HOST_EARLY_RATIO", "0.6"))))
 
 _CHECK_HOST_SEMAPHORE = asyncio.Semaphore(CHECK_HOST_CONCURRENCY)
-
+logger.warning(f"Check-Host runtime config: concurrency={CHECK_HOST_CONCURRENCY}, max_wait={CHECK_HOST_MAX_WAIT}s, poll_interval={CHECK_HOST_POLL_INTERVAL}s, retries={CHECK_HOST_MAX_RETRIES}, early_return={CHECK_HOST_EARLY_RETURN}")
 
 async def _fetch_nodes_from_api() -> Optional[Dict[str, Any]]:
     """Fetch current Check-Host nodes from the official API endpoint only.
@@ -69,7 +74,6 @@ async def _fetch_nodes_from_api() -> Optional[Dict[str, Any]]:
         logger.warning(f"Could not fetch Check-Host nodes from official API: {exc}")
         return None
 
-
 async def get_nodes() -> Dict[str, Any]:
     """Return Check-Host nodes from cache or official API.
 
@@ -100,10 +104,8 @@ async def get_nodes() -> Dict[str, Any]:
     logger.warning("No fresh Check-Host nodes list is available. Continuing with configured nodes only.")
     return {}
 
-
 def _dedupe(items: List[str]) -> List[str]:
     return list(dict.fromkeys([x for x in items if x]))
-
 
 def _tcp_node_result_finished(result_data: Any) -> bool:
     """Return True if a TCP node has produced a final success/failure result.
@@ -125,7 +127,6 @@ def _tcp_node_result_finished(result_data: Any) -> bool:
             return "time" in first or "error" in first
     return True
 
-
 def _tcp_node_result_ok(result_data: Any) -> bool:
     if not _tcp_node_result_finished(result_data):
         return False
@@ -134,14 +135,12 @@ def _tcp_node_result_ok(result_data: Any) -> bool:
         return "time" in first and "error" not in first
     return False
 
-
 def _summarize_snapshot(snapshot: Optional[Dict[str, Any]], limit: int = 1200) -> str:
     try:
         text = json.dumps(snapshot, ensure_ascii=False)
     except Exception:
         text = repr(snapshot)
     return text[:limit] + ("..." if len(text) > limit else "")
-
 
 async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str, bool]]:
     """Perform a TCP check with Check-Host.
@@ -157,12 +156,10 @@ async def perform_check(host: str, port: int, nodes: list) -> Optional[Dict[str,
     async with _CHECK_HOST_SEMAPHORE:
         return await _perform_check_limited(host, port, nodes)
 
-
 async def _perform_check_limited(host: str, port: int, nodes: list) -> Optional[Dict[str, bool]]:
     target = f"{host}:{port}"
     requested_nodes = _dedupe(list(nodes or []))
 
-    # Validate selected nodes if the official list is available. Do not hard-fail if it is unavailable.
     try:
         live_nodes = await get_nodes()
         if live_nodes and requested_nodes:
@@ -193,13 +190,12 @@ async def _perform_check_limited(host: str, port: int, nodes: list) -> Optional[
 
     return None
 
-
 async def _attempt_check_mode(target: str, mode_name: str, mode_nodes: Optional[List[str]]) -> Optional[Dict[str, bool]]:
     retry_delay = 8
 
     for attempt in range(CHECK_HOST_MAX_RETRIES):
         try:
-            await asyncio.sleep(random.uniform(0.4, 1.5))
+            await asyncio.sleep(random.uniform(0.05, 0.25))
 
             async with httpx.AsyncClient(timeout=40.0, follow_redirects=True) as client:
                 if mode_nodes:
@@ -269,6 +265,17 @@ async def _attempt_check_mode(target: str, mode_name: str, mode_nodes: Optional[
                     if completed_count == len(actual_nodes):
                         break
 
+                    early_needed = max(
+                        CHECK_HOST_MIN_COMPLETED,
+                        int((len(actual_nodes) * CHECK_HOST_EARLY_RATIO) + 0.999999)
+                    )
+                    if CHECK_HOST_EARLY_RETURN and completed_count >= min(len(actual_nodes), early_needed):
+                        logger.info(
+                            f"Check-Host early return for {target} request_id={request_id}: "
+                            f"{completed_count}/{len(actual_nodes)} node(s) finished; not waiting for pending nodes."
+                        )
+                        break
+
                 if not results:
                     logger.warning(
                         f"Check-Host request_id={request_id} for {target} produced no usable TCP result after "
@@ -288,10 +295,16 @@ async def _attempt_check_mode(target: str, mode_name: str, mode_nodes: Optional[
 
                 final_statuses: Dict[str, bool] = {}
                 for node_id in actual_nodes:
-                    # Missing/pending nodes are treated as failed from that node, not as a global failure.
-                    final_statuses[node_id] = _tcp_node_result_ok(results.get(node_id))
 
-                return final_statuses
+                    node_result = results.get(node_id)
+                    if _tcp_node_result_finished(node_result):
+                        final_statuses[node_id] = _tcp_node_result_ok(node_result)
+
+                if final_statuses:
+                    return final_statuses
+
+                logger.warning(f"Check-Host result for {target} had no completed nodes after filtering pending values.")
+                return None
 
         except httpx.ReadTimeout:
             logger.warning(f"Attempt {attempt + 1}/{CHECK_HOST_MAX_RETRIES} for {target} failed with ReadTimeout.")

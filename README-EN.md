@@ -1,5 +1,5 @@
 <div align="center">
-  <strong><a href="README.md">English</a></strong> | <strong><a href="README-FA.md">فارسی</a></strong> | <strong><a href="README-CH.md">中文</a></strong>
+  <strong><a href="README.md">فارسی</a></strong> | <strong><a href="README-EN.md">English</a></strong> | <strong><a href="README-CH.md">中文</a></strong>
 </div>
 <br>
 
@@ -31,9 +31,27 @@ A powerful Telegram bot for complete DNS record management and intelligent monit
     *   Generate on-demand reports for custom timeframes and manage log retention policies.
 
 ### ⚙️ Advanced DNS & User Management
+### 🌐 Cloudflare + ArvanCloud DNS Provider Support
+*   **Multi-provider DNS accounts**: Add and manage both Cloudflare and ArvanCloud accounts from the installation script.
+*   **ArvanCloud domain and record selection**: List ArvanCloud domains, browse DNS records, and select `A` records for monitoring policies.
+*   **Provider-aware Failover & Load Balancing**: Existing Cloudflare policies continue to work, while new ArvanCloud policies can automatically update DNS records when a monitored server goes down.
+*   **Safe upgrade path**: Add ArvanCloud to an existing installation from the installation script without resetting current bot settings or policies.
+
+#### Creating an ArvanCloud API Key and granting domain access
+To use ArvanCloud, create a **Machine User** in the ArvanCloud panel and grant it access to the domains you want to manage:
+
+1. Sign in to the ArvanCloud user panel.
+2. Open the account/IAM area and go to **Machine Users**.
+3. Create a new Machine User and generate an Access Key/API Key for it.
+4. In the access/permissions section, select the domains that the bot should manage.
+5. For each selected domain, enable the DNS management role. If needed, also grant domain view/manage access so the bot can list and select the domains.
+6. Add the generated key as an ArvanCloud account from the DNS account management menu in the installation script.
+
+If domains do not appear in the bot, the Machine User usually does not have access to that domain or does not have the required DNS role enabled.
+
 *   **🏷️ Zone & Record Aliases**: Assign friendly display names to both your zones (domains) and individual records for much easier identification and management.
 *   **👥 Advanced In-Bot User Management**:
-    *   **Super Admins** (from `.env`) can manage **Regular Admins** directly within the bot.
+    *   **Super Admins** can manage **Regular Admins** directly within the bot.
 *   **📤 Move & Copy Records**: Easily migrate DNS records between different zones, even across different Cloudflare accounts.
 *   **🔄 Convert Record Types**: Change a record's type (e.g., from `A` to `CNAME`) on the fly.
 *   **👥 Bulk Actions**: Delete or change the IP for multiple records at once.
@@ -74,9 +92,9 @@ To install a specific stable version, please replace `<VERSION>` with the latest
 bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/<VERSION>/install.sh)
 ```
 The script provides a full management menu:
-*   **Install or Reinstall Bot:** Clones the repository, allows you to choose the desired version (latest or stable), prompts for initial configuration (`.env`), and installs/runs the bot using Docker Compose.
+*   **Install or Reinstall Bot:** Clones the repository, allows you to choose the desired version (latest or stable), prompts for initial configuration, and installs/runs the bot using Docker Compose.
 *   **Update Bot from GitHub:** Fetches the latest code from GitHub. To apply the update, you should then run the "Install or Reinstall Bot" option again.
-*   **Edit Core Configuration (.env):** Opens a text editor to let you modify the bot's essential settings (tokens and admins) at any time.
+*   **Manage Core Configuration:** Lets you manage core settings, provider accounts, and admins from the script menu.
 *   **View Live Logs:** Shows the real-time output of the bot for monitoring and debugging.
 *   **Stop Bot / Start Bot:** Allows you to stop or start the bot's container without removing any data.
 *   **Remove Bot Completely:** Stops the container and completely removes all associated data, config files, containers, and images.
@@ -85,11 +103,18 @@ The script provides a full management menu:
 
 ## ⚙️ Configuration
 
-The installation script will create an `.env` file for you with the following structure. You can manage it later using the "Edit Core Configuration" option in the script.
+All core bot settings are handled through the installation script and its management menu. You do not need to manually edit configuration files to add or update Cloudflare, ArvanCloud, or Hetzner Cloud accounts.
 
-*   `TELEGRAM_ADMIN_IDS`:  A comma-separated list of Super Admin User IDs. These users have full control, including the ability to manage other admins from within the bot.
-*   `CF_ACCOUNTS`: A comma-separated list of your Cloudflare accounts in the format `Nickname1:Token1,Nickname2:Token2`. The nickname is a friendly name you choose for each account.
-*   `TELEGRAM_BOT_TOKEN`: The API token for your Telegram bot from @BotFather.
+Useful script menus:
+
+```text
+Manage DNS Provider Accounts
+├── Cloudflare
+└── ArvanCloud
+
+Manage Server Provider Accounts
+└── Hetzner Cloud
+```
 
 ---
 
@@ -129,6 +154,6 @@ If you find this project useful, please consider supporting its development:
 |:--------------------------|:---------------------------------------------|
 | 🟣 **Ethereum (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **Tron (TRX - TRC20)**     | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk`         |
-| 🟢 **Tether (USDT - BEP20)**  | `0x78C406B501c4895627CC22F6653AD66163294D60`         |
+| 🟢 **Tether (USDT - TRC20)**  | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR`         |
 
 🙏 Thank you for your support! 🚀

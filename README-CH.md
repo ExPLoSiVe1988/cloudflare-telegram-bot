@@ -1,5 +1,5 @@
 <div align="center">
-  <strong><a href="README.md">English</a></strong> | <strong><a href="README-FA.md">فارسی</a></strong> | <strong><a href="README-CH.md">中文</a></strong>
+  <strong><a href="README.md">فارسی</a></strong> | <strong><a href="README-EN.md">English</a></strong> | <strong><a href="README-CH.md">中文</a></strong>
 </div>
 <br>
 
@@ -31,9 +31,27 @@
     *   生成自定义时间范围的按需报告，并管理日志保留策略。
 
 ### ⚙️ 高级 DNS 与用户管理
+### 🌐 Cloudflare + ArvanCloud DNS Provider 支持
+*   **多 DNS Provider 账户管理**: 通过安装脚本添加和管理 Cloudflare 与 ArvanCloud 账户。
+*   **ArvanCloud 域名与记录选择**: 列出 ArvanCloud 域名、浏览 DNS 记录，并为监控策略选择 `A` 记录。
+*   **Provider 感知的故障转移与负载均衡**: 现有 Cloudflare 策略继续工作，新建 ArvanCloud 策略可在服务器故障时自动更新 DNS 记录。
+*   **安全升级路径**: 可通过安装脚本把 ArvanCloud 添加到现有安装中，不会重置当前机器人配置或策略。
+
+#### 创建 ArvanCloud API Key 并授权域名
+要使用 ArvanCloud，请先在 ArvanCloud 面板中创建一个 **Machine User**，并给它分配需要管理的域名权限：
+
+1. 登录 ArvanCloud 用户面板。
+2. 进入账户/IAM 区域，然后打开 **Machine Users**。
+3. 创建新的 Machine User，并生成 Access Key/API Key。
+4. 在权限设置中选择机器人需要管理的域名。
+5. 为每个域名启用 DNS 管理权限。如需让机器人列出和选择域名，也请授予域名查看/管理权限。
+6. 通过安装脚本中的 DNS 账户管理菜单，把生成的 Key 添加为 ArvanCloud 账户。
+
+如果域名没有出现在机器人中，通常是 Machine User 没有获得该域名权限，或该域名的 DNS 管理角色没有启用。
+
 *   **🏷️ 域名和记录别名**: 为您的域名和单个记录分配友好的显示名称，以便更轻松地识别和管理。
 *   **👥 高级机器人内用户管理**:
-    *   **超级管理员** (在 `.env` 中定义) 可以在机器人内部直接管理**普通管理员**。
+    *   **超级管理员** 可以在机器人内部直接管理**普通管理员**。
 *   **📤 跨区域移动和复制记录**: 轻松地将 DNS 记录在不同区域之间迁移，甚至可以跨不同的 Cloudflare 账户。
 *   **🔄 转换记录类型**: 即时更改记录类型（例如，从 `A` 到 `CNAME`）。
 *   **👥 批量操作**: 一次性删除或更改多个记录的 IP。
@@ -74,9 +92,9 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegram-bot/<VERSION>/install.sh)
 ```
 脚本提供一个完整的管理菜单：
-*   **安装或重新安装机器人 (Install or Reinstall Bot):** 克隆代码仓库，允许您选择所需的版本（最新版或稳定版），提示您进行初始配置（`.env`），并使用 Docker Compose 安装并运行机器人。
+*   **安装或重新安装机器人 (Install or Reinstall Bot):** 克隆代码仓库，允许您选择所需的版本（最新版或稳定版），提示您进行初始配置，并使用 Docker Compose 安装并运行机器人。
 *   **从 GitHub 更新机器人 (Update Bot from GitHub):** 从 GitHub 获取最新的代码。要应用更新，您应随后再次运行“安装或重新安装机器人”选项。
-*   **编辑核心配置 (.env) (Edit Core Configuration):** 打开一个文本编辑器，让您可以随时修改机器人的基本设置（令牌和管理员）。
+*   **管理核心配置 (Manage Core Configuration):** 通过脚本菜单管理核心设置、Provider 账户和管理员。
 *   **查看实时日志 (View Live Logs):** 显示机器人的实时输出，用于监控和调试。
 *   **停止/启动机器人 (Stop Bot / Start Bot):** 允许您停止或启动机器人的容器，而不会删除任何数据。
 *   **完全移除机器人 (Remove Bot Completely):** 停止并完全删除所有相关的数据、配置文件、容器和镜像。
@@ -85,11 +103,18 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 
 ## ⚙️ 配置
 
-安装脚本将为您创建一个 `.env` 文件，其结构如下。您可以稍后使用脚本中的“编辑核心配置”选项进行管理。
+所有核心设置都通过安装脚本和管理菜单完成。添加或更新 Cloudflare、ArvanCloud 或 Hetzner Cloud 账户时，无需手动编辑配置文件。
 
-*   `TELEGRAM_ADMIN_IDS`: 超级管理员用户 ID 的逗号分隔列表。这些用户拥有完全控制权，包括在机器人内部管理其他管理员的能力。
-*   `CF_ACCOUNTS`: 用逗-号分隔的 Cloudflare 账户列表，格式为 `Nickname1:Token1,Nickname2:Token2`。昵称是您为每个账户选择的友好名称。
-*   `TELEGRAM_BOT_TOKEN`: 来自 @BotFather 的 Telegram 机器人 API Token。
+常用脚本菜单：
+
+```text
+Manage DNS Provider Accounts
+├── Cloudflare
+└── ArvanCloud
+
+Manage Server Provider Accounts
+└── Hetzner Cloud
+```
 
 ---
 
@@ -129,6 +154,6 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 |:--------------------------|:---------------------------------------------|
 | 🟣 **Ethereum (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **Tron (TRX - TRC20)**     | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk`         |
-| 🟢 **Tether (USDT - BEP20)**  | `0x78C406B501c4895627CC22F6653AD66163294D60`         |
+| 🟢 **Tether (USDT - TRC20)**  | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR`         |
 
 🙏 感谢您的支持！🚀

@@ -540,7 +540,8 @@
     "invalid_hostname": "آدرس هاست‌نیم '{value}' نامعتبر است.",
     "select_at_least_one_record": "لطفاً حداقل یک رکورد انتخاب کنید.",
     "unsupported_policy_type": "نوع قانون برای این فرآیند پشتیبانی نمی‌شود.",
-    "select_only_one_primary": "لطفاً فقط یک رکورد را به عنوان آیپی اصلی انتخاب کنید."
+    "select_only_one_primary": "لطفاً فقط یک رکورد را به عنوان آیپی اصلی انتخاب کنید.",
+    "no_selectable_records": "هیچ رکورد قابل انتخابی در {zone_name} پیدا نشد. برای این قانون فقط رکوردهای A/AAAA قابل استفاده هستند."
   },
   "field_names": {
     "policy_name": "نام",
@@ -570,6 +571,8 @@
     "primary_monitoring_group": "گروه مانیتورینگ اصلی",
     "backup_monitoring_group": "گروه مانیتورینگ بکاپ",
     "monitoring_group": "گروه مانیتورینگ",
-    "maintenance_mode": "حالت تعمیر و نگهداری"
+    "maintenance_mode": "حالت تعمیر و نگهداری",
+    "provider": "ارائه‌دهنده",
+    "port": "پورت"
   }
 }
