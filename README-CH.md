@@ -103,7 +103,7 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 
 ## ⚙️ 配置
 
-所有核心设置都通过安装脚本和管理菜单完成。添加或更新 Cloudflare、ArvanCloud 或 Hetzner Cloud 账户时，无需手动编辑配置文件。
+所有核心设置都通过安装脚本和管理菜单完成。添加或更新 Cloudflare 或 ArvanCloud 账户时，无需手动编辑配置文件。
 
 常用脚本菜单：
 
@@ -111,9 +111,6 @@ bash <(curl -s https://raw.githubusercontent.com/ExPLoSiVe1988/cloudflare-telegr
 Manage DNS Provider Accounts
 ├── Cloudflare
 └── ArvanCloud
-
-Manage Server Provider Accounts
-└── Hetzner Cloud
 ```
 
 ---
@@ -154,6 +151,6 @@ Manage Server Provider Accounts
 |:--------------------------|:---------------------------------------------|
 | 🟣 **Ethereum (ETH - ERC20)** | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
 | 🔵 **Tron (TRX - TRC20)**     | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk`         |
-| 🟢 **Tether (USDT - TRC20)**  | `TN3cg5RM5JLEbnTgK5CU95uLQaukybPhtR`         |
+| 🟢 **Tether (USDT - BEP20)**  | `0x78C406B501c4895627CC22F6653AD66163294D60`         |
 
 🙏 感谢您的支持！🚀
