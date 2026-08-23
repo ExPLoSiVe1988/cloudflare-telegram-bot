@@ -48,9 +48,9 @@ EOF
     echo -e "${NC}"
     echo -e "${BLUE}  ┌────────────────────────────────────────────────────────┐${NC}"
     echo -e "${BLUE}  │${NC} ${GREEN}Cloudflare Telegram Bot${NC}                              ${BLUE}│${NC}"
-    echo -e "${BLUE}  │${NC} ${YELLOW}Cloudflare + ArvanCloud DNS Manager${NC}                   ${BLUE}│${NC}"
+    echo -e "${BLUE}  │${NC} ${YELLOW}Cloudflare + ArvanCloud + Hetzner Cloud${NC}               ${BLUE}│${NC}"
     echo -e "${BLUE}  │${NC} ${GREEN}Powered by @H_ExPLoSiVe / ExPLoSiVe1988${NC}              ${BLUE}│${NC}"
-    echo -e "${BLUE}  │${NC} ${YELLOW}Public / Community Package${NC}                            ${BLUE}│${NC}"
+    echo -e "${BLUE}  │${NC} ${YELLOW}Private / Pro Package${NC}                                 ${BLUE}│${NC}"
     echo -e "${BLUE}  └────────────────────────────────────────────────────────┘${NC}"
     echo -e "${CYAN}  Installing ${PROJECT_NAME} ...${NC}\n"
     sleep 1
@@ -103,6 +103,7 @@ ensure_env_defaults() {
     touch "$ENV_FILE"
     ensure_env_var_exists "CF_ACCOUNTS" ""
     ensure_env_var_exists "ARVAN_ACCOUNTS" ""
+    ensure_env_var_exists "HETZNER_CLOUD_ACCOUNTS" ""
     if ! grep -q "^TIMEZONE=" "$ENV_FILE"; then
         echo "" >> "$ENV_FILE"
         echo "# Timezone for log and report timestamps" >> "$ENV_FILE"
@@ -292,6 +293,62 @@ manage_arvan_accounts() {
     done
 }
 
+manage_hetzner_cloud_accounts() {
+    ensure_env_defaults
+    while true; do
+        print_header
+        echo -e "${YELLOW}--- Manage Hetzner Cloud Accounts ---${NC}"
+        local current_hcloud_accounts
+        current_hcloud_accounts=$(read_env_var "HETZNER_CLOUD_ACCOUNTS")
+        display_accounts_masked "$current_hcloud_accounts"
+        echo ""
+        echo "1) Add a new Hetzner Cloud account/project"
+        echo "2) Remove an existing Hetzner Cloud account/project"
+        echo "3) Back to previous menu"
+        read -p "Choose an option: " hcloud_choice
+
+        case $hcloud_choice in
+            1)
+                echo -e "${YELLOW}Create a Hetzner Cloud API token from Project > Security > API Tokens.${NC}"
+                echo -e "${YELLOW}Use a Read & Write token if you want power actions, Rescue, password reset, and Floating IP assignment.${NC}"
+                read -p "  Enter a nickname for this Hetzner Cloud project: " hcloud_nickname
+                validate_account_nickname "$hcloud_nickname" || { read -p "Press Enter..."; continue; }
+                read -p "  Enter the Hetzner Cloud API Token: " hcloud_token
+                if [ -z "$hcloud_token" ]; then
+                    echo -e "${RED}API token cannot be empty.${NC}"
+                else
+                    append_account_entry "HETZNER_CLOUD_ACCOUNTS" "$hcloud_nickname" "$hcloud_token"
+                    echo -e "${GREEN}Hetzner Cloud account '$hcloud_nickname' added.${NC}"
+                fi
+                read -p "Press Enter..."
+                ;;
+            2)
+                remove_account_entry "HETZNER_CLOUD_ACCOUNTS"
+                read -p "Press Enter..."
+                ;;
+            3) break ;;
+            *) echo -e "${RED}Invalid option.${NC}"; read -p "Press Enter..." ;;
+        esac
+    done
+}
+
+manage_server_provider_accounts() {
+    ensure_env_defaults
+    while true; do
+        print_header
+        echo -e "${YELLOW}--- Manage Server Provider Accounts ---${NC}"
+        echo "1) Manage Hetzner Cloud Accounts"
+        echo "2) Back to previous menu"
+        read -p "Choose an option: " server_provider_choice
+
+        case $server_provider_choice in
+            1) manage_hetzner_cloud_accounts ;;
+            2) break ;;
+            *) echo -e "${RED}Invalid option.${NC}"; read -p "Press Enter..." ;;
+        esac
+    done
+}
+
 manage_dns_provider_accounts() {
     ensure_env_defaults
     while true; do
@@ -331,9 +388,10 @@ edit_config() {
         echo -e "${YELLOW}--- Edit Core Configuration (.env) ---${NC}"
         echo "1) Manage Super Admins"
         echo "2) Manage DNS Provider Accounts (Cloudflare / ArvanCloud)"
-        echo "3) Edit Telegram Bot Token"
-        echo "4) Edit Timezone"
-        echo "5) Back to Main Menu"
+        echo "3) Manage Server Provider Accounts (Hetzner Cloud)"
+        echo "4) Edit Telegram Bot Token"
+        echo "5) Edit Timezone"
+        echo "6) Back to Main Menu"
         read -p "Choose an option: " choice
 
         case $choice in
@@ -352,6 +410,10 @@ edit_config() {
                 config_changed=true
                 ;;
             3)
+                manage_server_provider_accounts
+                config_changed=true
+                ;;
+            4)
                 local current_token
                 current_token=$(read_env_var "TELEGRAM_BOT_TOKEN")
                 echo "Current Token: $(mask_secret "$current_token")"
@@ -363,7 +425,7 @@ edit_config() {
                 fi
                 read -p "Press Enter..."
                 ;;
-            4)
+            5)
                 local current_timezone
                 current_timezone=$(read_env_var "TIMEZONE")
                 echo "Current Timezone: ${current_timezone:-Asia/Tehran}"
@@ -374,7 +436,7 @@ edit_config() {
                 config_changed=true
                 read -p "Press Enter..."
                 ;;
-            5) break ;;
+            6) break ;;
             *) echo -e "${RED}Invalid option.${NC}"; read -p "Press Enter..." ;;
         esac
     done
@@ -449,7 +511,7 @@ install_bot() {
 
     echo -e "\n${YELLOW}--- DNS Provider Accounts ---${NC}"
     echo "You can add Cloudflare accounts, ArvanCloud accounts, or both."
-    echo "You can leave these empty and add accounts later from: Edit Core Configuration > Manage DNS Provider Accounts."
+    echo "You can leave these empty and add DNS accounts later from: Edit Core Configuration > Manage DNS Provider Accounts."
 
     local cf_accounts_list=""
     while true; do
@@ -472,6 +534,19 @@ install_bot() {
         if [ -z "$arvan_accounts_list" ]; then arvan_accounts_list="$arvan_nickname:$arvan_token"; else arvan_accounts_list="$arvan_accounts_list,$arvan_nickname:$arvan_token"; fi
     done
 
+    echo -e "\n${YELLOW}--- Server Provider Accounts ---${NC}"
+    echo "Optional: add Hetzner Cloud projects for server power actions, Rescue, root password reset, and Floating IP failover."
+    local hcloud_accounts_list=""
+    while true; do
+        read -p "Add a Hetzner Cloud account/project? (y/n): " add_hcloud_account
+        if [[ "$add_hcloud_account" != "y" && "$add_hcloud_account" != "Y" ]]; then break; fi
+        echo -e "${YELLOW}Use a Read & Write Hetzner Cloud API token for management actions.${NC}"
+        read -p "  > Nickname for this Hetzner Cloud project: " hcloud_nickname
+        validate_account_nickname "$hcloud_nickname" || continue
+        read -p "  > Hetzner Cloud API Token: " hcloud_token
+        if [ -z "$hcloud_accounts_list" ]; then hcloud_accounts_list="$hcloud_nickname:$hcloud_token"; else hcloud_accounts_list="$hcloud_accounts_list,$hcloud_nickname:$hcloud_token"; fi
+    done
+
     echo -e "\n${YELLOW}--- Timezone ---${NC}"
     read -p "Enter your timezone [Default: Asia/Tehran]: " user_timezone
     if [ -z "$user_timezone" ]; then user_timezone="Asia/Tehran"; fi
@@ -482,6 +557,7 @@ TELEGRAM_BOT_TOKEN=${bot_token}
 TELEGRAM_ADMIN_IDS=${admin_ids}
 CF_ACCOUNTS=${cf_accounts_list}
 ARVAN_ACCOUNTS=${arvan_accounts_list}
+HETZNER_CLOUD_ACCOUNTS=${hcloud_accounts_list}
 
 TIMEZONE=${user_timezone}
 EOF
@@ -514,6 +590,7 @@ update_env_for_new_versions() {
     echo -e "${GREEN}.env migration check completed.${NC}"
     echo "Cloudflare accounts: $( [ -n "$(read_env_var CF_ACCOUNTS)" ] && echo configured || echo empty )"
     echo "ArvanCloud accounts: $( [ -n "$(read_env_var ARVAN_ACCOUNTS)" ] && echo configured || echo empty )"
+    echo "Hetzner Cloud accounts: $( [ -n "$(read_env_var HETZNER_CLOUD_ACCOUNTS)" ] && echo configured || echo empty )"
 
     if [ -z "$(read_env_var ARVAN_ACCOUNTS)" ]; then
         echo ""
@@ -526,6 +603,22 @@ update_env_for_new_versions() {
                 if [ -n "$arvan_token" ]; then
                     append_account_entry "ARVAN_ACCOUNTS" "$arvan_nickname" "$arvan_token"
                     echo -e "${GREEN}ArvanCloud account added.${NC}"
+                fi
+            fi
+        fi
+    fi
+
+    if [ -z "$(read_env_var HETZNER_CLOUD_ACCOUNTS)" ]; then
+        echo ""
+        read -p "Do you want to add a Hetzner Cloud account now? (y/n): " add_hcloud_now
+        if [[ "$add_hcloud_now" == "y" || "$add_hcloud_now" == "Y" ]]; then
+            read -p "  > Nickname for this Hetzner Cloud project: " hcloud_nickname
+            if validate_account_nickname "$hcloud_nickname"; then
+                echo -e "${YELLOW}Use a Read & Write token for power actions, Rescue, root password reset, and Floating IP assignment.${NC}"
+                read -p "  > Hetzner Cloud API Token: " hcloud_token
+                if [ -n "$hcloud_token" ]; then
+                    append_account_entry "HETZNER_CLOUD_ACCOUNTS" "$hcloud_nickname" "$hcloud_token"
+                    echo -e "${GREEN}Hetzner Cloud account added.${NC}"
                 fi
             fi
         fi
