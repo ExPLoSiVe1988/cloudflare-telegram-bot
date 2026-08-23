@@ -9,7 +9,6 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
       packages: write
@@ -33,24 +32,11 @@ jobs:
       - name: Set Docker tags
         id: set-tags
         run: |
-          echo "LATEST_TAG=explosive1988/cfbot:latest" >> $GITHUB_ENV
-
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION=${GITHUB_REF#refs/tags/}
-            echo "VERSION_TAG=explosive1988/cfbot:${VERSION}" >> $GITHUB_ENV
-            {
-              echo "DOCKER_TAGS<<EOF"
-              echo "explosive1988/cfbot:latest"
-              echo "explosive1988/cfbot:${VERSION}"
-              echo "EOF"
-            } >> "$GITHUB_ENV"
+            echo "DOCKER_TAGS=explosive1988/cfbot:latest,explosive1988/cfbot:${VERSION}" >> $GITHUB_ENV
           else
-            echo "VERSION_TAG=" >> $GITHUB_ENV
-            {
-              echo "DOCKER_TAGS<<EOF"
-              echo "explosive1988/cfbot:latest"
-              echo "EOF"
-            } >> "$GITHUB_ENV"
+            echo "DOCKER_TAGS=explosive1988/cfbot:latest" >> $GITHUB_ENV
           fi
 
       - name: Build and push Docker image
