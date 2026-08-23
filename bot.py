@@ -242,6 +242,13 @@ for acc in raw_arvan_accounts:
         nickname, token = acc.split(':', 1)
         ARVAN_ACCOUNTS[nickname.strip()] = token.strip()
 
+raw_hetzner_accounts = os.getenv("HETZNER_CLOUD_ACCOUNTS", "").split(',')
+HETZNER_CLOUD_ACCOUNTS = {}
+for acc in raw_hetzner_accounts:
+    if ':' in acc:
+        nickname, token = acc.split(':', 1)
+        HETZNER_CLOUD_ACCOUNTS[nickname.strip()] = token.strip()
+
 def get_provider_label(provider: str) -> str:
     return "ArvanCloud" if provider == "arvan" else "Cloudflare"
 
@@ -446,7 +453,8 @@ def load_config():
                 "monitoring_log_max_size_mb": 25,
                 "monitoring_log_status_changes_only": True,
                 "monitoring_groups": {},
-                "standalone_monitors": []
+                "standalone_monitors": [],
+                "hcloud_traffic_alerts": {"enabled": True, "quota_tb": 20, "threshold_percent": 85, "notified": {}}
             }
             save_config(default_config)
             return default_config
@@ -526,6 +534,7 @@ def load_config():
         if "monitoring_log_max_size_mb" not in config: config["monitoring_log_max_size_mb"] = 25; migrated = True
         if "monitoring_log_status_changes_only" not in config: config["monitoring_log_status_changes_only"] = True; migrated = True
         config.setdefault("standalone_monitors", [])
+        config.setdefault("hcloud_traffic_alerts", {"enabled": True, "quota_tb": 20, "threshold_percent": 85, "notified": {}})
 
         for policy in config.get("load_balancer_policies", []):
             if "ips" in policy and isinstance(policy["ips"], list):
@@ -608,7 +617,8 @@ async def set_bot_commands(application: Application):
         BotCommand("add", "➕ Add a New Record / افزودن رکورد جدید"),
         BotCommand("backup", "💾 Backup Records / تهیه بکاپ از رکوردها"),
         BotCommand("restore", "🔁 Restore Records / بازیابی رکوردها از بکاپ"),
-        BotCommand("settings", "⚙️ Monitoring & Failover Settings / تنظیمات مانیتورینگ")
+        BotCommand("settings", "⚙️ Monitoring & Failover Settings / تنظیمات مانیتورینگ"),
+        BotCommand("hetzner", "🟧 Hetzner Cloud Manager / مدیریت هتزنر کلاد")
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -1480,6 +1490,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
             gather_started_at = time.monotonic()
             unique_checks = await gather_all_ips_to_check(config)
             logger.info(f"[HEALTH TIMER] gather_all_ips_to_check finished in {time.monotonic() - gather_started_at:.1f}s. Unique checks: {len(unique_checks)}")
+            await hcloud_check_traffic_alerts(context, config)
             if not unique_checks:
                 logger.info("--- [HEALTH CHECK] No policies or monitors to check. Job Finished ---")
                 return
@@ -5721,12 +5732,13 @@ async def _handle_state_change_record_type(update: Update, context: ContextTypes
 
     token = get_current_token(context)
     zone_id = context.user_data.get('selected_zone_id')
-
+    provider = get_current_provider(context)
     updated_record = dict(record)
     updated_record["type"] = new_type
     updated_record["content"] = new_content
     updated_record["proxied"] = proxied
-    res = await update_provider_record(get_current_provider(context), token, zone_id, updated_record, new_content)
+
+    res = await update_provider_record(provider, token, zone_id, updated_record, new_content)
 
     if res.get("success"):
         temp_msg = await context.bot.send_message(
@@ -5832,8 +5844,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_state_notification_recipient(update, context)
         return
 
-    elif state == 'awaiting_health_check_interval' or context.user_data.get('awaiting_health_check_interval'):
-        await _handle_state_health_interval(update, context)
+    elif state == 'awaiting_hcloud_create_server':
+        await _handle_state_hcloud_create_server(update, context)
+        return
+
+    elif state == 'awaiting_hcloud_create_server_name':
+        await _handle_state_hcloud_create_server_name(update, context)
+        return
+
+    elif state == 'awaiting_hcloud_rename_server':
+        await _handle_state_hcloud_rename_server(update, context)
         return
 
     elif 'awaiting_record_alias' in context.user_data or 'awaiting_zone_alias' in context.user_data:
@@ -6663,6 +6683,7603 @@ async def lb_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['awaiting_lb_interval'] = True
         await query.edit_message_text(get_text('prompts.enter_lb_interval', lang))
 
+HCLOUD_API_BASE = "https://api.hetzner.cloud/v1"
+
+async def hcloud_api_request(token: str, method: str, endpoint: str, **kwargs):
+    if not token:
+        return {"success": False, "error": "No Hetzner Cloud API token selected."}
+    url = endpoint if endpoint.startswith("http") else f"{HCLOUD_API_BASE}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    try:
+        r = await HTTP_CLIENT.request(method, url, headers=headers, **kwargs)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        data["success"] = True
+        return data
+    except httpx.HTTPStatusError as e:
+        try:
+            data = e.response.json()
+        except Exception:
+            data = {"error": {"message": e.response.text or f"HTTP Error: {e.response.status_code}"}}
+        err = data.get("error") or {}
+        message = err.get("message") or data.get("message") or f"HTTP Error: {e.response.status_code}"
+        return {"success": False, "status_code": e.response.status_code, "error": message, "raw": data}
+    except (httpx.RequestError, json.JSONDecodeError) as e:
+        return {"success": False, "error": str(e)}
+
+async def hcloud_get_servers(token: str):
+    servers, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/servers", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud servers request failed: {res.get('error')}")
+            return []
+        servers.extend(res.get("servers", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return servers
+
+async def hcloud_get_server(token: str, server_id: str):
+    res = await hcloud_api_request(token, "get", f"/servers/{server_id}")
+    return res.get("server") if res.get("success") else None
+
+async def hcloud_get_server_types(token: str):
+    items, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/server_types", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud server types request failed: {res.get('error')}")
+            return []
+        items.extend(res.get("server_types", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return items
+
+async def hcloud_get_locations(token: str):
+    items, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/locations", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud locations request failed: {res.get('error')}")
+            return []
+        items.extend(res.get("locations", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return items
+
+async def hcloud_get_datacenters(token: str):
+    items, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/datacenters", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud datacenters request failed: {res.get('error')}")
+            return []
+        items.extend(res.get("datacenters", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return items
+
+async def hcloud_get_images(token: str):
+
+    res = await hcloud_api_request(token, "get", "/images", params={"type": "system", "per_page": 50, "page": 1})
+    return res.get("images", []) if res.get("success") else []
+
+async def hcloud_get_pricing(token: str):
+    res = await hcloud_api_request(token, "get", "/pricing")
+    return res if res.get("success") else {}
+
+async def hcloud_get_primary_ips(token: str):
+    primary_ips, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/primary_ips", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud Primary IPs request failed: {res.get('error')}")
+            return []
+        primary_ips.extend(res.get("primary_ips", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return primary_ips
+
+async def hcloud_create_floating_ip(token: str, ip_type: str, location: str, description: str = None, server_id: str = None):
+    payload = {"type": ip_type}
+    if server_id:
+        payload["server"] = int(server_id)
+    else:
+        payload["home_location"] = location
+    if description:
+        payload["description"] = description
+    return await hcloud_api_request(token, "post", "/floating_ips", json=payload)
+
+async def hcloud_create_primary_ip(token: str, ip_type: str, datacenter: str, name: str = None, assignee_id: str = None):
+    payload = {"type": ip_type, "auto_delete": False}
+    if assignee_id:
+        payload["assignee_type"] = "server"
+        payload["assignee_id"] = int(assignee_id)
+    else:
+        payload["datacenter"] = datacenter
+    if name:
+        payload["name"] = name
+    return await hcloud_api_request(token, "post", "/primary_ips", json=payload)
+
+async def hcloud_create_server(token: str, name: str, server_type: str, image: str, location: str):
+    payload = {
+        "name": name,
+        "server_type": server_type,
+        "image": image,
+        "location": location,
+        "start_after_create": True,
+        "public_net": {"enable_ipv4": True, "enable_ipv6": True}
+    }
+    return await hcloud_api_request(token, "post", "/servers", json=payload)
+
+async def hcloud_update_server(token: str, server_id: str, **fields):
+    payload = {k: v for k, v in fields.items() if v is not None}
+    if not payload:
+        return {"success": False, "error": "No update fields provided."}
+    return await hcloud_api_request(token, "put", f"/servers/{server_id}", json=payload)
+
+async def hcloud_delete_server(token: str, server_id: str):
+    return await hcloud_api_request(token, "delete", f"/servers/{server_id}")
+
+async def hcloud_change_server_type(token: str, server_id: str, server_type: str, upgrade_disk: bool = False):
+    return await hcloud_api_request(
+        token, "post", f"/servers/{server_id}/actions/change_type",
+        json={"server_type": server_type, "upgrade_disk": bool(upgrade_disk)}
+    )
+
+async def hcloud_rebuild_server(token: str, server_id: str, image: str):
+    return await hcloud_api_request(token, "post", f"/servers/{server_id}/actions/rebuild", json={"image": image})
+
+async def hcloud_change_protection(token: str, server_id: str, enabled: bool):
+    return await hcloud_api_request(
+        token, "post", f"/servers/{server_id}/actions/change_protection",
+        json={"delete": bool(enabled), "rebuild": bool(enabled)}
+    )
+
+def hcloud_server_delete_protected(server: dict) -> bool:
+    protection = (server or {}).get("protection") or {}
+    return bool(protection.get("delete"))
+
+def hcloud_server_rebuild_protected(server: dict) -> bool:
+    protection = (server or {}).get("protection") or {}
+    return bool(protection.get("rebuild"))
+
+async def hcloud_create_server_snapshot(token: str, server_id: str, description: str = None):
+    if not description:
+        description = f"Snapshot from Telegram bot - {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    return await hcloud_api_request(
+        token, "post", f"/servers/{server_id}/actions/create_image",
+        json={"type": "snapshot", "description": description}
+    )
+
+async def hcloud_get_snapshots(token: str, server_id: str = None):
+    snapshots, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/images", params={"type": "snapshot", "per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud snapshots request failed: {res.get('error')}")
+            return []
+        snapshots.extend(res.get("images", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    if server_id:
+        filtered = []
+        for img in snapshots:
+            created_from = img.get("created_from") or {}
+            if str(created_from.get("id")) == str(server_id):
+                filtered.append(img)
+        snapshots = filtered
+    return snapshots
+
+async def hcloud_get_image(token: str, image_id: str):
+    res = await hcloud_api_request(token, "get", f"/images/{image_id}")
+    return res.get("image") if res.get("success") else None
+
+async def hcloud_change_image_protection(token: str, image_id: str, enabled: bool):
+    return await hcloud_api_request(
+        token, "post", f"/images/{image_id}/actions/change_protection",
+        json={"delete": bool(enabled)}
+    )
+
+async def hcloud_delete_image(token: str, image_id: str):
+    return await hcloud_api_request(token, "delete", f"/images/{image_id}")
+
+async def hcloud_get_firewalls(token: str):
+    firewalls, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/firewalls", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud firewalls request failed: {res.get('error')}")
+            return []
+        firewalls.extend(res.get("firewalls", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return firewalls
+
+async def hcloud_get_firewall(token: str, firewall_id: str):
+    res = await hcloud_api_request(token, "get", f"/firewalls/{firewall_id}")
+    return res.get("firewall") if res.get("success") else None
+
+async def hcloud_apply_firewall_to_server(token: str, firewall_id: str, server_id: str):
+    return await hcloud_api_request(
+        token, "post", f"/firewalls/{firewall_id}/actions/apply_to_resources",
+        json={"apply_to": [{"type": "server", "server": {"id": int(server_id)}}]}
+    )
+
+async def hcloud_remove_firewall_from_server(token: str, firewall_id: str, server_id: str):
+    return await hcloud_api_request(
+        token, "post", f"/firewalls/{firewall_id}/actions/remove_from_resources",
+        json={"remove_from": [{"type": "server", "server": {"id": int(server_id)}}]}
+    )
+
+def hcloud_firewall_applies_to_server(firewall: dict, server_id: str) -> bool:
+    for item in firewall.get("applied_to", []) or []:
+        if item.get("type") != "server":
+            continue
+        server = item.get("server") or {}
+        if str(server.get("id")) == str(server_id):
+            return True
+    return False
+
+def hcloud_firewall_rules_summary(firewall: dict, limit: int = 6) -> str:
+    rules = firewall.get("rules", []) or []
+    if not rules:
+        return "-"
+    parts = []
+    for rule in rules[:limit]:
+        direction = rule.get("direction", "-")
+        protocol = rule.get("protocol", "-")
+        port = rule.get("port") or "all"
+        sources = rule.get("source_ips") or []
+        destinations = rule.get("destination_ips") or []
+        ips = sources if direction == "in" else destinations
+        ip_text = ", ".join(ips[:2]) if ips else "any"
+        if len(ips) > 2:
+            ip_text += ", ..."
+        parts.append(f"• {direction} · {protocol} · {port} · {ip_text}")
+    if len(rules) > limit:
+        parts.append(f"• ... +{len(rules)-limit}")
+    return "\n".join(parts)
+
+async def hcloud_get_floating_ips(token: str):
+    floating_ips, page = [], 1
+    while True:
+        res = await hcloud_api_request(token, "get", "/floating_ips", params={"per_page": 50, "page": page})
+        if not res.get("success"):
+            logger.error(f"Hetzner Cloud Floating IPs request failed: {res.get('error')}")
+            return []
+        floating_ips.extend(res.get("floating_ips", []) or [])
+        pagination = res.get("meta", {}).get("pagination", {}) or {}
+        last_page = int(pagination.get("last_page", page) or page)
+        if page >= last_page:
+            break
+        page += 1
+    return floating_ips
+
+async def hcloud_server_action(token: str, server_id: str, action: str):
+    payload = None
+    endpoint_action = action
+    if action == "rescue_reset":
+        rescue = await hcloud_api_request(token, "post", f"/servers/{server_id}/actions/enable_rescue", json={"type": "linux64"})
+        if not rescue.get("success"):
+            return rescue
+        reset = await hcloud_api_request(token, "post", f"/servers/{server_id}/actions/reset")
+        if not reset.get("success"):
+            rescue["reset_warning"] = reset.get("error", "Reset/power-cycle failed. Rescue is enabled but the server was not rebooted.")
+        rescue["composite_action"] = "rescue_reset"
+        return rescue
+    if action == "enable_rescue":
+        endpoint_action = "enable_rescue"
+        payload = {"type": "linux64"}
+    elif action == "enable_backup":
+        endpoint_action = "enable_backup"
+    elif action == "disable_backup":
+        endpoint_action = "disable_backup"
+    elif action == "snapshot":
+        return await hcloud_create_server_snapshot(token, server_id)
+    elif action == "protect_on":
+        return await hcloud_change_protection(token, server_id, True)
+    elif action == "protect_off":
+        return await hcloud_change_protection(token, server_id, False)
+    elif action not in {"poweron", "reboot", "shutdown", "poweroff", "reset", "reset_password"}:
+        return {"success": False, "error": f"Unsupported action: {action}"}
+
+    kwargs = {"json": payload} if payload is not None else {}
+    return await hcloud_api_request(token, "post", f"/servers/{server_id}/actions/{endpoint_action}", **kwargs)
+
+async def hcloud_floating_ip_action(token: str, floating_ip_id: str, action: str, server_id: str = None):
+    if action == "assign":
+        return await hcloud_api_request(token, "post", f"/floating_ips/{floating_ip_id}/actions/assign", json={"server": int(server_id)})
+    if action == "unassign":
+        return await hcloud_api_request(token, "post", f"/floating_ips/{floating_ip_id}/actions/unassign")
+    return {"success": False, "error": f"Unsupported Floating IP action: {action}"}
+
+async def hcloud_primary_ip_action(token: str, primary_ip_id: str, action: str, server_id: str = None):
+    if action == "assign":
+        return await hcloud_api_request(
+            token, "post", f"/primary_ips/{primary_ip_id}/actions/assign",
+            json={"assignee_type": "server", "assignee_id": int(server_id)}
+        )
+    if action == "unassign":
+        return await hcloud_api_request(token, "post", f"/primary_ips/{primary_ip_id}/actions/unassign")
+    return {"success": False, "error": f"Unsupported Primary IP action: {action}"}
+
+async def hcloud_change_primary_ip_protection(token: str, primary_ip_id: str, enabled: bool):
+    return await hcloud_api_request(
+        token, "post", f"/primary_ips/{primary_ip_id}/actions/change_protection",
+        json={"delete": bool(enabled)}
+    )
+
+def hcloud_primary_ip_delete_protected(primary_ip: dict) -> bool:
+    protection = (primary_ip or {}).get("protection") or {}
+    return bool(protection.get("delete"))
+
+def hcloud_public_ips(server: dict) -> str:
+    public_net = server.get("public_net", {}) or {}
+    ipv4 = ((public_net.get("ipv4") or {}).get("ip")) or "-"
+    ipv6 = ((public_net.get("ipv6") or {}).get("ip")) or "-"
+    return f"IPv4: <code>{escape_html(ipv4)}</code>\nIPv6: <code>{escape_html(ipv6)}</code>"
+
+def hcloud_account_token(context: ContextTypes.DEFAULT_TYPE):
+    account = context.user_data.get("hcloud_account")
+    return HETZNER_CLOUD_ACCOUNTS.get(account), account
+
+def hcloud_format_eur(value, decimals: int = 2, trim: bool = True) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "-"
+    text = f"{number:.{decimals}f}"
+    if trim and "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"€{text}"
+
+def hcloud_format_gb(value, decimals: int = 2) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "-"
+    return f"{number:.{decimals}f}"
+
+def hcloud_image_delete_protected(image: dict) -> bool:
+    protection = image.get("protection") or {}
+    return bool(protection.get("delete"))
+
+HCLOUD_LIST_PAGE_SIZE = 5
+
+def hcloud_paginate(items: list, page: int, per_page: int = HCLOUD_LIST_PAGE_SIZE):
+    total_pages = max((len(items) + per_page - 1) // per_page, 1)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    return items[page * per_page:(page + 1) * per_page], page, total_pages
+
+def hcloud_pagination_buttons(prefix: str, page: int, total_pages: int, lang: str):
+    if total_pages <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}|{page-1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}|{page+1}"))
+    return [row]
+
+def hcloud_price_values(server_type_obj: dict) -> tuple[str | None, str | None]:
+    prices = server_type_obj.get("prices") or []
+    if not prices:
+        return None, None
+    preferred = None
+    for item in prices:
+        if (item.get("location") or "").lower() in {"fsn1", "nbg1", "hel1"}:
+            preferred = item
+            break
+    item = preferred or prices[0]
+    monthly = ((item.get("price_monthly") or {}).get("gross") or (item.get("price_monthly") or {}).get("net"))
+    hourly = ((item.get("price_hourly") or {}).get("gross") or (item.get("price_hourly") or {}).get("net"))
+    return monthly, hourly
+
+def hcloud_price_text(server_type_obj: dict) -> str:
+    monthly, hourly = hcloud_price_values(server_type_obj)
+    if monthly is None and hourly is None:
+        return "-"
+    return f"{hcloud_format_eur(monthly, 2)}/mo · {hcloud_format_eur(hourly, 4)}/h"
+
+def hcloud_server_type_price(server: dict) -> str:
+    return hcloud_price_text(server.get("server_type") or {})
+
+def hcloud_human_gb(value) -> str:
+    try:
+        value = float(value)
+
+        if value > 1024 ** 4:
+            return f"{value / (1024 ** 4):.2f} TB"
+        return f"{value / (1024 ** 3):.2f} GB"
+    except Exception:
+        return "-"
+
+def hcloud_country_flag(country: str) -> str:
+    flags = {
+        "DE": "🇩🇪", "FI": "🇫🇮", "US": "🇺🇸", "SG": "🇸🇬",
+        "Germany": "🇩🇪", "Finland": "🇫🇮", "United States": "🇺🇸", "Singapore": "🇸🇬"
+    }
+    return flags.get(str(country or '').strip(), "🌍")
+
+def hcloud_location_button_label(loc: dict) -> str:
+    flag = hcloud_country_flag(loc.get('country'))
+    name = loc.get('name') or '-'
+    city = loc.get('city') or loc.get('description') or ''
+    country = loc.get('country') or ''
+    suffix = f" · {city}, {country}" if city or country else ""
+    return f"{flag} {name}{suffix}"
+
+def hcloud_server_type_button_label(st: dict) -> str:
+    name = st.get('name') or '-'
+    cores = st.get('cores') or '-'
+    memory = st.get('memory') or '-'
+    disk = st.get('disk') or '-'
+    price = hcloud_price_text(st)
+    return f"{name} · {cores} CPU · {memory}GB RAM · {disk}GB · {price}"
+
+def hcloud_server_type_available_in_location(st: dict, location_name: str | None) -> bool:
+    """Return True only for server types currently orderable in the selected location.
+
+    Hetzner's newer server_type payload exposes a per-location list with an
+    `available` flag. Older payloads may only expose prices per location; in
+    that case we keep the type visible so the bot remains backward compatible.
+    """
+    if not location_name:
+        return True
+
+    if st.get('deprecated') is True or st.get('deprecation'):
+        return False
+    locations = st.get('locations') or []
+    if isinstance(locations, list) and locations:
+        matched = False
+        for item in locations:
+            loc = item.get('location') if isinstance(item, dict) and isinstance(item.get('location'), dict) else item
+            loc_name = loc.get('name') if isinstance(loc, dict) else item.get('name') if isinstance(item, dict) else None
+            if str(loc_name) != str(location_name):
+                continue
+            matched = True
+            if item.get('deprecation') or item.get('deprecated') is True:
+                return False
+            available = item.get('available')
+            if available is False:
+                return False
+            return True
+
+        if not matched:
+            return False
+
+    prices = st.get('prices') or []
+    if isinstance(prices, list) and prices:
+        price_locations = {str(x.get('location')) for x in prices if isinstance(x, dict) and x.get('location')}
+        if price_locations and str(location_name) not in price_locations:
+            return False
+    return True
+
+def hcloud_short_image_label(img: dict) -> str:
+    name = img.get('name') or str(img.get('id') or '-')
+    desc = img.get('description') or ''
+    return f"{name} · {desc}"[:64]
+
+def hcloud_traffic_percent(total_bytes, quota_tb: float) -> float | None:
+    try:
+        quota_bytes = float(quota_tb) * (1024 ** 4)
+        if quota_bytes <= 0 or total_bytes is None:
+            return None
+        return (float(total_bytes) / quota_bytes) * 100
+    except Exception:
+        return None
+
+def hcloud_location_text(obj: dict) -> str:
+    if not obj:
+        return "-"
+    parts = []
+    for key in ("name", "description", "city", "country"):
+        value = obj.get(key)
+        if value and str(value) not in parts:
+            parts.append(str(value))
+    nested_location = obj.get("location") if isinstance(obj.get("location"), dict) else None
+    if nested_location:
+        for key in ("name", "city", "country"):
+            value = nested_location.get(key)
+            if value and str(value) not in parts:
+                parts.append(str(value))
+    return " / ".join(parts) if parts else "-"
+
+def hcloud_server_location_info(server: dict, assigned_primary_ips: list[dict] | None = None) -> tuple[str, str]:
+    """Return human-readable datacenter and location for a server.
+
+    Hetzner normally returns this on the server object as
+    server.datacenter + server.datacenter.location. Some responses may omit it,
+    while assigned Primary IP objects still include datacenter data.
+    """
+    candidates = []
+    dc_obj = server.get('datacenter') if isinstance(server.get('datacenter'), dict) else None
+    if dc_obj:
+        candidates.append(dc_obj)
+
+    loc_obj = server.get('location') if isinstance(server.get('location'), dict) else None
+    if loc_obj:
+        candidates.append({'location': loc_obj})
+
+    if assigned_primary_ips:
+        for ip in assigned_primary_ips:
+            ip_dc = ip.get('datacenter') if isinstance(ip.get('datacenter'), dict) else None
+            if ip_dc:
+                candidates.append(ip_dc)
+
+    for dc in candidates:
+        datacenter = hcloud_location_text(dc)
+        nested = dc.get('location') if isinstance(dc.get('location'), dict) else None
+        location = hcloud_location_text(nested or dc)
+        if datacenter != '-' or location != '-':
+            return datacenter, location
+
+    return '-', '-'
+
+def hcloud_primary_ip_assignee_label(item: dict, servers: list[dict] | None = None) -> str:
+    assignee_id = item.get("assignee_id")
+    if not assignee_id:
+        return "-"
+    if servers:
+        server = next((s for s in servers if str(s.get("id")) == str(assignee_id)), None)
+        if server:
+            return server.get("name") or str(assignee_id)
+    return str(assignee_id)
+
+def hcloud_month_progress_ratio() -> float:
+    now = datetime.utcnow()
+    start = datetime(now.year, now.month, 1)
+    if now.month == 12:
+        end = datetime(now.year + 1, 1, 1)
+    else:
+        end = datetime(now.year, now.month + 1, 1)
+    total = max((end - start).total_seconds(), 1)
+    used = max((now - start).total_seconds(), 0)
+    return min(max(used / total, 0), 1)
+
+def hcloud_server_month_cost_estimate(server: dict) -> float:
+    price = None
+    for item in ((server.get("server_type") or {}).get("prices") or []):
+        gross = ((item.get("price_monthly") or {}).get("gross"))
+        try:
+            price = float(gross)
+            break
+        except Exception:
+            pass
+    return (price or 0.0) * hcloud_month_progress_ratio()
+
+async def hcloud_estimate_server_traffic(token: str, server_id: str):
+    now = datetime.utcnow()
+    start = datetime(now.year, now.month, 1).isoformat() + "Z"
+    end = now.isoformat() + "Z"
+    res = await hcloud_api_request(token, "get", f"/servers/{server_id}/metrics", params={"type": "network", "start": start, "end": end, "step": 3600})
+    if not res.get("success"):
+        return {"in": None, "out": None, "total": None}
+    metrics = ((res.get("metrics") or {}).get("time_series") or {})
+    totals = {"in": 0.0, "out": 0.0}
+    found = False
+    for key, series in metrics.items():
+        key_l = key.lower()
+        if "bandwidth" not in key_l:
+            continue
+        direction = "out" if ("out" in key_l or "tx" in key_l) else ("in" if ("in" in key_l or "rx" in key_l) else None)
+        if not direction:
+            continue
+        values = series.get("values") or []
+        last_ts = None
+        for pair in values:
+            try:
+                ts = float(pair[0])
+                val = float(pair[1])
+                if last_ts is None:
+                    last_ts = ts
+                    continue
+                dt = max(ts - last_ts, 0)
+                last_ts = ts
+
+                totals[direction] += max(val, 0) * dt
+                found = True
+            except Exception:
+                continue
+    if not found:
+        return {"in": None, "out": None, "total": None}
+    return {"in": totals["in"], "out": totals["out"], "total": totals["in"] + totals["out"]}
+
+def hcloud_action_label(action: str, lang: str) -> str:
+    labels = {
+        "poweron": "Power On",
+        "reboot": "Reboot",
+        "shutdown": "Shutdown",
+        "poweroff": "Power Off",
+        "reset": "Hard Reset",
+        "reset_password": "Reset Root Password",
+        "enable_rescue": "Enable Rescue",
+        "rescue_reset": "Rescue + Power Cycle",
+        "snapshot": "Create Snapshot",
+        "enable_backup": "Enable Backups",
+        "disable_backup": "Disable Backups",
+        "protect_on": "Enable Protection",
+        "protect_off": "Disable Protection",
+    }
+    return labels.get(action, action)
+
+async def hcloud_check_traffic_alerts(context: ContextTypes.DEFAULT_TYPE, config: dict):
+    settings = config.setdefault("hcloud_traffic_alerts", {"enabled": True, "quota_tb": 20, "threshold_percent": 85, "notified": {}})
+    if not settings.get("enabled", True):
+        return
+    try:
+        quota_tb = float(settings.get("quota_tb", 20) or 20)
+        threshold = float(settings.get("threshold_percent", 85) or 85)
+    except Exception:
+        quota_tb, threshold = 20.0, 85.0
+    notified = settings.setdefault("notified", {})
+    month_key = datetime.utcnow().strftime("%Y-%m")
+    raw_super_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
+    recipients = {int(admin_id.strip()) for admin_id in raw_super_admin_ids if admin_id.strip().isdigit()}
+    recipients.update(config.setdefault("notifications", {}).setdefault("recipients", {}).setdefault("__default__", []))
+    if not recipients:
+        return
+    changed = False
+    for account, token in HETZNER_CLOUD_ACCOUNTS.items():
+        servers = await hcloud_get_servers(token)
+        for server in servers:
+            sid = str(server.get('id'))
+            traffic = await hcloud_estimate_server_traffic(token, sid)
+            total = traffic.get('total')
+            billable_incoming = traffic.get('in')
+            pct = hcloud_traffic_percent(billable_incoming, quota_tb)
+            if pct is None or pct < threshold:
+                continue
+            key = f"{month_key}:{account}:{sid}:{int(threshold)}"
+            if notified.get(key):
+                continue
+            name = server.get('name', sid)
+            used = hcloud_human_gb(billable_incoming)
+            await send_notification(
+                context, recipients, 'messages.hcloud_traffic_alert_notification',
+                account=account, server=name, used=used, quota=f"{quota_tb:g} TB", percent=f"{pct:.1f}%", threshold=f"{threshold:g}%",
+                add_settings_button=True
+            )
+            notified[key] = True
+            changed = True
+    if changed:
+
+        settings['notified'] = {k: v for k, v in notified.items() if k.startswith(month_key + ':')}
+        save_config(config)
+
+async def switch_dns_ip(context: ContextTypes.DEFAULT_TYPE, policy: dict, to_ip: str) -> int:
+    policy_name = policy.get('policy_name', 'Unnamed Policy')
+    provider = get_policy_provider(policy)
+    logger.info(f"DNS SWITCH: For policy '{policy_name}' via {get_provider_label(provider)}, ensuring records point to '{to_ip}'.")
+
+    account_nickname = policy.get('account_nickname')
+    token = get_account_token(provider, account_nickname)
+    if not token:
+        logger.error(f"DNS SWITCH FAILED for '{policy_name}': No {get_provider_label(provider)} token for account '{account_nickname}'.")
+        return 0
+
+    zone_name = policy.get('zone_name')
+    if not zone_name:
+        logger.error(f"DNS SWITCH FAILED for '{policy_name}': Missing zone/domain name.")
+        return 0
+
+    zone_identifier = zone_name
+    if provider == 'cloudflare':
+        zones = await get_all_zones(token)
+        zone_identifier = next((z['id'] for z in zones if z['name'] == zone_name), None)
+        if not zone_identifier:
+            logger.error(f"DNS SWITCH FAILED for '{policy_name}': Could not find zone_id for '{zone_name}'.")
+            return 0
+
+    all_records = await get_provider_dns_records(provider, token, zone_identifier)
+    success_count = 0
+    records_to_update = policy.get('record_names', [])
+
+    for record in all_records:
+        short_name = get_short_name(record['name'], zone_name)
+        if short_name in records_to_update and record.get('content') != to_ip:
+            logger.info(f"DNS SWITCH: Updating {get_provider_label(provider)} record '{record['name']}' from '{record.get('content')}' to '{to_ip}'...")
+            res = await update_provider_record(provider, token, zone_identifier, record, to_ip)
+            if res.get("success") is not False:
+                logger.info(f"SUCCESS: Record '{record['name']}' updated.")
+                success_count += 1
+            else:
+                error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+                logger.error(f"DNS SWITCH FAILED for '{record['name']}'. Reason: {error_msg}")
+
+    if success_count > 0 and provider == 'cloudflare':
+        await clear_zone_cache_for_all_users(context.application.persistence, zone_identifier)
+
+    return success_count
+
+async def get_policy_current_dns_ip(policy: dict) -> str | None:
+    provider = get_policy_provider(policy)
+    account_nickname = policy.get('account_nickname')
+    token = get_account_token(provider, account_nickname)
+    zone_name = policy.get('zone_name')
+    record_names = policy.get('record_names', [])
+
+    if not all([token, zone_name, record_names]):
+        return None
+
+    zone_identifier = zone_name
+    if provider == 'cloudflare':
+        zones = await get_all_zones(token)
+        zone_identifier = next((z['id'] for z in zones if z['name'] == zone_name), None)
+        if not zone_identifier:
+            return None
+
+    all_dns_records = await get_provider_dns_records(provider, token, zone_identifier)
+    if all_dns_records is None:
+        return None
+
+    actual_record = next((r for r in all_dns_records if get_short_name(r['name'], zone_name) in record_names), None)
+    return actual_record.get('content') if actual_record else None
+
+async def get_policy_dns_sync_status(policy: dict, expected_ip: str) -> dict:
+    """Checks every DNS record selected by a policy against the expected IP."""
+    provider = get_policy_provider(policy)
+    account_nickname = policy.get('account_nickname')
+    token = get_account_token(provider, account_nickname)
+    zone_name = policy.get('zone_name')
+    expected_names = {str(name) for name in policy.get('record_names', []) if name}
+
+    if not all([token, zone_name, expected_names, expected_ip]):
+        return {
+            "success": False,
+            "error": "incomplete_policy",
+            "total_records": 0,
+            "mismatched_records": [],
+            "missing_record_names": sorted(expected_names),
+        }
+
+    zone_identifier = zone_name
+    if provider == 'cloudflare':
+        zones = await get_all_zones(token)
+        zone_identifier = next((z['id'] for z in zones if z['name'] == zone_name), None)
+        if not zone_identifier:
+            return {
+                "success": False,
+                "error": "zone_not_found",
+                "total_records": 0,
+                "mismatched_records": [],
+                "missing_record_names": sorted(expected_names),
+            }
+
+    all_dns_records = await get_provider_dns_records(provider, token, zone_identifier)
+    if all_dns_records is None:
+        return {
+            "success": False,
+            "error": "records_unavailable",
+            "total_records": 0,
+            "mismatched_records": [],
+            "missing_record_names": sorted(expected_names),
+        }
+
+    selected_records = [
+        record for record in all_dns_records
+        if get_short_name(record.get('name', ''), zone_name) in expected_names
+    ]
+    found_names = {
+        get_short_name(record.get('name', ''), zone_name)
+        for record in selected_records
+    }
+    missing_names = sorted(expected_names - found_names)
+    mismatched_records = [
+        record.get('name', '?')
+        for record in selected_records
+        if record.get('content') != expected_ip
+    ]
+
+    return {
+        "success": bool(selected_records) and not missing_names and not mismatched_records,
+        "error": None,
+        "total_records": len(selected_records),
+        "mismatched_records": mismatched_records,
+        "missing_record_names": missing_names,
+    }
+
+def clear_pending_primary_change(policy_name: str, expected_ip: str) -> bool:
+    """Clears a completed pending change without overwriting newer config edits."""
+    latest_config = load_config()
+    if not latest_config:
+        return False
+
+    for latest_policy in latest_config.get('failover_policies', []):
+        if latest_policy.get('policy_name') != policy_name:
+            continue
+        pending = latest_policy.get('pending_primary_change') or {}
+        if latest_policy.get('primary_ip') != expected_ip or pending.get('to_ip') != expected_ip:
+            return False
+        latest_policy.pop('pending_primary_change', None)
+        save_config(latest_config)
+        return True
+
+    return False
+
+async def check_ip_health(ip: str, port: int, timeout: int = 5) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (socket.gaierror, ConnectionRefusedError, asyncio.TimeoutError, OSError):
+        return False
+
+async def get_ip_health_with_cache(context: ContextTypes.DEFAULT_TYPE, ip: str, check_details: dict) -> tuple[bool, bool]:
+    """
+    Checks IP health using the details provided in the check_details dictionary.
+    """
+    if not ip:
+        return True, True
+
+    is_online = True
+    service_failed = False
+
+    check_type = check_details.get('check_type', 'tcp')
+    port = check_details.get('check_port')
+    nodes = check_details.get('nodes', [])
+    threshold = check_details.get('threshold')
+
+    if not port:
+        logger.warning(f"No check_port defined for IP {ip}. Assuming online.")
+        return True, True
+
+    use_advanced_monitoring = bool(nodes and threshold)
+
+    if use_advanced_monitoring:
+        logger.info(f"IP '{ip}' advanced {check_type.upper()} check started...")
+        check_results = None
+
+        if check_type == 'http':
+            path = check_details.get('check_path', '/')
+            protocol = 'https' if check_details.get('check_protocol', 'https') != 'http' else 'http'
+            check_results = await check_host.perform_http_check(ip, port, path, protocol, nodes)
+        else:
+            check_results = await check_host.perform_check(ip, port, nodes)
+
+        if check_results is None:
+            logger.warning(f"Could not get check results for {ip}. Assuming online as a fail-safe.")
+            is_online = True
+            service_failed = True
+        else:
+            failures = sum(1 for result in check_results.values() if not result)
+            is_online = failures < threshold
+            logger.info(f"IP '{ip}' check complete. Failures: {failures}/{len(nodes)}. Threshold: {threshold}. Online: {colored_online_status(is_online)}")
+    else:
+        is_online = await check_ip_health(ip, port)
+        logger.info(f"IP '{ip}' simple check complete. Online: {colored_online_status(is_online)}")
+
+    return is_online, service_failed
+
+async def gather_all_ips_to_check(config: dict) -> dict:
+    """
+    Gathers all unique IPs/Hostnames, resolves hostnames, and prepares them for health checks.
+    """
+    unique_checks = {}
+    all_policies = config.get("load_balancer_policies", []) + config.get("failover_policies", [])
+    monitoring_groups = config.get("monitoring_groups", {})
+
+    items_to_resolve = []
+
+    for policy in all_policies:
+        if not policy.get('enabled', True):
+            continue
+
+        is_failover = 'primary_ip' in policy
+
+        if is_failover:
+            items_to_resolve.append({'value': policy.get('primary_ip'), 'policy': policy, 'is_primary': True})
+            for backup_ip in policy.get('backup_ips', []):
+                items_to_resolve.append({'value': backup_ip, 'policy': policy, 'is_primary': False})
+        else:
+            for item in policy.get("ips", []):
+                if item.get('enabled', True):
+                    items_to_resolve.append({'value': item.get('value'), 'policy': policy})
+
+    for monitor in config.get("standalone_monitors", []):
+        if monitor.get('enabled', True):
+            items_to_resolve.append({'value': monitor.get('ip'), 'policy': monitor})
+
+    resolve_tasks = [resolve_dns_to_ips(item['value']) for item in items_to_resolve if not is_valid_ip(item['value'])]
+    resolved_results = await asyncio.gather(*resolve_tasks)
+
+    resolved_map = {}
+    hostname_items = [item for item in items_to_resolve if not is_valid_ip(item['value'])]
+    for i, item in enumerate(hostname_items):
+        resolved_map[item['value']] = resolved_results[i]
+
+    for item in items_to_resolve:
+        value = item['value']
+        policy = item['policy']
+        ips_to_add = []
+
+        if is_valid_ip(value):
+            ips_to_add.append(value)
+        else:
+            ips_to_add.extend(resolved_map.get(value, []))
+
+        for ip in ips_to_add:
+            if ip in unique_checks:
+                continue
+
+            group_name = None
+            if 'primary_ip' in policy:
+                is_primary = item.get('is_primary', False)
+                group_name = policy.get('primary_monitoring_group') if is_primary else policy.get('backup_monitoring_group')
+            else:
+                group_name = policy.get('monitoring_group')
+
+            if group_name and group_name in monitoring_groups:
+                group_data = monitoring_groups[group_name]
+                unique_checks[ip] = {
+                    "ip": ip,
+                    "check_port": policy.get("check_port"),
+                    "check_type": policy.get("check_type", "tcp"),
+                    "check_path": policy.get("check_path", "/"),
+                    "check_protocol": policy.get("check_protocol", "https"),
+                    "nodes": group_data.get("nodes", []),
+                    "threshold": group_data.get("threshold", 1)
+                }
+    return unique_checks
+
+async def _run_single_health_check_with_timeout(context: ContextTypes.DEFAULT_TYPE, check: dict, timeout_seconds: int) -> tuple[bool, bool]:
+    """Runs one health check with a hard timeout so a stuck Check-Host request cannot block the whole job."""
+    ip = check.get('ip')
+    started_at = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            get_ip_health_with_cache(context, ip, check),
+            timeout=timeout_seconds
+        )
+        elapsed = time.monotonic() - started_at
+        logger.info(f"[HEALTH TIMER] IP '{ip}' finished in {elapsed:.1f}s.")
+        return result
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started_at
+        logger.warning(
+            f"[HEALTH TIMER] IP '{ip}' timed out after {elapsed:.1f}s "
+            f"(limit: {timeout_seconds}s). Marking result as UNKNOWN and monitoring service failure."
+        )
+
+        return True, True
+
+async def perform_health_checks(context: ContextTypes.DEFAULT_TYPE, unique_checks: dict) -> tuple[dict, bool, set]:
+    """
+    Performs concurrent health checks for all provided IPs.
+    Unknown results are returned separately so one failed Check-Host request does
+    not block unrelated policies or get treated as an online server.
+    """
+    checks_to_perform = list(unique_checks.values())
+    try:
+        timeout_seconds = int(os.getenv("ADVANCED_CHECK_TIMEOUT_SECONDS", "120"))
+    except ValueError:
+        timeout_seconds = 120
+    timeout_seconds = max(10, timeout_seconds)
+
+    tasks = [_run_single_health_check_with_timeout(context, check, timeout_seconds) for check in checks_to_perform]
+
+    batch_started_at = time.monotonic()
+    logger.info(
+        f"Dispatching {len(tasks)} health checks concurrently "
+        f"with per-IP hard timeout of {timeout_seconds}s..."
+    )
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"[HEALTH TIMER] perform_health_checks finished in {time.monotonic() - batch_started_at:.1f}s.")
+
+    health_results = {}
+    service_failure_detected = False
+    unknown_ips = set()
+
+    for i, check in enumerate(checks_to_perform):
+        ip = check['ip']
+        if isinstance(results[i], Exception):
+            service_failure_detected = True
+            unknown_ips.add(ip)
+            logger.error(f"Health check for IP {ip} failed with an exception: {results[i]}", exc_info=isinstance(results[i], Exception))
+        else:
+            is_online, service_failed_for_ip = results[i]
+            if service_failed_for_ip:
+                service_failure_detected = True
+                unknown_ips.add(ip)
+            else:
+                health_results[ip] = is_online
+
+    return health_results, service_failure_detected, unknown_ips
+
+async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
+    async with health_check_lock:
+        job_started_at = time.monotonic()
+        load_translations()
+        monitoring_log = load_monitoring_log()
+
+        try:
+            logger.info("--- [HEALTH CHECK] Job Started ---")
+            config = load_config()
+            if config is None:
+                logger.error("--- [HEALTH CHECK] HALTED: Config file is corrupted."); return
+
+            gather_started_at = time.monotonic()
+            unique_checks = await gather_all_ips_to_check(config)
+            logger.info(f"[HEALTH TIMER] gather_all_ips_to_check finished in {time.monotonic() - gather_started_at:.1f}s. Unique checks: {len(unique_checks)}")
+            await hcloud_check_traffic_alerts(context, config)
+            if not unique_checks:
+                logger.info("--- [HEALTH CHECK] No policies or monitors to check. Job Finished ---")
+                return
+
+            checks_started_at = time.monotonic()
+            health_results, service_failure_detected_in_job, unknown_health_ips = await perform_health_checks(context, unique_checks)
+            logger.info(f"[HEALTH TIMER] health check stage finished in {time.monotonic() - checks_started_at:.1f}s.")
+
+            now_iso = datetime.now().isoformat()
+
+            raw_super_admin_ids = os.getenv("TELEGRAM_ADMIN_IDS", "").split(',')
+            SUPER_ADMIN_IDS = {int(admin_id.strip()) for admin_id in raw_super_admin_ids if admin_id.strip().isdigit()}
+            if service_failure_detected_in_job:
+                new_failure_count = context.bot_data.get('check_host_failure_count', 0) + 1
+                context.bot_data['check_host_failure_count'] = new_failure_count
+                logger.warning(f"Check-Host service failed for one or more IPs. Failure count is now: {new_failure_count}.")
+                if new_failure_count == 3:
+                    await send_notification(context, SUPER_ADMIN_IDS, 'messages.check_host_api_down_alert', add_settings_button=True)
+                logger.warning(
+                    "[HEALTH CHECK] Monitoring results are incomplete/unknown. "
+                    f"Only affected policies will be skipped. Unknown IPs: {sorted(unknown_health_ips)}"
+                )
+            elif context.bot_data.get('check_host_failure_count', 0) > 0:
+                context.bot_data['check_host_failure_count'] = 0
+                logger.info("Check-Host service has recovered.")
+
+            context.bot_data['last_health_results'] = health_results
+            context.bot_data['last_health_check_time'] = datetime.now()
+            for ip, is_online in health_results.items():
+                monitoring_log.append({
+                    "timestamp": now_iso, "event_type": "IP_STATUS",
+                    "ip": ip, "status": "UP" if is_online else "DOWN"
+                })
+
+            if 'health_status' not in context.bot_data: context.bot_data['health_status'] = {}
+            status_data = context.bot_data['health_status']
+            lb_active_ips_map = {}
+            recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
+            recipients_map.setdefault("__default__", [])
+
+            logger.info("--- [HEALTH CHECK] Stage 1: Processing Load Balancer Policies ---")
+            lb_policies = [p for p in config.get("load_balancer_policies", []) if p.get('enabled', True)]
+            for policy in lb_policies:
+                policy_name = policy.get('policy_name', 'Unnamed LB')
+                if not policy.get('enabled', True):
+                    continue
+
+                if policy.get('maintenance_mode', False):
+                    logger.info(f"Policy '{policy_name}' is in maintenance mode. Skipping rotations.")
+                    status_data.setdefault(policy_name, {})['active_ip'] = get_text('messages.status_in_maintenance', 'fa')
+                    continue
+
+                else:
+                    current_status = status_data.get(policy_name, {}).get('active_ip')
+                if current_status == get_text('messages.status_in_maintenance', 'fa'):
+                    logger.info(f"Policy '{policy_name}' exited maintenance mode. Clearing status.")
+                    status_data[policy_name].pop('active_ip', None)
+                record_names = policy.get('record_names', [])
+                zone_name = policy.get('zone_name')
+                policy_status = status_data.setdefault(policy_name, {'lb_next_rotation_time': None})
+
+                current_pool_with_weights = []
+                for item in policy.get("ips", []):
+                    if not item.get("enabled", True): continue
+
+                    value = item.get("value")
+                    weight = item.get("weight", 1)
+                    if not value: continue
+
+                    if item.get("type") == "hostname":
+                        resolved_ips = await resolve_dns_to_ips(value)
+                        for ip in resolved_ips:
+                            current_pool_with_weights.append({"ip": ip, "weight": weight})
+                    else:
+                        current_pool_with_weights.append({"ip": value, "weight": weight})
+
+                unknown_lb_ips = sorted({
+                    ip_info['ip'] for ip_info in current_pool_with_weights
+                    if ip_info['ip'] in unknown_health_ips
+                })
+                if unknown_lb_ips:
+                    logger.warning(
+                        f"Skipping LB policy '{policy_name}' because health is unknown "
+                        f"for: {unknown_lb_ips}"
+                    )
+                    continue
+
+                healthy_lb_ips_with_weights = [ip_info for ip_info in current_pool_with_weights if health_results.get(ip_info['ip']) is True]
+
+                if not healthy_lb_ips_with_weights:
+                    logger.warning(f"All IPs for LB policy '{policy_name}' are down! No action taken.")
+                    policy_status['lb_next_rotation_time'] = None
+                    policy_status['active_ip'] = "All Down"
+                    continue
+
+                actual_ip_on_cf = await get_policy_current_dns_ip(policy)
+
+                if not actual_ip_on_cf:
+                    logger.warning(f"Could not determine current IP for LB policy '{policy_name}'. Assuming first healthy IP.")
+                    actual_ip_on_cf = healthy_lb_ips_with_weights[0]['ip']
+
+                logger.info(f"LB POLICY '{policy_name}': Checking. Current IP on DNS provider: {actual_ip_on_cf}")
+                logger.info(f"LB POLICY '{policy_name}': Healthy IPs in pool: {[ip['ip'] for ip in healthy_lb_ips_with_weights]}")
+
+                now = datetime.now()
+                next_rotation_time_str = policy_status.get('lb_next_rotation_time')
+                next_rotation_time = datetime.fromisoformat(next_rotation_time_str) if next_rotation_time_str else None
+                logger.info(f"LB POLICY '{policy_name}': Now: {now}, Next Scheduled Rotation: {next_rotation_time}")
+
+                time_to_rotate = False
+                if next_rotation_time:
+                    if now >= next_rotation_time:
+                        time_to_rotate = True
+                else:
+                    time_to_rotate = True
+
+                ip_to_set = actual_ip_on_cf
+                if time_to_rotate:
+                    rotation_algo = policy.get('rotation_algorithm', 'random')
+                    logger.info(f"Rotation triggered for LB '{policy_name}' using '{rotation_algo}' algorithm.")
+                    chosen_ip = None
+                    if rotation_algo == 'round_robin':
+                        policy_status.setdefault('wrr_state', {})
+                        wrr_state = policy_status['wrr_state']
+
+                        current_healthy_ips = {ip_info['ip'] for ip_info in healthy_lb_ips_with_weights}
+                        for ip in list(wrr_state.keys()):
+                            if ip not in current_healthy_ips:
+                                del wrr_state[ip]
+
+                        total_weight = sum(ip_info['weight'] for ip_info in healthy_lb_ips_with_weights)
+                        if total_weight > 0:
+                            best_server_ip = None
+                            for ip_info in healthy_lb_ips_with_weights:
+                                if ip_info['ip'] not in wrr_state:
+                                    wrr_state[ip_info['ip']] = 0
+
+                            for ip_info in healthy_lb_ips_with_weights:
+                                ip = ip_info['ip']
+                                wrr_state[ip] += ip_info['weight']
+                                if best_server_ip is None or wrr_state[ip] > wrr_state[best_server_ip]:
+                                    best_server_ip = ip
+
+                            if best_server_ip:
+                                wrr_state[best_server_ip] -= total_weight
+                                chosen_ip = best_server_ip
+                    else:
+                        selection_pool = [ip['ip'] for ip in healthy_lb_ips_with_weights for _ in range(ip['weight'])]
+                        if selection_pool: chosen_ip = random.choice(selection_pool)
+
+                    logger.info(f"LB POLICY '{policy_name}': Algorithm chose IP: {chosen_ip}")
+
+                    if chosen_ip and actual_ip_on_cf != chosen_ip:
+                        monitoring_log.append({
+                            "timestamp": now_iso,
+                            "event_type": "LB_ROTATION",
+                            "policy_name": policy_name,
+                            "from_ip": actual_ip_on_cf,
+                            "to_ip": chosen_ip
+                        })
+                        await switch_dns_ip(context, policy, to_ip=chosen_ip)
+                        ip_to_set = chosen_ip
+                        logger.info(f"Switched DNS for '{policy_name}' to choice: {chosen_ip}")
+                    elif chosen_ip:
+                        logger.info(f"Algorithm choice resulted in the same IP ({chosen_ip}). No DNS change needed.")
+
+                    min_h, max_h = policy.get('rotation_min_hours', 1.0), policy.get('rotation_max_hours', policy.get('rotation_min_hours', 1.0))
+                    delay = random.uniform(min_h * 3600, max_h * 3600)
+                    next_rotation = now + timedelta(seconds=delay)
+                    policy_status['lb_next_rotation_time'] = next_rotation.isoformat()
+                    logger.info(f"Next rotation for '{policy_name}' scheduled for {next_rotation.strftime('%Y-%m-%d %H:%M:%S')}.")
+
+                policy_status['active_ip'] = ip_to_set
+
+                for rec_name in record_names:
+                    lb_active_ips_map[(zone_name, rec_name)] = ip_to_set
+
+            logger.info("--- [HEALTH CHECK] Stage 2: Processing Failover Policies ---")
+            failover_policies = [p for p in config.get("failover_policies", []) if p.get('enabled', True)]
+            for policy in failover_policies:
+                policy_name = policy.get('policy_name', 'Unnamed')
+                if not policy.get('enabled', True):
+                    continue
+
+                if policy.get('maintenance_mode', False):
+                    logger.info(f"Policy '{policy_name}' is in maintenance mode. Skipping alerts and actions.")
+                    status_data.setdefault(policy_name, {})['active_ip'] = get_text('messages.status_in_maintenance', 'fa')
+                    status_data[policy_name].pop('downtime_start', None)
+                    status_data[policy_name].pop('uptime_start', None)
+                    continue
+
+                record_names = policy.get('record_names', [])
+                zone_name = policy.get('zone_name')
+                record_key = (zone_name, record_names[0]) if record_names else None
+                is_hybrid_mode = record_key in lb_active_ips_map
+
+                if is_hybrid_mode:
+                    effective_primary_ip = lb_active_ips_map[record_key]
+                    backup_ips = policy.get('backup_ips', [])
+                    if effective_primary_ip in unknown_health_ips:
+                        logger.warning(
+                            f"Skipping hybrid Failover policy '{policy_name}' because health "
+                            f"is unknown for active IP '{effective_primary_ip}'."
+                        )
+                        continue
+                    is_lb_ip_online = health_results.get(effective_primary_ip, True)
+                    if not is_lb_ip_online:
+                        logger.warning(f"HYBRID FAILOVER: Active LB IP '{effective_primary_ip}' for '{policy_name}' is DOWN. Switching to Failover backups.")
+                        next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip) is True), None)
+                        if next_healthy_backup:
+                            monitoring_log.append({
+                                "timestamp": now_iso,
+                                "event_type": "FAILOVER",
+                                "policy_name": policy_name,
+                                "from_ip": effective_primary_ip,
+                                "to_ip": next_healthy_backup,
+                                "mode": "hybrid"
+                            })
+                            await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
+
+                            recipients_to_notify = set(SUPER_ADMIN_IDS)
+                            recipient_key = f"__policy__{policy_name}"
+                            if recipient_key in recipients_map: recipients_to_notify.update(recipients_map[recipient_key])
+                            else: recipients_to_notify.update(recipients_map["__default__"])
+
+                            await send_notification(context, recipients_to_notify, 'messages.failover_notification_message', policy_name=policy_name, from_ip=effective_primary_ip, to_ip=next_healthy_backup, add_settings_button=True)
+                else:
+                    primary_ip_or_host = policy.get('primary_ip')
+                    backup_ips = policy.get('backup_ips', [])
+                    if not all([primary_ip_or_host, backup_ips, record_names, zone_name]):
+                        continue
+
+                    primary_ips_resolved = await resolve_dns_to_ips(primary_ip_or_host)
+                    if not primary_ips_resolved:
+                        logger.warning(f"Could not resolve primary hostname '{primary_ip_or_host}' for policy '{policy_name}'. Treating as offline.")
+                        is_primary_online = False
+                        primary_ip_to_use_for_notification = primary_ip_or_host
+                    else:
+                        primary_ip_to_use = primary_ips_resolved[0]
+                        if primary_ip_to_use in unknown_health_ips:
+                            logger.warning(
+                                f"Skipping Failover policy '{policy_name}' because health is "
+                                f"unknown for primary IP '{primary_ip_to_use}'."
+                            )
+                            continue
+                        is_primary_online = health_results.get(primary_ip_to_use, True)
+                        primary_ip_to_use_for_notification = primary_ip_to_use
+
+                    policy_status = status_data.setdefault(policy_name, {'critical_alert_sent': False, 'uptime_start': None, 'downtime_start': None})
+
+                    actual_ip_on_cf = await get_policy_current_dns_ip(policy)
+
+                    if not actual_ip_on_cf:
+                        logger.warning(f"Could not determine current IP for Failover policy '{policy_name}'. Skipping.")
+                        continue
+
+                    recipients_to_notify = set(SUPER_ADMIN_IDS)
+                    recipient_key = f"__policy__{policy_name}"
+                    if recipient_key in recipients_map: recipients_to_notify.update(recipients_map[recipient_key])
+                    else: recipients_to_notify.update(recipients_map["__default__"])
+
+                    pending_primary_change = policy.get('pending_primary_change') or {}
+                    pending_target_ip = pending_primary_change.get('to_ip')
+                    pending_requires_failback = bool(pending_primary_change.get('requires_failback', False))
+
+                    if pending_target_ip == primary_ip_or_host and not is_primary_online and not pending_requires_failback:
+                        if not mark_pending_primary_change_requires_failback(policy_name, primary_ip_or_host):
+                            logger.warning(
+                                f"PRIMARY CHANGE SYNC: Could not persist the DOWN state for "
+                                f"'{policy_name}'. Deferring DNS actions until the next check."
+                            )
+                            continue
+                        pending_primary_change['requires_failback'] = True
+                        pending_primary_change['primary_down_observed_at'] = now_iso
+                        pending_requires_failback = True
+                        logger.info(
+                            f"PRIMARY CHANGE SYNC: New primary '{primary_ip_or_host}' for "
+                            f"'{policy_name}' is DOWN. Future recovery will follow auto-failback "
+                            f"and the configured failback delay."
+                        )
+
+                    if pending_target_ip == primary_ip_or_host and is_primary_online and not pending_requires_failback:
+                        logger.info(
+                            f"PRIMARY CHANGE SYNC: Applying pending primary IP change for "
+                            f"'{policy_name}' to '{primary_ip_to_use}'."
+                        )
+                        updated_count = await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
+                        sync_status = await get_policy_dns_sync_status(policy, primary_ip_to_use)
+
+                        if sync_status.get('success'):
+                            change_cleared = clear_pending_primary_change(policy_name, primary_ip_or_host)
+                            if not change_cleared:
+                                logger.warning(
+                                    f"PRIMARY CHANGE SYNC: DNS was verified for '{policy_name}', "
+                                    "but a newer config change exists. The current pending state was preserved."
+                                )
+                                continue
+
+                            policy.pop('pending_primary_change', None)
+                            policy_status.pop('uptime_start', None)
+                            policy_status.pop('downtime_start', None)
+                            policy_status['critical_alert_sent'] = False
+                            monitoring_log.append({
+                                "timestamp": now_iso,
+                                "event_type": "PRIMARY_IP_CHANGE",
+                                "policy_name": policy_name,
+                                "from_ip": pending_primary_change.get('from_ip', '-'),
+                                "to_ip": primary_ip_to_use,
+                                "updated_records": updated_count,
+                                "total_records": sync_status.get('total_records', 0),
+                            })
+                            await send_notification(
+                                context,
+                                recipients_to_notify,
+                                'messages.primary_ip_change_applied_notification',
+                                policy_name=policy_name,
+                                from_ip=pending_primary_change.get('from_ip', '-'),
+                                to_ip=primary_ip_to_use,
+                                updated_count=updated_count,
+                                total_records=sync_status.get('total_records', 0),
+                                add_settings_button=True,
+                            )
+                            logger.info(
+                                f"PRIMARY CHANGE SYNC: Verified all "
+                                f"{sync_status.get('total_records', 0)} record(s) for '{policy_name}'."
+                            )
+                        else:
+                            logger.error(
+                                f"PRIMARY CHANGE SYNC: Verification failed for '{policy_name}'. "
+                                f"Mismatched records: {sync_status.get('mismatched_records', [])}; "
+                                f"missing names: {sync_status.get('missing_record_names', [])}; "
+                                f"error: {sync_status.get('error')}. The change remains pending for retry."
+                            )
+                        continue
+
+                    if is_primary_online:
+                        if policy_status.get('downtime_start') or policy_status.get('critical_alert_sent'):
+                             await send_notification(context, recipients_to_notify, 'messages.server_recovered_notification', policy_name=policy_name, ip=primary_ip_to_use_for_notification)
+
+                        policy_status['downtime_start'] = None
+                        policy_status['critical_alert_sent'] = False
+
+                        if actual_ip_on_cf != primary_ip_to_use:
+                            is_on_valid_backup = actual_ip_on_cf in backup_ips
+
+                            if not policy.get('auto_failback', True):
+                                policy_status.pop('uptime_start', None)
+                                logger.info(f"Primary IP for '{policy_name}' is online, but auto-failback is disabled. No action taken.")
+
+                            elif is_on_valid_backup:
+                                if not policy_status.get('uptime_start'):
+                                    policy_status['uptime_start'] = datetime.now().isoformat()
+                                    await send_notification(context, recipients_to_notify, 'messages.failback_alert_notification',
+                                                            policy_name=policy_name, primary_ip=primary_ip_to_use_for_notification,
+                                                            failback_minutes=policy.get('failback_minutes', 5.0))
+
+                                uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
+                                if (datetime.now() - uptime_dt) >= timedelta(minutes=policy.get('failback_minutes', 5.0)):
+                                    logger.info(f"FAILBACK TRIGGERED for '{policy_name}'. Switching to primary IP {primary_ip_to_use}.")
+                                    updated_count = await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
+                                    sync_status = await get_policy_dns_sync_status(policy, primary_ip_to_use)
+                                    if not sync_status.get('success'):
+                                        logger.error(
+                                            f"FAILBACK verification failed for '{policy_name}'. "
+                                            f"Mismatched records: {sync_status.get('mismatched_records', [])}; "
+                                            f"missing names: {sync_status.get('missing_record_names', [])}. "
+                                            "The next health check will retry."
+                                        )
+                                        continue
+
+                                    monitoring_log.append({
+                                        "timestamp": now_iso,
+                                        "event_type": "FAILBACK",
+                                        "policy_name": policy_name,
+                                        "from_ip": actual_ip_on_cf,
+                                        "to_ip": primary_ip_to_use,
+                                        "mode": "pending_primary_change" if pending_requires_failback else "standard",
+                                    })
+
+                                    if pending_target_ip == primary_ip_or_host and pending_requires_failback:
+                                        if not clear_pending_primary_change(policy_name, primary_ip_or_host):
+                                            logger.warning(
+                                                f"FAILBACK for '{policy_name}' was verified, but a newer "
+                                                "config change exists. Its pending state was preserved."
+                                            )
+                                            continue
+                                        policy.pop('pending_primary_change', None)
+                                        await send_notification(
+                                            context,
+                                            recipients_to_notify,
+                                            'messages.primary_ip_change_applied_notification',
+                                            policy_name=policy_name,
+                                            from_ip=pending_primary_change.get('from_ip', '-'),
+                                            to_ip=primary_ip_to_use,
+                                            updated_count=updated_count,
+                                            total_records=sync_status.get('total_records', 0),
+                                            add_settings_button=True,
+                                        )
+                                    else:
+                                        await send_notification(
+                                            context,
+                                            recipients_to_notify,
+                                            'messages.failback_executed_notification',
+                                            policy_name=policy_name,
+                                            primary_ip=primary_ip_to_use_for_notification,
+                                            add_settings_button=True,
+                                        )
+                                    policy_status.pop('uptime_start', None)
+
+                            else:
+                                logger.warning(f"SELF-HEALING: DNS for '{policy_name}' points to an invalid IP ({actual_ip_on_cf}) while primary is online. Correcting immediately.")
+                                monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip_to_use, "mode": "self-heal"})
+                                await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
+                                policy_status.pop('uptime_start', None)
+
+                        else:
+                            policy_status.pop('uptime_start', None)
+
+                    else:
+                        policy_status.pop('uptime_start', None)
+                        if actual_ip_on_cf in unknown_health_ips:
+                            logger.warning(
+                                f"Skipping Failover actions for '{policy_name}' because health "
+                                f"is unknown for the active DNS IP '{actual_ip_on_cf}'."
+                            )
+                            continue
+                        is_current_ip_online = health_results.get(actual_ip_on_cf, True)
+                        is_on_valid_backup = actual_ip_on_cf in backup_ips
+
+                        if is_current_ip_online and not is_on_valid_backup and actual_ip_on_cf != primary_ip_or_host:
+                            logger.warning(f"SELF-HEALING: DNS for '{policy_name}' points to an invalid IP ({actual_ip_on_cf}) while primary is offline. Finding a valid backup.")
+                            is_current_ip_online = False
+
+                        if is_current_ip_online and is_on_valid_backup:
+                            logger.info(f"Policy '{policy_name}' is stable on backup IP {actual_ip_on_cf}.")
+                            policy_status['downtime_start'] = None
+                            policy_status['critical_alert_sent'] = False
+
+                        else:
+                            if actual_ip_on_cf == primary_ip_to_use and not policy_status.get('downtime_start'):
+                                policy_status['downtime_start'] = datetime.now().isoformat()
+                                await send_notification(context, recipients_to_notify, 'messages.server_alert_notification',
+                                                        add_settings_button=True, policy_name=policy_name, ip=primary_ip_to_use_for_notification)
+
+                            downtime_start_str = policy_status.get('downtime_start')
+                            if downtime_start_str:
+                                downtime_dt = datetime.fromisoformat(downtime_start_str)
+                                elapsed_seconds = (datetime.now() - downtime_dt).total_seconds()
+                                required_seconds = policy.get("failover_minutes", 2.0) * 60
+                                if elapsed_seconds < required_seconds:
+                                    logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
+                                    continue
+
+                            next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip) is True), None)
+                            unknown_backup_ips = [ip for ip in backup_ips if ip in unknown_health_ips]
+
+                            if not next_healthy_backup and unknown_backup_ips:
+                                logger.warning(
+                                    f"Deferring Failover decision for '{policy_name}' because "
+                                    f"backup health is unknown for: {unknown_backup_ips}"
+                                )
+                                continue
+
+                            if next_healthy_backup:
+                                if next_healthy_backup != actual_ip_on_cf:
+                                    logger.warning(f"FAILOVER TRIGGERED for '{policy_name}'. Switching from {actual_ip_on_cf} to {next_healthy_backup}.")
+                                    monitoring_log.append({"timestamp": now_iso, "event_type": "FAILOVER", "policy_name": policy_name, "from_ip": actual_ip_on_cf, "to_ip": next_healthy_backup, "mode": "standard"})
+                                    await switch_dns_ip(context, policy, to_ip=next_healthy_backup)
+                                    await send_notification(context, recipients_to_notify, 'messages.failover_notification_message',
+                                                            add_settings_button=True, policy_name=policy_name, from_ip=actual_ip_on_cf, to_ip=next_healthy_backup)
+                                policy_status['downtime_start'] = None
+                                policy_status['critical_alert_sent'] = False
+
+                            else:
+                                if not policy_status.get('critical_alert_sent', False):
+                                    logger.error(f"CRITICAL ALERT for '{policy_name}': Primary and all backup IPs are down.")
+                                    await send_notification(context, recipients_to_notify, 'messages.failover_notification_all_down',
+                                                            add_settings_button=True, policy_name=policy_name,
+                                                            primary_ip=primary_ip_to_use_for_notification, backup_ips=", ".join(backup_ips))
+                                    policy_status['critical_alert_sent'] = True
+                    pass
+
+            logger.info("--- [HEALTH CHECK] Stage 3: Processing Standalone Monitors ---")
+
+            if 'monitor_status' not in context.bot_data:
+                context.bot_data['monitor_status'] = {}
+
+            standalone_monitors = config.get("standalone_monitors", [])
+            recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
+            recipients_map.setdefault("__default__", [])
+
+            for monitor in standalone_monitors:
+                if not monitor.get('enabled', True): continue
+
+                monitor_name = monitor.get("monitor_name")
+                input_addr = monitor.get("ip")
+                port = monitor.get("check_port")
+
+                if not all([monitor_name, input_addr, port]):
+                    continue
+
+                is_currently_online = True
+
+                if is_valid_ip(input_addr):
+                    if input_addr in unknown_health_ips:
+                        logger.warning(
+                            f"Skipping standalone monitor '{monitor_name}' because health "
+                            f"is unknown for '{input_addr}'."
+                        )
+                        continue
+                    is_currently_online = health_results.get(input_addr, True)
+                else:
+                    resolved_monitor_ips = await resolve_dns_to_ips(input_addr)
+                    if not resolved_monitor_ips:
+                        is_currently_online = False
+                        logger.warning(f"Monitor '{monitor_name}': Could not resolve domain '{input_addr}'. Treating as DOWN.")
+                    else:
+                        if any(ip in unknown_health_ips for ip in resolved_monitor_ips):
+                            logger.warning(
+                                f"Skipping standalone monitor '{monitor_name}' because one or "
+                                f"more resolved IP health results are unknown."
+                            )
+                            continue
+                        statuses = [health_results.get(rip, False) for rip in resolved_monitor_ips if rip in health_results]
+
+                        if statuses:
+                            is_currently_online = any(statuses)
+                        else:
+                            is_currently_online = True
+
+                was_previously_online = context.bot_data['monitor_status'].get(monitor_name, True)
+
+                if (is_currently_online and not was_previously_online) or (not is_currently_online and was_previously_online):
+                    message_key = 'messages.monitor_up_alert' if is_currently_online else 'messages.monitor_down_alert'
+                    recipients_to_notify = set(SUPER_ADMIN_IDS)
+                    recipient_key = f"__monitor__{monitor_name}"
+
+                    logger.info(f"--- Monitor Alert '{monitor_name}': Status Changed {was_previously_online} -> {is_currently_online} ---")
+                    logger.info(f"  - Building recipients for monitor '{monitor_name}' with key '{recipient_key}'")
+
+                    if recipient_key in recipients_map:
+                        logger.info(f"  - Using specific list. Members: {recipients_map[recipient_key]}")
+                        recipients_to_notify.update(recipients_map[recipient_key])
+                    else:
+                        logger.info(f"  - Using default list. Members: {recipients_map['__default__']}")
+                        recipients_to_notify.update(recipients_map["__default__"])
+
+                    await send_notification(context, recipients_to_notify, message_key,
+                                            monitor_name=monitor_name, ip=input_addr, port=port)
+
+                context.bot_data['monitor_status'][monitor_name] = is_currently_online
+
+        except Exception as e:
+            logger.error(f"!!! [HEALTH CHECK] An unhandled exception in health_check_job !!!", exc_info=True)
+
+        finally:
+            logger.info("--- [HEALTH CHECK] Finalizing job and saving logs. ---")
+            save_monitoring_log(monitoring_log)
+            try:
+                await context.application.persistence.flush()
+            except Exception as e:
+                logger.error(f"Failed to flush persistence at the end of health check job: {e}")
+            logger.info(f"[HEALTH TIMER] total health_check_job time: {time.monotonic() - job_started_at:.1f}s.")
+            logger.info("--- [HEALTH CHECK] Job Finished ---")
+
+async def manual_health_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Performs an on-demand health check for a specific policy or monitor."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    await query.edit_message_text(get_text('messages.manual_check_in_progress', lang))
+
+    try:
+        _, item_type, item_index_str = query.data.split('|')
+        item_index = int(item_index_str)
+
+        config = load_config()
+        items_to_check = []
+        policy_name = "N/A"
+        policy = {}
+
+        if item_type == 'monitor':
+            policy = config['standalone_monitors'][item_index]
+            policy_name = policy.get("monitor_name", "N/A")
+            ip = policy.get('ip')
+            if ip:
+                items_to_check.append({'value': ip, 'type': 'ip', 'group': policy.get('monitoring_group')})
+        else:
+            policy_list_key = "load_balancer_policies" if item_type == 'lb' else "failover_policies"
+            policy = config[policy_list_key][item_index]
+            policy_name = policy.get("policy_name", "N/A")
+
+            if item_type == 'failover':
+                primary_ip = policy.get('primary_ip')
+                if primary_ip:
+                    items_to_check.append({'value': primary_ip, 'type': 'ip', 'group': policy.get('primary_monitoring_group')})
+                for backup_ip in policy.get('backup_ips', []):
+                    items_to_check.append({'value': backup_ip, 'type': 'ip', 'group': policy.get('backup_monitoring_group')})
+
+            elif item_type == 'lb':
+                for item in policy.get('ips', []):
+                    items_to_check.append({
+                        'value': item.get('value'),
+                        'type': item.get('type', 'ip'),
+                        'group': policy.get('monitoring_group')
+                    })
+
+        final_ips_to_check = []
+        for item in items_to_check:
+            if item.get('type') == 'hostname':
+                resolved_ips = await resolve_dns_to_ips(item['value'])
+                for ip in resolved_ips:
+                    final_ips_to_check.append({'ip': ip, 'group': item['group']})
+            elif item.get('type') == 'ip':
+                final_ips_to_check.append({'ip': item['value'], 'group': item['group']})
+
+        if not final_ips_to_check:
+            await query.edit_message_text(get_text('messages.manual_check_no_ips', lang))
+            return
+
+        monitoring_groups = config.get("monitoring_groups", {})
+        results = []
+
+        for ip_info in final_ips_to_check:
+            ip = ip_info.get('ip')
+            if not ip: continue
+
+            group_name = ip_info.get('group')
+            check_details = {
+                "check_port": policy.get("check_port"),
+                "check_type": policy.get("check_type", "tcp"),
+                "check_path": policy.get("check_path", "/"),
+                "check_protocol": policy.get("check_protocol", "https")
+            }
+
+            if group_name and group_name in monitoring_groups:
+                group_data = monitoring_groups[group_name]
+                check_details.update({"nodes": group_data.get("nodes", []), "threshold": group_data.get("threshold", 1)})
+            elif group_name:
+                logger.warning(f"Monitoring group '{group_name}' not found for '{policy_name}'.")
+
+            is_online, _ = await get_ip_health_with_cache(context, ip, check_details)
+            status_text = get_text('messages.manual_check_status_online', lang) if is_online else get_text('messages.manual_check_status_offline', lang)
+            results.append(get_text('messages.manual_check_result_item', lang, ip=ip, status=status_text))
+
+        result_text = get_text('messages.manual_check_results_header', lang, policy_name=escape_html(policy_name)) + "\n".join(results)
+
+        buttons = []
+        if item_type == 'monitor':
+            back_to_source_callback = "monitors_menu"
+            back_to_source_text_key = 'buttons.back_to_list'
+        else:
+            back_to_source_callback = f"{item_type}_policy_view|{item_index}"
+            back_to_source_text_key = 'buttons.back_to_policy_details'
+
+        buttons.append([InlineKeyboardButton(get_text(back_to_source_text_key, lang), callback_data=back_to_source_callback)])
+        buttons.append([InlineKeyboardButton(get_text('buttons.back_to_status_list', lang), callback_data="status_refresh")])
+
+        await query.edit_message_text(result_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    except (IndexError, KeyError, ValueError) as e:
+        logger.error(f"A session/key error in manual_health_check_callback: {e}", exc_info=True)
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+    except Exception as e:
+        logger.error(f"Error in manual_health_check_callback: {e}", exc_info=True)
+        await query.edit_message_text(get_text('messages.manual_check_error', lang))
+
+def clean_old_monitoring_logs(context: ContextTypes.DEFAULT_TYPE):
+    """Removes old monitoring log entries based on the configured retention period."""
+    config = load_config()
+    retention_days = config.get("log_retention_days", 30)
+
+    if retention_days <= 0:
+        return
+
+    log = load_monitoring_log()
+    if not log:
+        return
+
+    cutoff_date = datetime.now() - timedelta(days=retention_days)
+
+    recent_logs = [entry for entry in log if datetime.fromisoformat(entry['timestamp']) >= cutoff_date]
+
+    if len(recent_logs) < len(log):
+        save_monitoring_log(recent_logs)
+        logger.info(f"Cleaned up {len(log) - len(recent_logs)} old monitoring log entries (older than {retention_days} days).")
+
+async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """Generates and sends the daily monitoring report to all admins."""
+    logger.info("--- [JOB] Generating and sending daily report... ---")
+
+    clean_old_monitoring_logs()
+    log = load_monitoring_log()
+    now = datetime.now()
+    cutoff_date = now - timedelta(hours=24)
+    recent_events = [e for e in log if datetime.fromisoformat(e['timestamp']) >= cutoff_date]
+
+    failover_events = [e for e in recent_events if e['event_type'] == 'FAILOVER']
+    failback_events = [e for e in recent_events if e['event_type'] == 'FAILBACK']
+    lb_rotations = [e for e in recent_events if e['event_type'] == 'LB_ROTATION']
+
+    lb_duration_stats = {}
+    if lb_rotations:
+        rotations_by_policy = {}
+        for event in lb_rotations:
+            policy_name = event.get('policy_name')
+            if not policy_name: continue
+            if policy_name not in rotations_by_policy:
+                rotations_by_policy[policy_name] = []
+            rotations_by_policy[policy_name].append(event)
+
+        for policy_name, events in rotations_by_policy.items():
+            if not events: continue
+            events.sort(key=lambda e: e['timestamp'])
+
+            ip_durations_seconds = {}
+
+            involved_ips = set()
+            for event in events:
+                involved_ips.add(event.get('from_ip'))
+                involved_ips.add(event.get('to_ip'))
+
+            for ip in involved_ips:
+                if not ip: continue
+                total_active_time = timedelta()
+
+                for i, event in enumerate(events):
+                    if event.get('to_ip') == ip:
+                        start_time = datetime.fromisoformat(event['timestamp'])
+                        end_time = now
+                        if i + 1 < len(events):
+                            end_time = datetime.fromisoformat(events[i+1]['timestamp'])
+
+                        start_time = max(start_time, cutoff_date)
+                        end_time = min(end_time, now)
+
+                        if end_time > start_time:
+                            total_active_time += (end_time - start_time)
+
+                initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
+                if initial_events:
+                    active_ip_at_start = initial_events[-1].get('to_ip')
+                    if active_ip_at_start == ip:
+                        first_event_time_in_window = events[0]['timestamp']
+                        duration = datetime.fromisoformat(first_event_time_in_window) - cutoff_date
+                        if duration.total_seconds() > 0:
+                            total_active_time += duration
+
+                if total_active_time.total_seconds() > 0:
+                    ip_durations_seconds[ip] = total_active_time.total_seconds()
+
+            total_duration_seconds = sum(ip_durations_seconds.values())
+            if total_duration_seconds > 0:
+                lb_duration_stats[policy_name] = {
+                    ip: {
+                        "hours": seconds / 3600,
+                        "percent": (seconds / total_duration_seconds) * 100
+                    } for ip, seconds in ip_durations_seconds.items()
+                }
+
+    uptime_stats = {}
+    ip_status_events = [e for e in recent_events if e['event_type'] == 'IP_STATUS']
+
+    if ip_status_events:
+        unique_ips_in_log = sorted(list(set(e['ip'] for e in ip_status_events)))
+        for ip in unique_ips_in_log:
+            ip_specific_log = [e for e in ip_status_events if e['ip'] == ip]
+            if ip_specific_log:
+                up_checks = sum(1 for e in ip_specific_log if e['status'] == 'UP')
+                uptime_percent = (up_checks / len(ip_specific_log)) * 100
+                uptime_stats[ip] = f"{uptime_percent:.2f}"
+
+    config = load_config()
+    all_admin_ids = set(config.get("notifications", {}).get("chat_ids", [])) | SUPER_ADMIN_IDS
+    user_data = await context.application.persistence.get_user_data()
+
+    for chat_id in all_admin_ids:
+        lang = user_data.get(chat_id, {}).get('language', 'fa')
+        message_parts = [get_text('messages.daily_report_header', lang)]
+
+        if not failover_events and not lb_rotations and not failback_events:
+            message_parts.append(get_text('messages.daily_report_no_events', lang))
+        else:
+            message_parts.append(get_text('messages.daily_report_summary', lang, failovers=len(failover_events), failbacks=len(failback_events), rotations=len(lb_rotations)))
+            if failover_events:
+                message_parts.append(get_text('messages.daily_report_failover_header', lang))
+                for event in failover_events:
+                    safe_event = {k: escape_html(str(v)) for k, v in event.items()}
+                    message_parts.append(get_text('messages.daily_report_failover_entry', lang, **safe_event))
+
+        if lb_duration_stats:
+            message_parts.append(get_text('messages.report_lb_duration_header', lang))
+            for policy_name, stats in sorted(lb_duration_stats.items()):
+                message_parts.append(get_text('messages.report_lb_duration_entry', lang, policy_name=escape_html(policy_name)))
+                for ip, data in sorted(stats.items(), key=lambda item: item[1]['percent'], reverse=True):
+                    message_parts.append(get_text('messages.report_lb_duration_ip_entry', lang, ip=ip, hours=data['hours'], percent=data['percent']))
+
+        if uptime_stats:
+            message_parts.append(get_text('messages.report_uptime_header', lang))
+            for ip, uptime_percent in sorted(uptime_stats.items()):
+                message_parts.append(get_text('messages.report_uptime_entry', lang, ip=ip, uptime_percent=uptime_percent))
+
+        full_message = "\n".join(message_parts)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to send daily report to {chat_id}: {e}")
+
+def clear_state(context: ContextTypes.DEFAULT_TYPE, preserve=None):
+    if preserve is None: preserve = []
+    if 'language' not in preserve: preserve.append('language')
+    preserved_data = {key: context.user_data[key] for key in preserve if key in context.user_data}
+    context.user_data.clear()
+    context.user_data.update(preserved_data)
+
+async def display_records_for_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Displays a paginated list of records for policy selection."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    selection_purpose = context.user_data.get('record_selection_purpose', 'policy_records')
+
+    if selection_purpose == 'pool_items':
+        prompt_key = 'prompts.select_records_for_lb_pool'
+        confirm_callback = "confirm_pool_selection"
+    elif selection_purpose == 'primary_ip':
+        prompt_key = 'prompts.select_primary_ip_method'
+        confirm_callback = "policy_confirm_records"
+    else:
+        prompt_key = 'prompts.select_records_for_policy'
+        confirm_callback = "policy_confirm_records"
+
+    is_editing = context.user_data.get('is_editing_policy_records', False)
+    policy_type = context.user_data.get('editing_policy_type') if is_editing else context.user_data.get('add_policy_type')
+
+    try:
+        if is_editing or context.user_data.get('editing_policy_type'):
+            policy_index = context.user_data['edit_policy_index']
+            config = load_config()
+            policy_list_key = 'load_balancer_policies' if context.user_data.get('editing_policy_type') == 'lb' else 'failover_policies'
+            policy = config[policy_list_key][policy_index]
+            account_nickname, zone_name = policy['account_nickname'], policy['zone_name']
+            provider = get_policy_provider(policy)
+        else:
+            account_nickname = context.user_data['new_policy_data']['account_nickname']
+            zone_name = context.user_data['new_policy_data']['zone_name']
+            provider = context.user_data['new_policy_data'].get('provider', 'cloudflare')
+    except (KeyError, IndexError, TypeError):
+        logger.error("Failed to retrieve policy data in display_records_for_selection context.", exc_info=True)
+        if query: await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    if 'policy_all_records' not in context.user_data or context.user_data.get('current_selection_zone') != zone_name:
+        if query: await query.edit_message_text(get_text('messages.fetching_records', lang))
+        token = get_account_token(provider, account_nickname)
+        if not token:
+            if query: await query.edit_message_text(get_text('messages.error_no_token', lang)); return
+
+        zone_identifier = zone_name
+        if provider == 'cloudflare':
+            zones = await get_all_zones(token)
+            zone_identifier = next((z['id'] for z in zones if z['name'] == zone_name), None)
+            if not zone_identifier:
+                if query: await query.edit_message_text(get_text('messages.error_no_zone_id', lang)); return
+
+        all_records_raw = await get_provider_dns_records(provider, token, zone_identifier)
+
+        if selection_purpose in ['pool_items', 'primary_ip', 'backup_ips']:
+            record_types = ['A', 'AAAA', 'CNAME']
+        else:
+            record_types = ['A', 'AAAA']
+        context.user_data['policy_all_records'] = [r for r in all_records_raw if str(r.get('type', '')).upper() in record_types]
+        context.user_data['current_selection_zone'] = zone_name
+
+    all_records = context.user_data.get('policy_all_records', [])
+    selected_records = context.user_data.get('policy_selected_records', [])
+
+    if not all_records:
+        await query.edit_message_text(get_text('errors.no_selectable_records', lang, zone_name=zone_name))
+        return
+
+    start_index = page * RECORDS_PER_PAGE
+    end_index = start_index + RECORDS_PER_PAGE
+    records_on_page = all_records[start_index:end_index]
+
+    buttons = []
+    for record in records_on_page:
+        short_name = get_short_name(record['name'], zone_name)
+        check_icon = "✅" if short_name in selected_records else "▫️"
+        button_text = f"{check_icon} {record.get('type', '')} {short_name} ({record.get('content', '')})"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"policy_select_record|{short_name}|{page}")])
+
+    pagination_buttons = []
+    if page > 0:
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.previous', lang), callback_data=f"policy_records_page|{page - 1}"))
+    if end_index < len(all_records):
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next', lang), callback_data=f"policy_records_page|{page + 1}"))
+    if pagination_buttons: buttons.append(pagination_buttons)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection', lang, count=len(selected_records)), callback_data=confirm_callback)])
+
+    try:
+        if query:
+            await query.edit_message_text(get_text(prompt_key, lang), reply_markup=InlineKeyboardMarkup(buttons))
+    except error.BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.error("A BadRequest error occurred in display_records_for_selection", exc_info=True)
+
+NODES_PER_PAGE = 12
+
+async def display_countries_for_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    now = datetime.now()
+    nodes_last_updated = context.bot_data.get('nodes_last_updated')
+    should_refresh_nodes = 'all_nodes' not in context.bot_data or \
+                           not nodes_last_updated or \
+                           (now - nodes_last_updated) > timedelta(hours=24)
+
+    if should_refresh_nodes:
+        await send_or_edit(update, context, get_text('messages.fetching_locations_message', lang))
+        nodes_data = await check_host.get_nodes()
+        if not nodes_data:
+            await send_or_edit(update, context, get_text('messages.fetching_locations_error', lang))
+            return
+
+        countries = {}
+        for node_id, info in nodes_data.items():
+            country_code = info.get('location', 'UN').lower()
+            country_name = info.get('country', 'Unknown')
+            if country_code not in countries:
+                countries[country_code] = {'name': country_name, 'nodes': []}
+            countries[country_code]['nodes'].append(node_id)
+
+        context.bot_data['all_nodes'] = nodes_data
+        context.bot_data['countries'] = dict(sorted(countries.items(), key=lambda item: item[1]['name']))
+        context.bot_data['nodes_last_updated'] = now
+        logger.info(f"Successfully fetched and cached {len(nodes_data)} nodes.")
+
+    countries = context.bot_data.get('countries', {})
+    country_codes = list(countries.keys())
+
+    buttons = []
+
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+    header_text = f"<b>Selected Nodes:</b>\n"
+    if selected_nodes:
+        selected_cities = []
+        for node_id in sorted(selected_nodes)[:10]:
+            node_info = context.bot_data.get('all_nodes', {}).get(node_id, {})
+            city = escape_html(node_info.get('city', 'Unknown'))
+            country = escape_html(node_info.get('country', 'Unknown'))
+            selected_cities.append(f"<code>{city} ({country})</code>")
+        header_text += ", ".join(selected_cities)
+        if len(selected_nodes) > 10:
+            header_text += f" ...and {len(selected_nodes) - 10} more."
+    else:
+        header_text += "<i>None</i>"
+
+    message_text = f"{header_text}\n\n" + get_text('messages.select_country_message', lang)
+
+    action_buttons = [
+        InlineKeyboardButton(get_text('buttons.select_all_nodes', lang), callback_data="policy_nodes_select_all_global"),
+        InlineKeyboardButton(get_text('buttons.clear_all_nodes', lang), callback_data="policy_nodes_clear_all_global")
+    ]
+    buttons.append(action_buttons)
+    buttons.append([InlineKeyboardButton(get_text('buttons.force_update_nodes', lang), callback_data="policy_force_update_nodes")])
+
+    start_index = page * NODES_PER_PAGE
+    end_index = start_index + NODES_PER_PAGE
+    page_countries = country_codes[start_index:end_index]
+
+    row = []
+    for code in page_countries:
+        country_info = countries[code]
+        flag = get_flag_emoji(code)
+        country_name = f"{flag} {country_info['name']}"
+        row.append(InlineKeyboardButton(country_name, callback_data=f"policy_select_country|{code}|0"))
+        if len(row) == 2: buttons.append(row); row = []
+    if row: buttons.append(row)
+
+    pagination_buttons = []
+    if page > 0:
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.back_button', lang), callback_data=f"policy_country_page|{page - 1}"))
+    if end_index < len(country_codes):
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next_button', lang), callback_data=f"policy_country_page|{page + 1}"))
+    if pagination_buttons: buttons.append(pagination_buttons)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection_button', lang, count=len(selected_nodes)), callback_data="policy_confirm_nodes")])
+
+    policy_type = context.user_data.get('editing_policy_type')
+
+    if policy_type == 'group':
+        back_button_callback = "groups_menu"
+        back_button_text = get_text('buttons.back_to_list', lang)
+    else:
+        policy_index = context.user_data.get('edit_policy_index')
+        if policy_index is None:
+            await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
+            return
+        back_button_callback = f"lb_policy_edit|{policy_index}" if policy_type == 'lb' else f"failover_policy_edit|{policy_index}"
+        back_button_text = get_text('buttons.back_to_edit_menu_button', lang)
+
+    buttons.append([InlineKeyboardButton(back_button_text, callback_data=back_button_callback)])
+
+    await send_or_edit(update, context, message_text, InlineKeyboardMarkup(buttons))
+
+NODES_PER_PAGE = 12
+
+async def display_nodes_for_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, country_code: str, page: int = 0):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    countries = context.bot_data.get('countries', {})
+    country_info = countries.get(country_code)
+    if not country_info:
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    all_node_ids_in_country = sorted(country_info['nodes'])
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+
+    start_index = page * NODES_PER_PAGE
+    end_index = start_index + NODES_PER_PAGE
+    page_nodes = all_node_ids_in_country[start_index:end_index]
+
+    buttons = []
+    for node_id in page_nodes:
+        check_icon = "✅" if node_id in selected_nodes else "▫️"
+        city = context.bot_data['all_nodes'][node_id].get('city', 'Unknown')
+        button_text = f"{check_icon} {city}"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"policy_toggle_node|{country_code}|{page}|{node_id}")])
+
+    pagination_buttons = []
+    if page > 0:
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.back_button', lang), callback_data=f"policy_nodes_page|{country_code}|{page - 1}"))
+    if end_index < len(all_node_ids_in_country):
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next_button', lang), callback_data=f"policy_nodes_page|{country_code}|{page + 1}"))
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.confirm_selection_button', lang, count=len(selected_nodes)), callback_data="policy_confirm_nodes")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_countries_button', lang), callback_data="policy_country_page|0")])
+
+    header_text = f"<b>Selected Nodes:</b>\n"
+    if selected_nodes:
+        selected_cities = []
+        for node_id in sorted(selected_nodes)[:10]:
+            node_info = context.bot_data.get('all_nodes', {}).get(node_id, {})
+            city = escape_html(node_info.get('city', 'Unknown'))
+            country = escape_html(node_info.get('country', 'Unknown'))
+            selected_cities.append(f"<code>{city} ({country})</code>")
+        header_text += ", ".join(selected_cities)
+        if len(selected_nodes) > 10:
+            header_text += f" ...and {len(selected_nodes) - 10} more."
+    else:
+        header_text += "<i>None</i>"
+
+    message_text = f"{header_text}\n\n" + get_text('messages.select_nodes_message', lang, country_name=f"<b>{escape_html(country_info['name'])}</b>")
+
+    await send_or_edit(update, context, message_text, InlineKeyboardMarkup(buttons))
+
+async def display_account_list(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    lang = get_user_lang(context)
+    buttons = get_dns_accounts_for_buttons("select_account")
+    if not buttons:
+        text = "No DNS provider accounts configured. Please set CF_ACCOUNTS and/or ARVAN_ACCOUNTS in .env."
+    else:
+        text = get_text('messages.choose_account', lang)
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    query = update.callback_query
+
+    if query and not force_new_message:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Error editing message in display_account_list: {e}")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+    else:
+        chat_id = update.effective_chat.id
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+async def display_zones_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    lang = get_user_lang(context)
+    provider = get_current_provider(context)
+    token = get_current_token(context)
+
+    if not token:
+        await display_account_list(update, context)
+        return
+
+    cache_key = f"all_zones_cache_{provider}_{context.user_data.get('selected_account_nickname', '')}"
+    if cache_key not in context.user_data:
+        await send_or_edit(update, context, get_text('messages.fetching_zones', lang, default="Fetching zones/domains..."))
+        zones = await get_provider_zones(provider, token)
+        logger.info(f"Fetched {len(zones) if zones else 0} zones/domains for {get_provider_label(provider)} account '{context.user_data.get('selected_account_nickname')}'.")
+        if not zones:
+            msg = get_text('messages.no_zones_found', lang, default="No zones/domains found for this account.")
+            buttons = [[InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="back_to_accounts")]]
+            await send_or_edit(update, context, msg, reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        context.user_data[cache_key] = zones
+
+    all_zones = context.user_data[cache_key]
+    context.user_data['all_zones_cache'] = all_zones
+    context.user_data['all_zones'] = {z['id']: z for z in all_zones}
+
+    config = load_config()
+    aliases = config.get('zone_aliases', {})
+
+    sorted_zones = sorted(all_zones, key=lambda z: aliases.get(z['id'], z['name']))
+
+    start_index = page * ZONES_PER_PAGE
+    end_index = start_index + ZONES_PER_PAGE
+    zones_on_page = sorted_zones[start_index:end_index]
+
+    buttons = []
+    for zone in zones_on_page:
+        zone_id = zone['id']
+        zone_name = zone['name']
+        alias = aliases.get(zone_id)
+        button_text = alias if alias else zone_name
+        buttons.append([
+            InlineKeyboardButton(button_text, callback_data=f"select_zone|{zone_id}"),
+            InlineKeyboardButton(get_text('buttons.set_zone_alias', lang), callback_data=f"set_alias_start|{zone_id}")
+        ])
+
+    pagination_buttons = []
+    if page > 0:
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.previous', lang), callback_data=f"zones_page|{page - 1}"))
+    if end_index < len(sorted_zones):
+        pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next', lang), callback_data=f"zones_page|{page + 1}"))
+
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="back_to_accounts")])
+
+    text = get_text('messages.choose_zone', lang)
+    await send_or_edit(update, context, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def display_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    provider = get_current_provider(context)
+    zone_id, zone_name = context.user_data.get('selected_zone_id'), context.user_data.get('selected_zone_name')
+    if not token or not zone_id:
+        await list_records_command(update, context); return
+
+    context.user_data['current_page'] = page
+    records_cache = context.user_data.get('records_list_cache', {})
+    records = records_cache.get('data', [])
+    cache_time = records_cache.get('timestamp')
+
+    if not records or not cache_time or (datetime.now() - cache_time) > timedelta(minutes=5):
+        await send_or_edit(update, context, get_text('messages.fetching_records', lang))
+        records = await get_provider_dns_records(provider, token, zone_id)
+        context.user_data['records_list_cache'] = {'data': records, 'timestamp': datetime.now()}
+    context.user_data['all_records'] = records
+
+    config = load_config()
+    record_aliases = config.get('record_aliases', {}).get(zone_id, {})
+
+    monitored_records_failover = set()
+    for policy in config.get('failover_policies', []):
+        if policy.get('zone_name') == zone_name:
+            for record_name in policy.get('record_names', []):
+                monitored_records_failover.add(record_name)
+
+    monitored_records_lb = set()
+    for policy in config.get('load_balancer_policies', []):
+        if policy.get('zone_name') == zone_name:
+            for record_name in policy.get('record_names', []):
+                monitored_records_lb.add(record_name)
+
+    search_query, search_ip_query = context.user_data.get('search_query'), context.user_data.get('search_ip_query')
+
+    if search_query:
+        q = search_query.lower().strip()
+        records_in_view = [r for r in context.user_data.get('all_records', []) if q in str(r.get('name', '')).lower()]
+        context.user_data['records_in_view'] = records_in_view
+        context.user_data.pop('pending_global_search', None)
+    elif search_ip_query:
+        ip_q = search_ip_query.strip()
+        records_in_view = [r for r in context.user_data.get('all_records', []) if str(r.get('content', '')).strip() == ip_q]
+        context.user_data['records_in_view'] = records_in_view
+        context.user_data.pop('pending_global_search', None)
+    else:
+        records_in_view = context.user_data.get('records_in_view', context.user_data.get('all_records', []))
+
+    header_text = f"<i>{escape_html(context.user_data.get('selected_account_nickname', 'N/A'))}</i> / <code>{escape_html(zone_name or '')}</code>"
+    message_text = get_text('messages.all_records_list', lang)
+    if search_query: message_text = get_text('messages.search_results', lang, query=escape_html(search_query))
+    elif search_ip_query: message_text = get_text('messages.search_results_ip', lang, query=f"<code>{escape_html(search_ip_query)}</code>")
+
+    buttons = []
+    if not records_in_view:
+        buttons.extend([
+            [InlineKeyboardButton(get_text('buttons.add_record', lang), callback_data="add")],
+            [InlineKeyboardButton(get_text('buttons.back_to_zones', lang), callback_data="back_to_zones")]
+        ])
+        msg_text = get_text('messages.no_records_found_search' if (search_query or search_ip_query) else 'messages.no_records_found', lang)
+        await send_or_edit(update, context, f"{header_text}\n\n{msg_text}", InlineKeyboardMarkup(buttons))
+        return
+
+    context.user_data["records"] = {r['id']: r for r in context.user_data.get('all_records', [])}
+    records_on_page = records_in_view[page * RECORDS_PER_PAGE:(page + 1) * RECORDS_PER_PAGE]
+    is_bulk_mode, selected_records = context.user_data.get('is_bulk_mode', False), context.user_data.get('selected_records', [])
+
+    if is_bulk_mode:
+        all_ids_in_view = {r['id'] for r in records_in_view}
+        select_all_text = get_text('buttons.deselect_all' if all_ids_in_view and all_ids_in_view.issubset(set(selected_records)) else 'buttons.select_all', lang)
+        buttons.append([InlineKeyboardButton(select_all_text, callback_data=f"bulk_select_all|{page}")])
+
+    for r in records_on_page:
+        short_name = get_short_name(r['name'], zone_name)
+
+        status_icons = []
+        if short_name in monitored_records_failover:
+            status_icons.append("🛡️")
+        if short_name in monitored_records_lb:
+            status_icons.append("🚦")
+
+        icons_str = "".join(status_icons)
+
+        proxy_icon = "☁️" if r.get('proxied') else "⬜️"
+        check_icon = "✅" if is_bulk_mode and r['id'] in selected_records else "▫️"
+
+        alias_key = f"{r['type']}:{r['name']}"
+        alias = record_aliases.get(alias_key)
+        alias_display = f" ({escape_html(alias)})" if alias else ""
+
+        button_text = f"{icons_str} {check_icon if is_bulk_mode else proxy_icon} {r['type']} {short_name}{alias_display}"
+        callback_data = f"bulk_select|{r['id']}|{page}" if is_bulk_mode else f"select|{r['id']}"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+    pagination_buttons = []
+    if page > 0: pagination_buttons.append(InlineKeyboardButton(get_text('buttons.previous', lang), callback_data=f"list_page|{page - 1}"))
+    if (page + 1) * RECORDS_PER_PAGE < len(records_in_view): pagination_buttons.append(InlineKeyboardButton(get_text('buttons.next', lang), callback_data=f"list_page|{page + 1}"))
+    if pagination_buttons: buttons.append(pagination_buttons)
+
+    if is_bulk_mode:
+        count = len(selected_records)
+        buttons.append([
+            InlineKeyboardButton(get_text('buttons.change_ip_selected', lang, count=count), callback_data="bulk_change_ip_start"),
+            InlineKeyboardButton(get_text('buttons.delete_selected', lang, count=count), callback_data="bulk_delete_confirm")
+        ])
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="bulk_cancel")])
+    else:
+        buttons.append([
+            InlineKeyboardButton(get_text('buttons.add_record', lang), callback_data="add"),
+            InlineKeyboardButton(get_text('buttons.search', lang), callback_data="search_menu"),
+            InlineKeyboardButton(get_text('buttons.bulk_actions', lang), callback_data="bulk_start")
+        ])
+        buttons.append([
+            InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data="refresh_list"),
+            InlineKeyboardButton(get_text('buttons.settings', lang), callback_data="go_to_settings")
+        ])
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_zones', lang), callback_data="back_to_zones")])
+    await send_or_edit(update, context, f"{header_text}\n\n{message_text}", InlineKeyboardMarkup(buttons))
+
+async def lb_force_rotate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forces an immediate rotation for a Load Balancer policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        config = load_config()
+        policy = config['load_balancer_policies'][policy_index]
+        policy_name = policy.get('policy_name')
+
+        if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+            context.bot_data['health_status'][policy_name].pop('lb_next_rotation_time', None)
+            logger.info(f"User forced a rotation for policy '{policy_name}'. Next rotation time cleared.")
+
+            await query.answer(get_text('messages.rotation_triggered', lang, default="Rotation triggered. Please wait a moment for the next health check cycle to apply it."), show_alert=True)
+        else:
+            await query.answer("Bot state for this policy not found. It will rotate on the next cycle.", show_alert=True)
+
+    except (IndexError, KeyError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def add_policy_failover_manual_primary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles manual input for the primary IP in a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    context.user_data['add_policy_step'] = 'primary_ip'
+    await query.edit_message_text(get_text('prompts.enter_primary_ip', lang))
+
+async def add_policy_failover_from_list_primary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts record selection for the primary IP in a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['record_selection_purpose'] = 'primary_ip'
+    context.user_data['policy_selected_records'] = []
+
+    await display_records_for_selection(update, context, page=0)
+
+async def add_policy_failover_select_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts record selection for the main records of a new Failover policy."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['record_selection_purpose'] = 'policy_records'
+    context.user_data['policy_selected_records'] = []
+
+    context.user_data['is_editing_policy_records'] = False
+    await display_records_for_selection(update, context, page=0)
+
+async def confirm_pool_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms the selection of records for the LB POOL and proceeds to the next step."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    selected_short_names = context.user_data.get('policy_selected_records', [])
+    if not selected_short_names:
+        await query.answer(get_text('errors.select_at_least_one_record', lang), show_alert=True)
+        return
+
+    new_items = []
+    zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+    if not zone_name:
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    for short_name in selected_short_names:
+        full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+        new_items.append({
+            "type": "hostname",
+            "value": full_name,
+            "weight": 1,
+            "enabled": True
+        })
+
+    context.user_data['new_policy_data']['ips'] = new_items
+
+    context.user_data.pop('record_selection_purpose', None)
+    context.user_data.pop('policy_selected_records', None)
+    context.user_data.pop('policy_all_records', None)
+    context.user_data.pop('current_selection_zone', None)
+
+    context.user_data['add_policy_step'] = 'rotation_interval_hours'
+    await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
+
+async def add_policy_lb_select_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record selection for a new LB policy after port has been entered."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['is_selecting_for_pool'] = False
+    context.user_data['policy_selected_records'] = []
+
+    context.user_data['is_editing_policy_records'] = False
+    await display_records_for_selection(update, context, page=0)
+
+async def add_policy_lb_from_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record selection process for the POOL of a new LB policy."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['record_selection_purpose'] = 'pool_items'
+    context.user_data['lb_pool_selected_records'] = []
+
+    await display_records_for_selection(update, context, page=0)
+
+async def add_policy_lb_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' button during the add policy flow."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    context.user_data['add_policy_step'] = 'ips'
+    text = get_text('prompts.enter_new_lb_items', lang)
+    buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="settings_lb_policies")]]
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def wizard_lb_add_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Type Manually' button during the wizard."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    context.user_data['wizard_step'] = 'ask_lb_ips'
+    text = get_text('prompts.enter_new_lb_items', lang)
+    buttons = [[InlineKeyboardButton(get_text('buttons.wizard_cancel', lang), callback_data="wizard_cancel")]]
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def clone_policy_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of cloning a policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, policy_type, policy_index_str = query.data.split('|')
+
+        context.user_data['clone_info'] = {
+            'type': policy_type,
+            'index': int(policy_index_str)
+        }
+
+        context.user_data['state'] = 'awaiting_clone_name'
+
+        text = get_text('prompts.enter_clone_name', lang)
+
+        back_callback = f"{policy_type}_policy_view|{policy_index_str}"
+        buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=back_callback)]]
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        context.user_data['clone_start_message_id'] = query.message.message_id
+
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def toggle_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the maintenance mode for a specific policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, policy_type, policy_index_str = query.data.split('|')
+        policy_index = int(policy_index_str)
+
+        config = load_config()
+        policy_list_key = "load_balancer_policies" if policy_type == 'lb' else "failover_policies"
+
+        policy = config[policy_list_key][policy_index]
+        policy_name = policy.get('policy_name', 'N/A')
+
+        current_status = policy.get('maintenance_mode', False)
+        new_status = not current_status
+        policy['maintenance_mode'] = new_status
+
+        save_config(config)
+
+        if not new_status:
+            if 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+                context.bot_data['health_status'][policy_name].pop('active_ip', None)
+                logger.info(f"Cleared cached status for '{policy_name}' after exiting maintenance mode.")
+
+        if new_status:
+            await query.answer(get_text('messages.maintenance_mode_enabled', lang, policy_name=policy_name), show_alert=True)
+        else:
+            await query.answer(get_text('messages.maintenance_mode_disabled', lang, policy_name=policy_name), show_alert=True)
+
+        if policy_type == 'lb':
+            await lb_policy_view_callback(update, context)
+        else:
+            await failover_policy_view_callback(update, context)
+
+    except (IndexError, KeyError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+
+async def send_test_alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    await update.message.reply_text("Sending a test alert to default recipients...")
+    await send_notification(context, 'messages.welcome', add_settings_button=True)
+
+async def zones_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination for the zones list."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('|')[1])
+    await display_zones_list(update, context, page=page)
+
+async def get_chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replies with the current chat's ID."""
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+
+    message = (
+        f"ℹ️ The ID for this chat is:\n\n"
+        f"👉 <code>{chat_id}</code> 👈\n\n"
+        f"Chat Type: {chat_type}"
+    )
+
+    if chat_type in ["group", "supergroup"]:
+        message += "\n\nSince this is a group, you can add this negative ID to any notification group to receive alerts here."
+
+    await update.message.reply_text(message, parse_mode="HTML")
+
+async def set_notification_group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Displays a list of available notification groups for the user to assign to a
+    specific item (monitor, failover policy, or lb policy).
+    """
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, item_type, item_index_str = query.data.split('|')
+        item_index = int(item_index_str)
+
+        context.user_data['set_notification_group_context'] = {'type': item_type, 'index': item_index}
+    except (ValueError, IndexError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    config = load_config()
+    groups = config.get("notification_groups", {})
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"set_notification_group_execute|{name}")] for name in sorted(groups.keys())]
+
+    buttons.append([InlineKeyboardButton("🔕 None (Use Default)", callback_data="set_notification_group_execute|__NONE__")])
+
+    if item_type == 'monitor':
+        back_cb = f"monitor_edit|{item_index}"
+    elif item_type == 'failover':
+        back_cb = f"failover_policy_edit|{item_index}"
+    else:
+        back_cb = f"lb_policy_edit|{item_index}"
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=back_cb)])
+
+    await query.edit_message_text(
+        get_text('messages.select_notification_group_prompt', lang),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def set_notification_group_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Saves the selected notification group to the corresponding item's configuration
+    and returns the user to the item's edit menu.
+    """
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+
+        ctx = context.user_data.pop('set_notification_group_context')
+        item_type, item_index = ctx['type'], ctx['index']
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    config = load_config()
+
+    list_key_map = {
+        'monitor': 'standalone_monitors',
+        'failover': 'failover_policies',
+        'lb': 'load_balancer_policies'
+    }
+    list_key = list_key_map.get(item_type)
+
+    if not list_key:
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    try:
+        if group_name == '__NONE__':
+            if 'notification_group' in config[list_key][item_index]:
+                del config[list_key][item_index]['notification_group']
+            await query.answer(get_text('messages.notification_group_cleared', lang), show_alert=True)
+        else:
+            config[list_key][item_index]['notification_group'] = group_name
+            await query.answer(get_text('messages.notification_group_set_success', lang, group_name=escape_html(group_name)), show_alert=True)
+
+        save_config(config)
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.error_generic_request', lang))
+        return
+
+    if item_type == 'monitor':
+        await monitor_edit_menu_callback(update, context)
+    elif item_type == 'failover':
+        await failover_policy_edit_callback(update, context)
+    else:
+        await lb_policy_edit_callback(update, context)
+
+async def monitor_purge_old_ip_logs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes all IP_STATUS events for a specific IP from the monitoring log."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        ip_to_purge = query.data.split('|', 1)[1]
+    except IndexError:
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    log = load_monitoring_log()
+
+    new_log = [event for event in log if not (event.get('event_type') == 'IP_STATUS' and event.get('ip') == ip_to_purge)]
+
+    if len(new_log) < len(log):
+        save_monitoring_log(new_log)
+        await query.answer(get_text('messages.monitor_logs_purged', lang, old_ip=escape_html(ip_to_purge)), show_alert=True)
+    else:
+        await query.answer("No logs found for the old IP.", show_alert=True)
+
+    monitor_index = context.user_data.get('edit_monitor_index')
+    if monitor_index is not None:
+        await monitor_edit_menu_callback(update, context)
+    else:
+        await monitors_menu_callback(update, context)
+
+async def policy_add_step_ask_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the list of monitoring groups for the user to choose when adding a new policy."""
+    lang = get_user_lang(context)
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    if not groups:
+        await send_or_edit(update, context, get_text('messages.no_groups_for_selection', lang))
+        for key in ['add_policy_step', 'new_policy_data', 'add_policy_type']:
+            context.user_data.pop(key, None)
+        return
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"policy_add_select_group|{name}")] for name in sorted(groups.keys())]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="back_to_settings_main")])
+
+    text = get_text('messages.policy_add_ask_group', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def policy_add_select_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the selected group and creates the new policy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+        policy_data = context.user_data['new_policy_data']
+        policy_type = context.user_data['add_policy_type']
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    config = load_config()
+
+    if policy_type == 'failover':
+        policy_data['primary_monitoring_group'] = group_name
+        policy_data['backup_monitoring_group'] = group_name
+        policy_data.setdefault('auto_failback', True)
+        policy_data.setdefault('failback_minutes', 5.0)
+        config.setdefault('failover_policies', []).append(policy_data)
+
+    else:
+        policy_data['monitoring_group'] = group_name
+        config.setdefault('load_balancer_policies', []).append(policy_data)
+
+    save_config(config)
+
+    for key in ['add_policy_step', 'new_policy_data', 'add_policy_type', 'last_callback_query']:
+        context.user_data.pop(key, None)
+
+    await query.edit_message_text(get_text('messages.policy_added_successfully', lang, name=escape_html(policy_data['policy_name'])), parse_mode="HTML")
+    await asyncio.sleep(2)
+
+    if policy_type == 'failover':
+        await settings_failover_policies_callback(update, context)
+    else:
+        await settings_lb_policies_callback(update, context)
+
+async def policy_change_group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of changing the monitoring group for any policy type."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    monitoring_type = query.data.split('|', 1)[1]
+    context.user_data['monitoring_type'] = monitoring_type
+
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    if not groups:
+        await query.answer(get_text('messages.no_groups_for_selection', lang), show_alert=True)
+        return
+
+    policy_type = context.user_data.get('editing_policy_type')
+    policy_index = context.user_data.get('edit_policy_index')
+    back_button_cb = f"{policy_type}_policy_edit|{policy_index}"
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"policy_change_group_execute|{name}")] for name in sorted(groups.keys())]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=back_button_cb)])
+
+    text = get_text('messages.select_monitoring_group_prompt', lang, monitoring_type=monitoring_type)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def policy_change_group_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the new monitoring group for the policy and removes old fields."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        new_group_name = query.data.split('|', 1)[1]
+        policy_type = context.user_data['editing_policy_type']
+        policy_index = context.user_data['edit_policy_index']
+        monitoring_type = context.user_data['monitoring_type']
+
+        config = load_config()
+
+        if policy_type == 'failover':
+            policy = config['failover_policies'][policy_index]
+            group_field_name = f"{monitoring_type}_monitoring_group"
+            nodes_field_name = f"{monitoring_type}_monitoring_nodes"
+            threshold_field_name = f"{monitoring_type}_threshold"
+
+            policy[group_field_name] = new_group_name
+            policy.pop(nodes_field_name, None)
+            policy.pop(threshold_field_name, None)
+
+        else:
+            policy = config['load_balancer_policies'][policy_index]
+            policy['monitoring_group'] = new_group_name
+            policy.pop('monitoring_nodes', None)
+            policy.pop('threshold', None)
+
+        save_config(config)
+
+        await query.answer(get_text('messages.monitoring_group_updated', lang, monitoring_type=monitoring_type, group_name=new_group_name), show_alert=True)
+    except (IndexError, KeyError):
+        await query.answer(get_text('messages.session_expired_error', lang), show_alert=True)
+        return
+
+    if policy_type == 'failover':
+        await failover_policy_edit_callback(update, context)
+    else:
+        await lb_policy_edit_callback(update, context)
+
+async def policy_change_group_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the new monitoring group for the policy and removes old fields."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        new_group_name = query.data.split('|', 1)[1]
+        policy_type = context.user_data['editing_policy_type']
+        policy_index = context.user_data['edit_policy_index']
+        monitoring_type = context.user_data['monitoring_type']
+
+        config = load_config()
+
+        if policy_type == 'failover':
+            policy = config['failover_policies'][policy_index]
+            group_field_name = f"{monitoring_type}_monitoring_group"
+            nodes_field_name = f"{monitoring_type}_monitoring_nodes"
+            threshold_field_name = f"{monitoring_type}_threshold"
+
+            policy[group_field_name] = new_group_name
+            policy.pop(nodes_field_name, None)
+            policy.pop(threshold_field_name, None)
+
+        else:
+            policy = config['load_balancer_policies'][policy_index]
+            policy['monitoring_group'] = new_group_name
+            policy.pop('monitoring_nodes', None)
+            policy.pop('threshold', None)
+
+        save_config(config)
+
+        await query.answer(get_text('messages.monitoring_group_updated', lang, monitoring_type=monitoring_type, group_name=new_group_name), show_alert=True)
+    except (IndexError, KeyError):
+        await query.answer(get_text('messages.session_expired_error', lang), show_alert=True)
+        return
+
+    if policy_type == 'failover':
+        await failover_policy_edit_callback(update, context)
+    else:
+        await lb_policy_edit_callback(update, context)
+
+async def monitor_change_group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of changing the monitoring group for a monitor."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        monitor_index = int(query.data.split('|')[1])
+        context.user_data['edit_monitor_index'] = monitor_index
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    if not groups:
+        await query.answer(get_text('messages.no_groups_for_selection', lang), show_alert=True)
+        return
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"monitor_change_group_execute|{name}")] for name in sorted(groups.keys())]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")])
+
+    text = get_text('messages.monitor_select_new_group', lang)
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def monitor_change_group_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the new monitoring group for the monitor."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        new_group_name = query.data.split('|', 1)[1]
+        monitor_index = context.user_data['edit_monitor_index']
+
+        config = load_config()
+        config['standalone_monitors'][monitor_index]['monitoring_group'] = new_group_name
+        save_config(config)
+
+        await query.answer("✅ Monitoring group updated successfully!", show_alert=True)
+    except (IndexError, KeyError):
+        await query.answer(get_text('messages.session_expired_error', get_user_lang(context)), show_alert=True)
+        await monitors_menu_callback(update, context)
+        return
+
+    await monitor_edit_menu_callback(update, context)
+
+async def monitor_step_ask_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the list of monitoring groups for the user to choose during monitor creation."""
+    lang = get_user_lang(context)
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    if not groups:
+        await send_or_edit(update, context, get_text('messages.no_groups_for_selection', lang))
+        context.user_data.pop('monitor_add_step', None)
+        context.user_data.pop('new_monitor_data', None)
+        return
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"monitor_select_group|{name}")] for name in sorted(groups.keys())]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")])
+
+    text = get_text('messages.monitor_ask_group', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def monitor_select_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the selected group, creates the monitor, and finishes the process."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+    except IndexError:
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    monitor_data = context.user_data.get('new_monitor_data')
+    if not monitor_data:
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    monitor_data['monitoring_group'] = group_name
+    monitor_data['check_type'] = 'tcp'
+    monitor_data['enabled'] = True
+
+    config = load_config()
+    config.setdefault("standalone_monitors", []).append(monitor_data)
+    save_config(config)
+
+    for key in ['monitor_add_step', 'new_monitor_data', 'last_callback_query']:
+        context.user_data.pop(key, None)
+
+    await query.edit_message_text(get_text('messages.monitor_created_success', lang))
+    await asyncio.sleep(2)
+
+    await monitors_menu_callback(update, context)
+
+async def group_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asks for confirmation before deleting a monitoring group."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+    except IndexError:
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"group_delete_execute|{group_name}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="groups_menu")]
+    ]
+    text = get_text('messages.confirm_delete_group', lang, group_name=escape_html(group_name))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def group_delete_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes a monitoring group from the config."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+        config = load_config()
+        if group_name in config.get("monitoring_groups", {}):
+            del config["monitoring_groups"][group_name]
+            save_config(config)
+            await query.answer(get_text('messages.group_deleted_success', lang, group_name=escape_html(group_name)), show_alert=True)
+        else:
+            await query.answer("Group not found.", show_alert=True)
+    except (IndexError, KeyError):
+        await query.answer(get_text('messages.internal_error', lang), show_alert=True)
+
+    await groups_menu_callback(update, context)
+
+async def group_edit_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of editing an existing monitoring group."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        group_name = query.data.split('|', 1)[1]
+        config = load_config()
+        group_data = config['monitoring_groups'][group_name]
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    context.user_data['editing_policy_type'] = 'group'
+    context.user_data['new_group_name'] = group_name
+    context.user_data['policy_selected_nodes'] = group_data.get('nodes', [])
+
+    await query.edit_message_text(get_text('messages.group_edit_prompt_nodes', lang, group_name=escape_html(group_name)), parse_mode="HTML")
+    await asyncio.sleep(2)
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def group_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new monitoring group."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    context.user_data['group_add_step'] = 'ask_name'
+
+    buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="groups_menu")]]
+    await query.edit_message_text(
+        get_text('messages.group_add_prompt_name', lang),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
+
+async def groups_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the main menu for managing monitoring groups."""
+    query = update.callback_query
+    if query and not getattr(query, 'is_dummy', False):
+        await query.answer()
+    lang = get_user_lang(context)
+
+    config = load_config()
+    groups = config.get("monitoring_groups", {})
+
+    buttons = []
+    groups_list_text = ""
+    if not groups:
+        groups_list_text = get_text('messages.no_groups_defined', lang)
+    else:
+        for group_name, group_data in sorted(groups.items()):
+            groups_list_text += get_text('messages.group_list_entry', lang,
+                                         group_name=escape_html(group_name),
+                                         node_count=len(group_data.get('nodes', [])),
+                                         threshold=group_data.get('threshold', 1))
+            buttons.append([
+                InlineKeyboardButton(f"» {group_name}", callback_data=f"group_edit_start|{group_name}"),
+                InlineKeyboardButton(get_text('buttons.edit_group', lang), callback_data=f"group_edit_start|{group_name}"),
+                InlineKeyboardButton(get_text('buttons.delete_group', lang), callback_data=f"group_delete_confirm|{group_name}")
+            ])
+
+    text = get_text('messages.groups_menu_header', lang, groups_list=groups_list_text)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.add_new_group', lang), callback_data="group_add_start")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")])
+
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def monitor_edit_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    """Displays the edit menu for a specific standalone monitor."""
+    query = update.callback_query
+    if query and not getattr(query, 'is_dummy', False):
+        await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        if query and "monitor_edit|" in query.data:
+            monitor_index = int(query.data.split('|')[1])
+        else:
+            monitor_index = context.user_data.get('edit_monitor_index')
+
+        if monitor_index is None:
+             raise KeyError("Monitor index not found in context or query.")
+
+        config = load_config()
+        monitor = config['standalone_monitors'][monitor_index]
+        monitor_name = monitor.get('monitor_name', 'N/A')
+
+        context.user_data['edit_monitor_index'] = monitor_index
+
+    except (IndexError, ValueError, KeyError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang))
+        return
+
+    is_enabled = monitor.get('enabled', True)
+    toggle_text = "🔴 خاموش کردن مانیتور مستقل" if is_enabled else "🟢 روشن کردن مانیتور مستقل"
+    buttons = [
+        [InlineKeyboardButton(toggle_text, callback_data=f"monitor_toggle|{monitor_index}|edit")],
+        [InlineKeyboardButton(get_text('buttons.edit_monitor_name', lang), callback_data=f"monitor_edit_field|monitor_name")],
+        [InlineKeyboardButton(get_text('buttons.edit_monitor_address', lang), callback_data=f"monitor_edit_field|ip")],
+        [InlineKeyboardButton(get_text('buttons.edit_monitor_port', lang), callback_data=f"monitor_edit_field|check_port")],
+        [InlineKeyboardButton(get_text('buttons.edit_monitor_group', lang), callback_data=f"monitor_change_group_start|{monitor_index}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="monitors_menu")]
+    ]
+
+    text = get_text('messages.monitor_edit_menu_header', lang, monitor_name=escape_html(monitor_name))
+
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
+
+async def monitor_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of editing a specific field of a monitor."""
+    query = update.callback_query
+    context.user_data['last_callback_query'] = query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, field_to_edit = query.data.split('|')
+        monitor_index = context.user_data['edit_monitor_index']
+    except (ValueError, KeyError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    context.user_data['monitor_edit_step'] = field_to_edit
+
+    prompt_map = {
+        'monitor_name': 'messages.monitor_ask_name_edit',
+        'ip': 'messages.monitor_ask_ip_edit',
+        'check_port': 'messages.monitor_ask_port_edit'
+    }
+    prompt_key = prompt_map.get(field_to_edit)
+
+    if not prompt_key:
+        await query.edit_message_text("Invalid field to edit.")
+        return
+
+    buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]]
+    await query.edit_message_text(get_text(prompt_key, lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def monitor_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asks for confirmation before deleting a standalone monitor."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        monitor_index = int(query.data.split('|')[1])
+        config = load_config()
+        monitor_name = config['standalone_monitors'][monitor_index]['monitor_name']
+    except (IndexError, ValueError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"monitor_delete_execute|{monitor_index}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]
+    ]
+    text = get_text('messages.confirm_delete_monitor', lang, monitor_name=escape_html(monitor_name))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def monitor_delete_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes a standalone monitor from the config."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        monitor_index = int(query.data.split('|')[1])
+        config = load_config()
+        monitor = config['standalone_monitors'].pop(monitor_index)
+        save_config(config)
+        await query.answer(get_text('messages.monitor_deleted_success', lang, monitor_name=escape_html(monitor['monitor_name'])), show_alert=True)
+    except (IndexError, ValueError, KeyError):
+        await query.answer(get_text('messages.internal_error', lang), show_alert=True)
+
+    await monitors_menu_callback(update, context)
+
+async def monitors_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the main menu for standalone monitors with clear per-monitor ON/OFF controls."""
+    query = update.callback_query
+    if query and not getattr(query, 'is_dummy', False):
+        await query.answer()
+    lang = get_user_lang(context)
+
+    config = load_config()
+    monitors = config.get("standalone_monitors", [])
+
+    buttons = []
+    monitors_list_text = ""
+
+    if not monitors:
+        monitors_list_text = get_text('messages.no_standalone_monitors', lang)
+    else:
+        for i, monitor in enumerate(monitors):
+            is_enabled = monitor.get('enabled', True)
+            status_icon = "🟢" if is_enabled else "🔴"
+            status_word = "روشن" if is_enabled else "خاموش"
+            monitor_name = escape_html(monitor.get('monitor_name', 'N/A'))
+            ip = escape_html(monitor.get('ip', 'N/A'))
+            port = escape_html(str(monitor.get('check_port', 'N/A')))
+
+            try:
+                monitors_list_text += get_text(
+                    'messages.monitor_list_entry_enabled' if is_enabled else 'messages.monitor_list_entry',
+                    lang,
+                    monitor_name=monitor_name,
+                    ip=ip,
+                    check_port=port
+                )
+            except Exception:
+                monitors_list_text += f"{status_icon} <b>{monitor_name}</b> — <code>{ip}:{port}</code> — {status_word}\n"
+
+            toggle_text = "🔴 خاموش کردن" if is_enabled else "🟢 روشن کردن"
+
+            buttons.append([
+                InlineKeyboardButton(f"{status_icon} {monitor.get('monitor_name', 'N/A')}", callback_data=f"monitor_edit|{i}"),
+                InlineKeyboardButton(toggle_text, callback_data=f"monitor_toggle|{i}|list")
+            ])
+
+            buttons.append([
+                InlineKeyboardButton(get_text('buttons.edit', lang), callback_data=f"monitor_edit|{i}"),
+                InlineKeyboardButton(get_text('buttons.manual_check_short', lang), callback_data=f"manual_check|monitor|{i}"),
+                InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"monitor_delete_confirm|{i}")
+            ])
+
+    text = get_text('messages.standalone_monitors_menu_header', lang, monitors_list=monitors_list_text)
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.add_new_monitor', lang), callback_data="monitor_add_start")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")])
+
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def monitor_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new standalone monitor."""
+    query = update.callback_query
+    context.user_data['last_callback_query'] = query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    context.user_data['monitor_add_step'] = 'ask_name'
+    context.user_data['new_monitor_data'] = {}
+
+    buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+    await query.edit_message_text(
+        get_text('messages.add_monitor_prompt_name', lang),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
+
+async def failover_start_backup_monitoring_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'No, configure separately' button to start backup monitoring setup."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    context.user_data['edit_policy_index'] = policy_index
+    context.user_data['editing_policy_type'] = 'failover'
+    context.user_data['monitoring_type'] = 'backup'
+
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+    context.user_data['policy_selected_nodes'] = policy.get('backup_monitoring_nodes', [])
+
+    msg = get_text('messages.start_backup_monitoring_setup', lang)
+
+    await query.edit_message_text(msg, parse_mode="HTML")
+
+    await asyncio.sleep(2)
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def set_record_alias_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of setting a record alias."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        rid = query.data.split('|')[1]
+        record = context.user_data['records'][rid]
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    prompt_message_id = query.message.message_id
+
+    context.user_data['awaiting_record_alias'] = {
+        'record_id': rid,
+        'record_name': record['name'],
+        'record_type': record['type'],
+        'prompt_message_id': prompt_message_id
+    }
+
+    text = get_text('prompts.set_record_alias_prompt', lang, record_name=escape_html(record['name']))
+    await query.edit_message_text(text, parse_mode="HTML")
+
+async def set_alias_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of setting a zone alias."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        zone_id = query.data.split('|')[1]
+        zone_name = context.user_data['all_zones'][zone_id]['name']
+    except (IndexError, KeyError):
+        await query.edit_message_text(get_text('messages.internal_error', lang))
+        return
+
+    context.user_data['awaiting_zone_alias'] = {
+        'zone_id': zone_id,
+        'zone_name': zone_name
+    }
+    context.user_data['last_menu_message_id'] = query.message.message_id
+
+    text = get_text('prompts.set_alias_prompt', lang, zone_name=escape_html(zone_name))
+    await query.edit_message_text(text, parse_mode="HTML")
+
+async def clear_logs_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asks for confirmation before clearing logs."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="clear_logs_execute")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="reporting_menu")]
+    ]
+    text = get_text('messages.confirm_clear_logs', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def clear_logs_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears all monitoring logs."""
+    query = update.callback_query
+
+    save_monitoring_log([])
+
+    await query.answer(get_text('messages.logs_cleared_success', get_user_lang(context)), show_alert=True)
+
+    await reporting_menu_callback(update, context)
+
+async def log_retention_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays options for setting the log retention period."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    buttons = [
+        [InlineKeyboardButton(get_text('messages.log_retention_7_days', lang), callback_data="set_log_retention|7")],
+        [InlineKeyboardButton(get_text('messages.log_retention_30_days', lang), callback_data="set_log_retention|30")],
+        [InlineKeyboardButton(get_text('messages.log_retention_90_days', lang), callback_data="set_log_retention|90")],
+        [InlineKeyboardButton(get_text('messages.log_retention_never', lang), callback_data="set_log_retention|0")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="reporting_menu")]
+    ]
+    text = get_text('messages.log_retention_menu_header', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def set_log_retention_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves the selected log retention period to the config."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    days = int(query.data.split('|')[1])
+
+    config = load_config()
+    config['log_retention_days'] = days
+    save_config(config)
+
+    if days > 0:
+        await query.answer(get_text('messages.log_retention_set_success', lang, days=days), show_alert=True)
+    else:
+        await query.answer(get_text('messages.log_retention_set_never', lang), show_alert=True)
+
+    await reporting_menu_callback(update, context)
+
+async def user_management_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if not getattr(query, 'is_dummy', False):
+        await query.answer()
+
+    if not is_super_admin(update):
+        if not getattr(query, 'is_dummy', False):
+            await query.answer(get_text('messages.not_a_super_admin', get_user_lang(context)), show_alert=True)
+        return
+
+    lang = get_user_lang(context)
+    config = load_config()
+
+    super_admins_str = ", ".join(map(str, sorted(list(SUPER_ADMIN_IDS))))
+
+    admins = config.get("admins", [])
+    admins_str = ", ".join(map(str, sorted(admins))) if admins else get_text('messages.no_admins_in_config', lang)
+
+    text = get_text('messages.user_management_menu_header', lang, super_admins=super_admins_str, admins=admins_str)
+
+    buttons = [
+        [
+            InlineKeyboardButton(get_text('buttons.add_admin_id', lang), callback_data="admin_add_start"),
+            InlineKeyboardButton(get_text('buttons.remove_admin_id', lang), callback_data="admin_remove_start")
+        ],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+
+    await send_or_edit(update, context, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def admin_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new bot admin."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    context.user_data['awaiting_admin_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+
+    await query.edit_message_text(get_text('prompts.add_admin_prompt', lang))
+
+async def admin_remove_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a list of configurable admins to be removed."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    config = load_config()
+    admins = config.get("admins", [])
+
+    if not admins:
+        await query.answer(get_text('messages.no_admins_in_config', lang), show_alert=True)
+        return
+
+    buttons = [[InlineKeyboardButton(str(admin_id), callback_data=f"admin_remove_confirm|{admin_id}")] for admin_id in sorted(admins)]
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="user_management_menu")])
+
+    await query.edit_message_text(get_text('prompts.remove_admin_prompt', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def admin_remove_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    admin_id_to_remove = int(query.data.split('|')[1])
+    config = load_config()
+
+    if admin_id_to_remove in config.get("admins", []):
+        config["admins"].remove(admin_id_to_remove)
+        save_config(config)
+        await query.answer(get_text('messages.admin_removed_success', lang, user_id=admin_id_to_remove), show_alert=True)
+    else:
+        await query.answer()
+
+    await user_management_menu_callback(update, context)
+
+async def add_recipient_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of adding a new notification recipient."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    context.user_data['awaiting_recipient_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+
+    await query.edit_message_text(get_text('prompts.add_recipient_prompt', lang))
+
+async def remove_recipient_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a list of notification recipients to be removed."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    config = load_config()
+
+    recipients = config.get("notifications", {}).get("chat_ids", [])
+
+    if not recipients:
+        await query.answer(get_text('messages.no_recipients_to_remove', lang), show_alert=True)
+        return
+
+    buttons = []
+    for recipient_id in sorted(recipients):
+        buttons.append([InlineKeyboardButton(str(recipient_id), callback_data=f"remove_recipient_confirm|{recipient_id}")])
+
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data="settings_notifications")])
+
+    await query.edit_message_text(get_text('prompts.remove_recipient_prompt', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def remove_recipient_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes a selected recipient from the config."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    recipient_id_to_remove = int(query.data.split('|')[1])
+    config = load_config()
+
+    if recipient_id_to_remove in config.get("notifications", {}).get("chat_ids", []):
+        config['notifications']['chat_ids'].remove(recipient_id_to_remove)
+        save_config(config)
+        await query.answer(get_text('messages.recipient_removed_success', lang, user_id=recipient_id_to_remove), show_alert=True)
+
+    await show_settings_notifications_menu(update, context)
+
+async def user_management_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', get_user_lang(context)), show_alert=True)
+        return
+
+    lang = get_user_lang(context)
+    config = load_config()
+
+    super_admins_str = ", ".join(map(str, sorted(list(SUPER_ADMIN_IDS))))
+
+    admins = config.get("admins", [])
+    admins_str = ", ".join(map(str, sorted(admins))) if admins else get_text('messages.no_admins_in_config', lang)
+
+    text = get_text('messages.user_management_menu_header', lang, super_admins=super_admins_str, admins=admins_str)
+
+    buttons = [
+        [
+            InlineKeyboardButton(get_text('buttons.add_admin_id', lang), callback_data="admin_add_start"),
+            InlineKeyboardButton(get_text('buttons.remove_admin_id', lang), callback_data="admin_remove_start")
+        ],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def admin_add_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    if not is_super_admin(update):
+        await query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
+
+    context.user_data['awaiting_admin_id_to_add'] = True
+    context.user_data['last_menu_message_id'] = query.message.message_id
+
+    await query.edit_message_text(get_text('prompts.add_admin_prompt', lang))
+
+async def reporting_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    config = load_config()
+    retention_days = config.get("log_retention_days", 30)
+
+    if retention_days > 0:
+        retention_text = get_text('buttons.log_retention_period', lang, days=retention_days)
+    else:
+        retention_text = get_text('buttons.log_retention_never', lang)
+
+    buttons = [
+        [InlineKeyboardButton(get_text('messages.report_time_range_1', lang), callback_data="report_generate|1")],
+        [InlineKeyboardButton(get_text('messages.report_time_range_7', lang), callback_data="report_generate|7")],
+        [InlineKeyboardButton(get_text('messages.report_time_range_30', lang), callback_data="report_generate|30")],
+        [InlineKeyboardButton(retention_text, callback_data="log_retention_menu")],
+        [InlineKeyboardButton(get_text('buttons.clear_monitoring_logs', lang), callback_data="clear_logs_confirm")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]
+    ]
+
+    text = get_text('messages.reporting_menu_header_with_options', lang)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def generate_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lang = get_user_lang(context)
+    await query.answer()
+
+    try:
+        days = int(query.data.split('|')[1])
+
+        await query.edit_message_text(get_text('messages.generating_report', lang), parse_mode="HTML")
+
+        log = load_monitoring_log()
+
+        now = datetime.now()
+        cutoff_date = now - timedelta(days=days)
+
+        recent_events = [e for e in log if datetime.fromisoformat(e['timestamp']) >= cutoff_date]
+
+        if not recent_events:
+            buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="reporting_menu")]]
+            await query.edit_message_text(get_text('messages.no_events_found', lang, days=days), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+            return
+
+        failover_events = [e for e in recent_events if e['event_type'] == 'FAILOVER']
+        failback_events = [e for e in recent_events if e['event_type'] == 'FAILBACK']
+        lb_rotations = [e for e in recent_events if e['event_type'] == 'LB_ROTATION']
+
+        uptime_stats = {}
+        ip_status_events = [e for e in recent_events if e['event_type'] == 'IP_STATUS']
+        if ip_status_events:
+            unique_ips_in_log = sorted(list(set(e['ip'] for e in ip_status_events)))
+            for ip in unique_ips_in_log:
+                ip_specific_log = [e for e in ip_status_events if e['ip'] == ip]
+                if ip_specific_log:
+                    up_checks = sum(1 for e in ip_specific_log if e['status'] == 'UP')
+                    total_checks = len(ip_specific_log)
+                    uptime_percent = (up_checks / total_checks) * 100 if total_checks > 0 else 100
+                    uptime_stats[ip] = f"{uptime_percent:.2f}"
+
+        lb_duration_stats = {}
+        if lb_rotations:
+            rotations_by_policy = {}
+            for event in lb_rotations:
+                policy_name = event.get('policy_name')
+                if not policy_name: continue
+                if policy_name not in rotations_by_policy:
+                    rotations_by_policy[policy_name] = []
+                rotations_by_policy[policy_name].append(event)
+
+            for policy_name, events in rotations_by_policy.items():
+                try:
+                    if not events: continue
+                    events.sort(key=lambda e: e['timestamp'])
+
+                    ip_durations_seconds = {}
+                    involved_ips = set()
+                    for event in events:
+                        involved_ips.add(event.get('from_ip'))
+                        involved_ips.add(event.get('to_ip'))
+
+                    for ip in involved_ips:
+                        if not ip: continue
+                        total_active_time = timedelta()
+                        for i, event in enumerate(events):
+                            if event.get('to_ip') == ip:
+                                start_time = datetime.fromisoformat(event['timestamp'])
+                                end_time = now
+                                if i + 1 < len(events):
+                                    end_time = datetime.fromisoformat(events[i+1]['timestamp'])
+
+                                start_time = max(start_time, cutoff_date)
+                                end_time = min(end_time, now)
+                                if end_time > start_time:
+                                    total_active_time += (end_time - start_time)
+
+                        initial_events = [e for e in log if e.get('policy_name') == policy_name and e.get('event_type') == 'LB_ROTATION' and datetime.fromisoformat(e['timestamp']) < cutoff_date]
+                        if initial_events:
+                            active_ip_at_start = initial_events[-1].get('to_ip')
+                            if active_ip_at_start == ip and events:
+                                first_event_time_in_window = events[0]['timestamp']
+                                duration = datetime.fromisoformat(first_event_time_in_window) - cutoff_date
+                                if duration.total_seconds() > 0:
+                                    total_active_time += duration
+
+                        if total_active_time.total_seconds() > 0:
+                            ip_durations_seconds[ip] = total_active_time.total_seconds()
+
+                    total_duration_seconds = sum(ip_durations_seconds.values())
+                    if total_duration_seconds > 0:
+                        lb_duration_stats[policy_name] = {
+                            ip: {
+                                "hours": seconds / 3600,
+                                "percent": (seconds / total_duration_seconds) * 100
+                            } for ip, seconds in ip_durations_seconds.items()
+                        }
+                except Exception as e:
+                    logger.error(f"Error calculating LB stats for policy '{policy_name}' in generate_report: {e}", exc_info=True)
+                    continue
+
+        message_parts = [get_text('messages.report_header', lang, days=days)]
+
+        summary_text = get_text('messages.report_summary', lang,
+                                  failovers=len(failover_events),
+                                  failbacks=len(failback_events),
+                                  rotations=len(lb_rotations))
+        message_parts.append(summary_text)
+
+        if failover_events:
+            message_parts.append(get_text('messages.report_failover_header', lang))
+            for event in failover_events[:5]:
+                utc_time = datetime.fromisoformat(event['timestamp'])
+                local_time = utc_time.astimezone(USER_TIMEZONE)
+                ts = local_time.strftime('%Y-%m-%d %H:%M')
+                safe_event = {k: escape_html(str(v)) for k, v in event.items()}
+                safe_event['ts'] = ts
+                message_parts.append(get_text('messages.report_failover_entry', lang, **safe_event))
+
+        if lb_duration_stats:
+            message_parts.append(get_text('messages.report_lb_duration_header', lang))
+            for policy_name, stats in sorted(lb_duration_stats.items()):
+                message_parts.append(get_text('messages.report_lb_duration_entry', lang, policy_name=escape_html(policy_name)))
+                for ip, data in sorted(stats.items(), key=lambda item: item[1]['percent'], reverse=True):
+                    message_parts.append(get_text('messages.report_lb_duration_ip_entry', lang, ip=ip, hours=data['hours'], percent=data['percent']))
+
+        if uptime_stats:
+            message_parts.append(get_text('messages.report_uptime_header', lang))
+            for ip, uptime_percent in sorted(uptime_stats.items()):
+                message_parts.append(get_text('messages.report_uptime_entry', lang, ip=ip, uptime_percent=uptime_percent))
+
+        full_message = "\n".join(message_parts)
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="reporting_menu")]]
+
+        await query.edit_message_text(full_message, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"!!! An unhandled exception occurred in generate_report_callback: {e} !!!", exc_info=True)
+        try:
+            await send_or_edit(update, context, "An unexpected error occurred while generating the report.")
+        except:
+            pass
+
+async def lb_policy_change_algo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        config = load_config()
+        policy = config['load_balancer_policies'][policy_index]
+
+        current_algo = policy.get('rotation_algorithm', 'random')
+        new_algo = 'round_robin' if current_algo == 'random' else 'random'
+
+        config['load_balancer_policies'][policy_index]['rotation_algorithm'] = new_algo
+
+        policy_name = policy.get('policy_name')
+        if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+            if 'wrr_state' in context.bot_data['health_status'][policy_name]:
+                del context.bot_data['health_status'][policy_name]['wrr_state']
+                logger.info(f"Cleared WRR state for policy '{policy_name}' due to algorithm change.")
+
+        save_config(config)
+
+        new_algo_name = "Weighted Random" if new_algo == 'random' else "Weighted Round-Robin"
+        confirmation_message = get_text('messages.algorithm_changed', lang, algo_name=new_algo_name)
+        await query.answer(confirmation_message, show_alert=True)
+
+        await lb_policy_edit_callback(update, context)
+
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.error_policy_not_found', lang))
+    except Exception as e:
+        logger.error(f"Error in lb_policy_change_algo_callback: {e}", exc_info=True)
+        await query.edit_message_text(get_text('messages.error_generic_request', lang))
+
+async def policy_nodes_select_all_global_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Selects ALL available nodes from ALL countries and refreshes the view."""
+    query = update.callback_query
+    await query.answer()
+
+    if 'all_nodes' not in context.bot_data:
+        await query.edit_message_text(get_text('messages.fetching_locations_message', get_user_lang(context)))
+        await display_countries_for_selection(update, context, page=0)
+        return
+
+    all_nodes = context.bot_data.get('all_nodes', {})
+    all_node_ids = list(all_nodes.keys())
+    context.user_data['policy_selected_nodes'] = all_node_ids
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def policy_nodes_clear_all_global_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears ALL selected nodes and refreshes the view."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['policy_selected_nodes'] = []
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def policy_nodes_select_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Selects all nodes for the current country view."""
+    query = update.callback_query
+    _, country_code, page_str = query.data.split('|')
+
+    country_info = context.bot_data['countries'][country_code]
+    all_node_ids_in_country = set(country_info['nodes'])
+
+    selected_nodes = set(context.user_data.get('policy_selected_nodes', []))
+    selected_nodes.update(all_node_ids_in_country)
+    context.user_data['policy_selected_nodes'] = list(selected_nodes)
+
+    await display_nodes_for_selection(update, context, country_code, page=int(page_str))
+
+async def policy_nodes_clear_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears all selected nodes for the current country view."""
+    query = update.callback_query
+    _, country_code, page_str = query.data.split('|')
+
+    country_info = context.bot_data['countries'][country_code]
+    all_node_ids_in_country = set(country_info['nodes'])
+
+    selected_nodes = set(context.user_data.get('policy_selected_nodes', []))
+    selected_nodes.difference_update(all_node_ids_in_country)
+    context.user_data['policy_selected_nodes'] = list(selected_nodes)
+
+    await display_nodes_for_selection(update, context, country_code, page=int(page_str))
+
+async def go_to_settings_from_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Go to Settings' button from an alert message, sending the menu as a new message."""
+    query = update.callback_query
+
+    try:
+        if query:
+            await query.answer()
+    except error.BadRequest as e:
+        if "Query is too old" in str(e):
+            logger.info("Ignoring 'Query is too old' error from an alert button.")
+            pass
+        else:
+            logger.error("A BadRequest error occurred in go_to_settings_from_alert_callback", exc_info=True)
+
+    await show_settings_menu(update, context, force_new_message=True)
+
+async def policy_edit_nodes_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the node selection process for ANY policy type."""
+    query = update.callback_query
+    await query.answer()
+
+    policy_type = context.user_data.get('editing_policy_type')
+    policy_index = context.user_data.get('edit_policy_index')
+
+    if not all([policy_type, policy_index is not None]):
+        await query.edit_message_text("Error: Session expired. Please start over."); return
+
+    monitoring_type = query.data.split('|')[1]
+    context.user_data['monitoring_type'] = monitoring_type
+
+    config = load_config()
+
+    if policy_type == 'lb':
+        policy = config['load_balancer_policies'][policy_index]
+        context.user_data['policy_selected_nodes'] = policy.get('monitoring_nodes', [])
+    else:
+        policy = config['failover_policies'][policy_index]
+        if monitoring_type == 'primary':
+            context.user_data['policy_selected_nodes'] = policy.get('primary_monitoring_nodes', [])
+        else:
+            context.user_data['policy_selected_nodes'] = policy.get('backup_monitoring_nodes', [])
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def policy_country_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination for the country list."""
+    query = update.callback_query
+    page = int(query.data.split('|')[1])
+    await display_countries_for_selection(update, context, page=page)
+
+async def policy_select_country_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles country selection and shows nodes for it."""
+    query = update.callback_query
+    _, country_code, page_str = query.data.split('|')
+    await display_nodes_for_selection(update, context, country_code, page=int(page_str))
+
+async def policy_nodes_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination for the node list."""
+    query = update.callback_query
+    _, country_code, page_str = query.data.split('|')
+    await display_nodes_for_selection(update, context, country_code, page=int(page_str))
+
+async def policy_toggle_node_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the selection of a monitoring node."""
+    query = update.callback_query
+    _, country_code, page_str, node_id = query.data.split('|')
+
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+    if node_id in selected_nodes:
+        selected_nodes.remove(node_id)
+    else:
+        selected_nodes.append(node_id)
+    context.user_data['policy_selected_nodes'] = selected_nodes
+
+    await display_nodes_for_selection(update, context, country_code, page=int(page_str))
+
+async def policy_confirm_nodes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lang = get_user_lang(context)
+    await query.answer()
+
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+    policy_type = context.user_data.get('editing_policy_type')
+
+    if policy_type == 'group':
+        if not selected_nodes:
+            await query.answer("Please select at least one location.", show_alert=True)
+            return
+
+        context.user_data['awaiting_threshold'] = True
+        group_name_text = get_text('messages.monitoring_type_group', lang, group_name=escape_html(context.user_data.get('new_group_name', '')))
+        text_to_send = get_text('messages.nodes_updated_message', lang,
+                                  count=len(selected_nodes),
+                                  monitoring_type=group_name_text)
+        await send_or_edit(update, context, text_to_send)
+        return
+
+    policy_index = context.user_data.get('edit_policy_index')
+    monitoring_type = context.user_data.get('monitoring_type')
+
+    if not all([policy_type, policy_index is not None, monitoring_type]):
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
+        return
+
+    config = load_config()
+
+    try:
+        if policy_type == 'lb':
+            config['load_balancer_policies'][policy_index]['monitoring_nodes'] = selected_nodes
+        else:
+            if monitoring_type == 'primary':
+                config['failover_policies'][policy_index]['primary_monitoring_nodes'] = selected_nodes
+            else:
+                config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
+    except IndexError:
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
+        return
+
+    if not selected_nodes:
+        if policy_type == 'lb':
+            config['load_balancer_policies'][policy_index].pop('threshold', None)
+        elif monitoring_type == 'primary':
+            config['failover_policies'][policy_index].pop('primary_threshold', None)
+        else:
+            config['failover_policies'][policy_index].pop('backup_threshold', None)
+
+        save_config(config)
+        await query.answer("All monitoring nodes for this group have been cleared.", show_alert=True)
+
+        view_callback = lb_policy_edit_callback if policy_type == 'lb' else failover_policy_edit_callback
+        await view_callback(update, context)
+        return
+
+    save_config(config)
+    context.user_data['awaiting_threshold'] = True
+
+    type_text_key = f'messages.monitoring_type_{monitoring_type}'
+    type_text = get_text(type_text_key, lang)
+
+    text_to_send = get_text('messages.nodes_updated_message', lang,
+                              count=len(selected_nodes),
+                              monitoring_type=type_text)
+    await send_or_edit(update, context, text_to_send)
+
+async def policy_records_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('|')[1])
+    await display_records_for_selection(update, context, page=page)
+
+async def policy_select_record_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, short_name, page_str = query.data.split('|')
+    page = int(page_str)
+
+    selected_records_key = 'policy_selected_records'
+
+    selected_records = context.user_data.get(selected_records_key, [])
+
+    if short_name in selected_records:
+        selected_records.remove(short_name)
+    else:
+        selected_records.append(short_name)
+
+    context.user_data[selected_records_key] = selected_records
+
+    await display_records_for_selection(update, context, page=page)
+
+async def policy_confirm_records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finalizes record selection for all scenarios."""
+    query = update.callback_query
+    context.user_data['last_callback_query'] = query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    selected_short_names = context.user_data.get('policy_selected_records', [])
+    if not selected_short_names:
+        await query.answer(get_text('errors.select_at_least_one_record', lang), show_alert=True)
+        return
+
+    selection_purpose = context.user_data.pop('record_selection_purpose', 'policy_records')
+
+    if selection_purpose == 'pool_items':
+        new_items = []
+        zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+        if not zone_name:
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
+            return
+
+        for short_name in selected_short_names:
+            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+            new_items.append({
+                "type": "hostname",
+                "value": full_name,
+                "weight": 1,
+                "enabled": True
+            })
+
+        context.user_data['new_policy_data']['ips'] = new_items
+
+        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+            context.user_data.pop(key, None)
+
+        context.user_data['add_policy_step'] = 'rotation_interval_hours'
+        await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
+        return
+
+    elif selection_purpose == 'primary_ip':
+        if len(selected_short_names) > 1:
+            await query.answer(get_text('errors.select_only_one_primary', lang), show_alert=True)
+            context.user_data['record_selection_purpose'] = 'primary_ip'
+            return
+
+        all_records = context.user_data.get('policy_all_records', [])
+        zone_name = context.user_data.get('new_policy_data', {}).get('zone_name')
+        primary_ip_record = next((r for r in all_records if get_short_name(r['name'], zone_name) == selected_short_names[0]), None)
+
+        if not primary_ip_record:
+            await query.edit_message_text(get_text('messages.session_expired_error', lang))
+            return
+
+        context.user_data['new_policy_data']['primary_ip'] = primary_ip_record['content']
+
+        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+            context.user_data.pop(key, None)
+
+        context.user_data['add_policy_step'] = 'backup_ips'
+        await send_or_edit(update, context, get_text('prompts.enter_backup_ip', lang))
+        return
+
+    elif context.user_data.get('wizard_step') == 'select_records':
+        context.user_data['wizard_data']['record_names'] = selected_short_names
+        for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone', 'add_policy_type', 'new_policy_data']:
+            context.user_data.pop(key, None)
+        await wizard_final_step_ask_monitoring(update, context)
+        return
+
+    elif selection_purpose == 'policy_records':
+        is_editing = context.user_data.get('is_editing_policy_records', False)
+
+        policy_type = context.user_data.get('editing_policy_type') if is_editing else context.user_data.get('add_policy_type')
+        config = load_config()
+
+        if is_editing:
+            policy_index = context.user_data.get('edit_policy_index')
+            if not all([policy_type, policy_index is not None]):
+                await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
+            policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+
+            try:
+                config[policy_list_key][policy_index]['record_names'] = selected_short_names
+                save_config(config)
+
+                current_policy = config[policy_list_key][policy_index]
+                account_nickname = current_policy.get('account_nickname')
+            except IndexError:
+                await send_or_edit(update, context, get_text('messages.session_expired_error', lang)); return
+
+            policy_type_display = "LB" if policy_type == 'lb' else "Failover"
+            await send_or_edit(update, context, get_text('messages.policy_records_updated', lang, policy_type=policy_type_display))
+
+            if policy_type == 'failover':
+                best_ip_to_use = current_policy.get('primary_ip')
+                backup_ips = current_policy.get('backup_ips', [])
+                check_port = current_policy.get('check_port')
+
+                mon_group_name = current_policy.get('primary_monitoring_group')
+                mon_group = config.get('monitoring_groups', {}).get(mon_group_name, {})
+                nodes = mon_group.get('nodes', [])
+                threshold = mon_group.get('threshold', 1)
+
+                check_details = {
+                    'check_port': check_port,
+                    'nodes': nodes,
+                    'threshold': threshold
+                }
+
+                await send_or_edit(update, context, get_text('messages.checking_primary_health', lang, ip=best_ip_to_use))
+
+                is_primary_up, _ = await get_ip_health_with_cache(context, best_ip_to_use, check_details)
+
+                if is_primary_up:
+                    await send_or_edit(update, context, get_text('messages.primary_online_applying', lang, ip=best_ip_to_use))
+                else:
+                    if backup_ips:
+                        await send_or_edit(update, context, get_text('messages.primary_down_checking_backups', lang, count=len(backup_ips)))
+                        found_backup = False
+
+                        for bip in backup_ips:
+                            is_backup_up, _ = await get_ip_health_with_cache(context, bip, check_details)
+                            if is_backup_up:
+                                best_ip_to_use = bip
+                                found_backup = True
+                                await send_or_edit(update, context, get_text('messages.backup_online_applying', lang, ip=bip))
+                                break
+
+                        if not found_backup:
+                            await send_or_edit(update, context, get_text('messages.all_backups_down_force_primary', lang))
+                    else:
+                        await send_or_edit(update, context, get_text('messages.primary_down_no_backup', lang))
+
+                provider = get_policy_provider(current_policy)
+                token = get_account_token(provider, account_nickname)
+                cached_records = context.user_data.get('policy_all_records', [])
+                zone_name = context.user_data.get('current_selection_zone') or current_policy.get('zone_name')
+
+                if best_ip_to_use and token and zone_name:
+                    zone_identifier = zone_name
+                    if provider == 'cloudflare':
+                        all_zones_fetched = await get_all_zones(token)
+                        zone_identifier = next((z['id'] for z in all_zones_fetched if z['name'] == zone_name), None)
+
+                    if zone_identifier:
+                        update_count = 0
+                        for short_name in selected_short_names:
+                            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+                            target_record = next((r for r in cached_records if r['name'] == full_name), None)
+
+                            if target_record and target_record.get('content') != best_ip_to_use:
+                                 res = await update_provider_record(provider, token, zone_identifier, target_record, best_ip_to_use)
+                                 if res.get('success') is not False:
+                                     update_count += 1
+                                 else:
+                                     logger.error(f"Initial DNS sync failed for {full_name}: {res.get('errors', [{}])[0].get('message', 'Unknown error')}")
+
+                        if update_count > 0:
+                            await send_or_edit(update, context, get_text('messages.ip_sync_success', lang, count=update_count, ip=best_ip_to_use))
+                    else:
+                        await send_or_edit(update, context, get_text('messages.error_zone_id_missing', lang))
+
+            await asyncio.sleep(1)
+            for key in ['is_editing_policy_records', 'policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+                context.user_data.pop(key, None)
+            if policy_type == 'lb':
+                await lb_policy_view_callback(update, context)
+            else:
+                await failover_policy_view_callback(update, context)
+            return
+
+        else:
+            data = context.user_data['new_policy_data']
+            data['record_names'] = selected_short_names
+
+            if policy_type == 'failover':
+                target_ip_to_sync = data.get('primary_ip')
+                account_nickname = data.get('account_nickname')
+                provider = data.get('provider', 'cloudflare')
+                token = get_account_token(provider, account_nickname)
+                cached_records = context.user_data.get('policy_all_records', [])
+                zone_name = context.user_data.get('current_selection_zone')
+
+                if target_ip_to_sync and token and zone_name:
+                     await send_or_edit(update, context, get_text('messages.setting_initial_records', lang))
+
+                     zone_identifier = zone_name
+                     if provider == 'cloudflare':
+                         all_zones_fetched = await get_all_zones(token)
+                         zone_identifier = next((z['id'] for z in all_zones_fetched if z['name'] == zone_name), None)
+
+                     if zone_identifier:
+                         for short_name in selected_short_names:
+                            full_name = zone_name if short_name == '@' else f"{short_name}.{zone_name}"
+                            target_record = next((r for r in cached_records if r['name'] == full_name), None)
+                            if target_record and target_record.get('content') != target_ip_to_sync:
+                                await update_provider_record(provider, token, zone_identifier, target_record, target_ip_to_sync)
+
+            for key in ['policy_all_records', 'policy_selected_records', 'current_selection_zone']:
+                context.user_data.pop(key, None)
+
+            if policy_type in ['lb', 'failover']:
+                context.user_data['add_policy_step'] = 'select_group'
+                await policy_add_step_ask_group(update, context)
+            else:
+                await query.edit_message_text(get_text('errors.unsupported_policy_type', lang))
+            return
+
+async def policy_set_failback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    choice = query.data.split('|')[1]
+    auto_failback_enabled = (choice == 'true')
+
+    context.user_data['new_policy_data']['auto_failback'] = auto_failback_enabled
+
+    if auto_failback_enabled:
+        context.user_data['add_policy_step'] = 'failback_minutes'
+        await send_or_edit(update, context, get_text('prompts.enter_failback_minutes', lang))
+    else:
+        context.user_data['new_policy_data']['failback_minutes'] = 5
+        await start_node_selection_for_new_failover(update, context, 'primary')
+
+async def failover_policy_toggle_failback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        config = load_config()
+        if config is None: raise IndexError
+
+        is_failback_enabled = config['failover_policies'][policy_index].get('auto_failback', True)
+
+        config['failover_policies'][policy_index]['auto_failback'] = not is_failback_enabled
+        save_config(config)
+
+        policy_name = config['failover_policies'][policy_index].get('policy_name', 'N/A')
+        new_status_key = 'status_enabled' if not is_failback_enabled else 'status_disabled'
+        new_status_text = get_text(new_status_key, lang)
+
+        await query.answer(
+            text=get_text('messages.failback_status_changed', lang, name=policy_name, status=new_status_text),
+            show_alert=True
+        )
+
+        await failover_policy_view_callback(update, context)
+
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.error_generic_request', lang))
+
+async def failover_policy_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        config = load_config()
+        if config is None: raise IndexError
+
+        is_enabled = config['failover_policies'][policy_index].get('enabled', True)
+
+        config['failover_policies'][policy_index]['enabled'] = not is_enabled
+        save_config(config)
+
+        policy_name = config['failover_policies'][policy_index].get('policy_name', 'N/A')
+        new_status_key = 'status_enabled' if not is_enabled else 'status_disabled'
+        new_status_text = get_text(new_status_key, lang)
+
+        await query.answer(
+            text=get_text('messages.policy_status_changed', lang, name=policy_name, status=new_status_text),
+            show_alert=True
+        )
+
+        await failover_policy_view_callback(update, context)
+
+    except (IndexError, ValueError):
+        await query.edit_message_text(get_text('messages.error_generic_request', lang))
+
+async def sync_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs the health check job once to update the status, and then runs the sync
+    function on demand from a button press. It handles the callback query correctly
+    to avoid timeouts and shows the final policy list.
+    """
+    query = update.callback_query
+    await query.answer(text="Starting health check and sync...", show_alert=False)
+
+    try:
+        await query.edit_message_text("⏳ Step 1/2: Running an immediate health check...")
+        await health_check_job(context)
+
+        await query.edit_message_text("⏳ Step 2/2: Syncing DNS records with the latest status...")
+        await sync_dns_with_config(context)
+
+        await query.edit_message_text("✅ Sync complete!")
+        await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.error(f"An error occurred during sync_now_callback: {e}", exc_info=True)
+        try:
+            await query.edit_message_text(f"❌ An error occurred during the process.")
+        except Exception:
+            pass
+        return
+
+    await settings_failover_policies_callback(update, context)
+
+async def start_node_selection_for_new_failover(update: Update, context: ContextTypes.DEFAULT_TYPE, monitoring_type: str):
+    """Transitions a new failover policy creation to the node selection stage."""
+    lang = get_user_lang(context)
+
+    if 'edit_policy_index' not in context.user_data:
+        config = load_config()
+        config['failover_policies'].append(context.user_data['new_policy_data'])
+        save_config(config)
+        new_policy_index = len(config['failover_policies']) - 1
+        context.user_data['edit_policy_index'] = new_policy_index
+
+        for key in ['add_policy_step', 'new_policy_data', 'add_policy_type']:
+            context.user_data.pop(key, None)
+
+    context.user_data['editing_policy_type'] = 'failover'
+    context.user_data['monitoring_type'] = monitoring_type
+    context.user_data['policy_selected_nodes'] = []
+
+    if monitoring_type == 'primary':
+        msg = get_text('messages.start_primary_monitoring_setup', lang)
+    else:
+        msg = get_text('messages.start_backup_monitoring_setup', lang)
+
+    await send_or_edit(update, context, msg)
+    await asyncio.sleep(2)
+
+    await display_countries_for_selection(update, context, page=0)
+
+async def _handle_state_awaiting_clone_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles user input for a new policy clone name."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    try:
+        if 'clone_start_message_id' in context.user_data:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('clone_start_message_id'))
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        new_name = text
+        clone_info = context.user_data.pop('clone_info')
+        policy_type = clone_info['type']
+        policy_index = clone_info['index']
+
+        config = load_config()
+
+        all_names = [p.get('policy_name') for p in config.get('failover_policies', [])] + \
+                    [p.get('policy_name') for p in config.get('load_balancer_policies', [])]
+
+        if new_name in all_names:
+            back_callback = f"{policy_type}_policy_view|{policy_index}"
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=back_callback)]]
+            error_text = f"{get_text('prompts.enter_clone_name', lang)}\n\n<b>{get_text('messages.clone_name_exists', lang)}</b>"
+            error_msg = await update.effective_chat.send_message(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+            context.user_data['clone_info'] = clone_info
+            context.user_data['state'] = 'awaiting_clone_name'
+            context.user_data['clone_start_message_id'] = error_msg.message_id
+            return
+
+        policy_list_key = "load_balancer_policies" if policy_type == 'lb' else "failover_policies"
+        original_policy = config[policy_list_key][policy_index]
+        cloned_policy = copy.deepcopy(original_policy)
+
+        original_name = cloned_policy.get('policy_name', 'N/A')
+        cloned_policy['policy_name'] = new_name
+        cloned_policy['enabled'] = False
+
+        config[policy_list_key].append(cloned_policy)
+        save_config(config)
+
+        context.user_data.pop('state', None)
+
+        success_text = get_text('messages.clone_success', lang, original_name=escape_html(original_name), new_name=escape_html(new_name))
+        back_callback = "settings_lb_policies" if policy_type == 'lb' else "settings_failover_policies"
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back_callback)]]
+
+        await update.effective_chat.send_message(success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    except (IndexError, KeyError):
+        await update.message.reply_text(get_text('messages.session_expired_error', lang))
+
+async def _handle_state_wizard_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs during the wizard setup process."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    wizard_step = context.user_data.get('wizard_step')
+
+    start_time = context.user_data.get('wizard_start_time')
+    if not start_time or (datetime.now() - start_time) > timedelta(minutes=10):
+        for key in ['wizard_data', 'wizard_step', 'wizard_start_time', 'last_callback_query']:
+            context.user_data.pop(key, None)
+        await update.message.reply_text(get_text('messages.wizard_expired', lang, default="Wizard has expired due to inactivity. Please start over with /wizard."))
+        return
+
+    if wizard_step == 'ask_name':
+        context.user_data['wizard_data']['policy_name'] = text
+        await wizard_step3_ask_ips(update, context)
+
+    elif wizard_step == 'ask_primary_ip':
+        if not is_valid_ip(text):
+            error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
+            await asyncio.sleep(4)
+            try: await error_msg.delete(); await update.message.delete()
+            except Exception: pass
+            return
+        context.user_data['wizard_data']['primary_ip'] = text
+        await wizard_step4_ask_backup_ips(update, context)
+
+    elif wizard_step == 'ask_backup_ips':
+        ips = [ip.strip() for ip in text.split(',') if ip.strip() and is_valid_ip(ip.strip())]
+        if not ips:
+            error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_ip', lang)}")
+            await asyncio.sleep(4)
+            try: await error_msg.delete(); await update.message.delete()
+            except Exception: pass
+            return
+        context.user_data['wizard_data']['backup_ips'] = ips
+        await wizard_step5_ask_port(update, context)
+
+    elif wizard_step == 'ask_lb_ips':
+        new_items_data = []
+        entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+        for entry in entries:
+            value, weight = entry.strip(), 1
+            if ':' in entry:
+                parts = entry.split(':', 1)
+                value, weight_str = parts[0].strip(), parts[1].strip()
+                if not (weight_str.isdigit() and int(weight_str) >= 1):
+                    error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_weight_positive', lang, ip=value)}")
+                    await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
+                    return
+                weight = int(weight_str)
+
+            item_type = "ip" if is_valid_ip(value) else "hostname"
+
+            if item_type == "hostname" and '.' not in value:
+                error_msg = await update.message.reply_text(f"❌ {get_text('errors.invalid_hostname', lang, value=value, default=f'Invalid hostname: {value}')}")
+                await asyncio.sleep(4); await error_msg.delete(); await update.message.delete()
+                return
+
+            new_items_data.append({
+                "type": item_type,
+                "value": value,
+                "weight": weight,
+                "enabled": True
+            })
+
+        if not new_items_data: return
+        context.user_data['wizard_data']['ips'] = new_items_data
+        await wizard_step5_ask_port(update, context)
+
+    elif wizard_step == 'ask_port':
+        if not (text.isdigit() and 1 <= int(text) <= 65535):
+            error_msg = await update.message.reply_text(f"❌ {get_text('messages.invalid_port', lang)}")
+            await asyncio.sleep(4)
+            try: await error_msg.delete(); await update.message.delete()
+            except Exception: pass
+            return
+        context.user_data['wizard_data']['check_port'] = int(text)
+        await wizard_step6_ask_account(update, context)
+
+async def _handle_state_aliases(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for setting or removing zone and record aliases."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if 'awaiting_record_alias' in context.user_data:
+        alias_data = context.user_data.pop('awaiting_record_alias')
+        try:
+            if alias_data.get('prompt_message_id'):
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=alias_data['prompt_message_id'])
+        except Exception:
+            pass
+
+        config = load_config()
+        zone_id = context.user_data.get('selected_zone_id')
+        config.setdefault('record_aliases', {}).setdefault(zone_id, {})
+        alias_key = f"{alias_data['record_type']}:{alias_data['record_name']}"
+
+        if text == '-':
+            config['record_aliases'][zone_id].pop(alias_key, None)
+            temp_msg_text = get_text('messages.record_alias_removed_success', lang, record_name=escape_html(alias_data['record_name']))
+        else:
+            config['record_aliases'][zone_id][alias_key] = text
+            temp_msg_text = get_text('messages.record_alias_set_success', lang, record_name=escape_html(alias_data['record_name']), alias=escape_html(text))
+
+        save_config(config)
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(2)
+        try: await temp_msg.delete()
+        except Exception: pass
+        context.user_data.pop('all_records', None)
+        await display_records_list(update, context)
+
+    elif 'awaiting_zone_alias' in context.user_data:
+        message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+        alias_data = context.user_data.pop('awaiting_zone_alias')
+        zone_id, zone_name = alias_data['zone_id'], alias_data['zone_name']
+
+        config = load_config()
+        config.setdefault('zone_aliases', {})
+
+        if text == '-':
+            config['zone_aliases'].pop(zone_id, None)
+            temp_msg_text = get_text('messages.alias_removed_success', lang, zone_name=escape_html(zone_name))
+        else:
+            config['zone_aliases'][zone_id] = text
+            temp_msg_text = get_text('messages.alias_set_success', lang, zone_name=escape_html(zone_name), alias=escape_html(text))
+
+        save_config(config)
+        temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+        await asyncio.sleep(3)
+        try: await temp_msg.delete()
+        except Exception: pass
+
+        if message_id_to_edit:
+            dummy_update = context.application.create_dummy_update(update, message_id_to_edit)
+            await display_zones_list(dummy_update, context)
+
+async def _handle_state_notification_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles adding new recipient IDs to a notification group."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    recipient_key = context.user_data.get('current_recipient_key')
+
+    if not recipient_key:
+        await update.message.reply_text(get_text('messages.session_expired_try_again', lang))
+        return
+
+    try:
+        await update.message.delete()
+        if context.user_data.get('last_menu_message_id'):
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('last_menu_message_id'))
+    except error.BadRequest:
+        pass
+
+    new_member_ids = set()
+    parts = [p.strip() for p in text.split(',') if p.strip()]
+    for part in parts:
+        try:
+            new_member_ids.add(int(part))
+        except ValueError:
+            await update.message.reply_text(get_text('messages.invalid_recipient_id', lang, part=escape_html(part)), parse_mode="HTML")
+            return
+
+    if not new_member_ids:
+        await update.message.reply_text(get_text('messages.no_valid_ids_entered', lang))
+        return
+
+    config = load_config()
+    recipients_map = config.setdefault("notifications", {}).setdefault("recipients", {})
+    current_members = set(recipients_map.get(recipient_key, []))
+    current_members.update(new_member_ids)
+    recipients_map[recipient_key] = sorted(list(current_members))
+    save_config(config)
+
+    context.user_data.pop('state', None)
+
+    dummy_update = context.application.create_dummy_update(update, update.message.message_id, callback_data=f"notification_edit_recipients|{recipient_key}")
+    await notification_edit_recipients_callback(dummy_update, context)
+
+async def _create_dummy_update_from_text(update: Update, callback_data: str):
+    """Creates a dummy Update object with a CallbackQuery from a text message."""
+    async def dummy_answer(*args, **kwargs): return True
+    message_obj = update.message if hasattr(update, 'message') and update.message else update.callback_query.message
+
+    dummy_query = type('obj', (object,), {
+        'data': callback_data, 'answer': dummy_answer,
+        'message': message_obj, 'is_dummy': True
+    })
+    return type('obj', (object,), {
+        'callback_query': dummy_query, 'effective_user': update.effective_user,
+        'effective_chat': update.effective_chat
+    })
+
+async def _handle_state_lb_ip_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs for managing Load Balancer IP addresses/hostnames and weights."""
+    lang = get_user_lang(context)
+    state = context.user_data.get('state')
+    text = update.message.text.strip()
+    config = None
+    try:
+        await update.message.delete()
+        if context.user_data.get('last_callback_query'):
+            await context.user_data.pop('last_callback_query').message.delete()
+    except Exception: pass
+
+    try:
+        policy_index = context.user_data['edit_policy_index']
+        config = load_config()
+        policy = config['load_balancer_policies'][policy_index]
+
+        if state in ['awaiting_lb_new_ip', 'awaiting_lb_ip_address']:
+            edit_index = context.user_data.get('lb_ip_action_index')
+
+            if state == 'awaiting_lb_ip_address' and ',' in text:
+                raise ValueError(get_text('errors.edit_one_item_at_a_time', lang, default="Please provide only one IP or Hostname when editing."))
+
+            new_items_data = []
+            entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in entries:
+                value, weight = entry.strip(), 1
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    value, weight_str = parts[0].strip(), parts[1].strip()
+                    if not (weight_str.isdigit() and int(weight_str) >= 1): raise ValueError(get_text('messages.invalid_weight_positive', lang, ip=value))
+                    weight = int(weight_str)
+
+                item_type = "ip" if is_valid_ip(value) else "hostname"
+                new_items_data.append({"type": item_type, "value": value, "weight": weight})
+
+            if not new_items_data:
+                raise ValueError(get_text('errors.no_valid_items_provided', lang, default="No valid items provided."))
+
+            if edit_index is not None:
+                old_item = policy['ips'][edit_index]
+                newly_parsed_item = new_items_data[0]
+                newly_parsed_item['enabled'] = old_item.get('enabled', True)
+                if ':' not in text:
+                    newly_parsed_item['weight'] = old_item.get('weight', 1)
+                policy['ips'][edit_index] = newly_parsed_item
+            else:
+                for item in new_items_data:
+                    item['enabled'] = True
+                policy.setdefault('ips', []).extend(new_items_data)
+
+        elif state == 'awaiting_lb_ip_weight':
+            ip_index = context.user_data.get('lb_ip_action_index')
+            if ip_index is None: raise KeyError(get_text('errors.cannot_edit_weight_no_index', lang, default="Cannot edit weight, index not found."))
+            if not text.isdigit() or int(text) < 1: raise ValueError(get_text('errors.invalid_weight_input', lang, weight=text))
+            policy['ips'][ip_index]['weight'] = int(text)
+
+    except (IndexError, KeyError) as e:
+        logger.error(f"Session error in LB IP management: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.session_expired_error', lang))
+        config = None
+    except ValueError as e:
+        logger.warning(f"Invalid user input in LB IP management: {e}")
+        error_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ {e}")
+        await asyncio.sleep(4)
+        try: await error_msg.delete()
+        except Exception: pass
+        config = None
+    finally:
+        if config:
+            save_config(config)
+
+        context.user_data.pop('state', None)
+        context.user_data.pop('lb_ip_action_index', None)
+
+        dummy_update = await _create_dummy_update_from_text(update, "lb_ip_list_menu")
+        await lb_ip_list_menu(dummy_update, context, config_data=config)
+
+async def _handle_state_admin_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for adding a new bot admin."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    message_id_to_edit = context.user_data.pop('last_menu_message_id', None)
+    context.user_data.pop('awaiting_admin_id_to_add', None)
+
+    if not is_super_admin(update):
+        await update.message.reply_text(get_text('messages.not_a_super_admin', lang))
+        return
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        admin_id = int(text)
+        config = load_config()
+        config.setdefault("admins", [])
+        if admin_id in config["admins"] or admin_id in SUPER_ADMIN_IDS:
+            temp_msg_text = get_text('messages.admin_already_exists', lang)
+        else:
+            config["admins"].append(admin_id)
+            save_config(config)
+            temp_msg_text = get_text('messages.admin_added_success', lang, user_id=admin_id)
+    except ValueError:
+        if message_id_to_edit:
+            error_text = f"{get_text('prompts.add_admin_prompt', lang)}\n\n❌ {get_text('messages.invalid_id_numeric', lang)}"
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=error_text)
+            context.user_data.update({'awaiting_admin_id_to_add': True, 'last_menu_message_id': message_id_to_edit})
+        else:
+            await update.message.reply_text(get_text('messages.invalid_id_numeric', lang))
+        return
+
+    temp_msg = await context.bot.send_message(update.effective_chat.id, temp_msg_text, parse_mode="HTML")
+    await asyncio.sleep(3)
+    try: await temp_msg.delete()
+    except Exception: pass
+
+    if message_id_to_edit:
+        dummy_update = context.application.create_dummy_update(update, message_id_to_edit)
+        await user_management_menu_callback(dummy_update, context)
+
+async def _handle_state_monitor_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for adding and editing standalone monitors."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if 'monitor_add_step' in context.user_data:
+        monitor_add_step = context.user_data['monitor_add_step']
+
+        async def edit_previous_prompt(new_text, new_markup):
+            if context.user_data.get('last_callback_query'):
+                try:
+                    await context.user_data['last_callback_query'].message.edit_text(new_text, reply_markup=new_markup, parse_mode="HTML")
+                except Exception:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=new_text, reply_markup=new_markup, parse_mode="HTML")
+
+        if monitor_add_step == 'ask_name':
+            context.user_data['new_monitor_data']['monitor_name'] = text
+            context.user_data['monitor_add_step'] = 'ask_ip'
+            text_to_send = get_text('messages.wizard_name_saved', lang) + get_text('messages.monitor_ask_ip', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
+
+        elif monitor_add_step == 'ask_ip':
+            context.user_data['new_monitor_data']['ip'] = text
+            context.user_data['monitor_add_step'] = 'ask_port'
+            text_to_send = get_text('messages.monitor_ip_saved', lang) + get_text('messages.monitor_ask_port', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+            await edit_previous_prompt(text_to_send, InlineKeyboardMarkup(buttons))
+
+        elif monitor_add_step == 'ask_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535):
+                error_text = get_text('messages.monitor_ask_port', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
+                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="monitors_menu")]]
+                await edit_previous_prompt(error_text, InlineKeyboardMarkup(buttons))
+            else:
+                context.user_data['new_monitor_data']['check_port'] = int(text)
+                context.user_data['monitor_add_step'] = 'select_group'
+                await monitor_step_ask_group(update, context)
+
+    elif 'monitor_edit_step' in context.user_data:
+        field = context.user_data.pop('monitor_edit_step')
+        monitor_index = context.user_data.get('edit_monitor_index')
+        if monitor_index is None:
+            await update.message.reply_text(get_text('messages.session_expired_error', lang))
+            return
+
+        new_value = text.strip()
+
+        if field == 'check_port':
+            if not new_value.isdigit() or not (1 <= int(new_value) <= 65535):
+                error_text = get_text('messages.monitor_ask_port_edit', lang) + f"\n\n<b>❌ {get_text('messages.monitor_invalid_port', lang)}</b>"
+                buttons = [[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]]
+                if context.user_data.get('last_callback_query'):
+                    await context.user_data['last_callback_query'].message.edit_text(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+                context.user_data['monitor_edit_step'] = field
+                return
+            value_to_save = int(new_value)
+        else:
+            value_to_save = new_value
+
+        config = load_config()
+        old_ip = None
+        try:
+            if field == 'ip': old_ip = config['standalone_monitors'][monitor_index].get('ip')
+            config['standalone_monitors'][monitor_index][field] = value_to_save
+            save_config(config)
+        except (IndexError, KeyError):
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.internal_error', lang))
+            return
+
+        if field == 'ip' and old_ip and old_ip != value_to_save:
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"monitor_purge_logs|{old_ip}")],
+                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"monitor_edit|{monitor_index}")]
+            ]
+            text_to_send = get_text('messages.monitor_ask_purge_logs', lang, old_ip=escape_html(old_ip))
+            if context.user_data.get('last_callback_query'):
+                await context.user_data['last_callback_query'].message.edit_text(text_to_send, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        else:
+            temp_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=get_text('messages.value_updated_success', lang))
+            await asyncio.sleep(2)
+            await temp_msg.delete()
+
+            if context.user_data.get('last_callback_query'):
+                await context.user_data.pop('last_callback_query').message.delete()
+            callback_data_for_menu = f"monitor_edit|{monitor_index}"
+            dummy_update = context.application.create_dummy_update(update, update.message.message_id, callback_data=callback_data_for_menu)
+            await monitor_edit_menu_callback(dummy_update, context)
+
+async def _handle_state_record_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs related to adding, editing, and bulk-modifying DNS records."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    if "add_step" in context.user_data:
+        step = context.user_data["add_step"]
+        zone_name = context.user_data.get('selected_zone_name', 'your_domain.com')
+        if step == "name":
+            new_name = zone_name if text.strip() == "@" else f"{text.strip()}.{zone_name}"
+            all_records = context.user_data.get('all_records', [])
+            existing_record = next((r for r in all_records if r['name'].lower() == new_name.lower()), None)
+            if existing_record:
+                context.user_data.pop("add_step", None)
+                buttons = [[InlineKeyboardButton(get_text('buttons.try_another_name', lang), callback_data="add_retry_name")],
+                           [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{existing_record['id']}")],
+                           [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+                await send_or_edit(update, context, get_text('messages.subdomain_exists', lang), InlineKeyboardMarkup(buttons))
+            else:
+                context.user_data["new_name"] = new_name
+                context.user_data["add_step"] = "content"
+                prompt_text_key = 'prompts.enter_ip' if context.user_data.get("new_type") in ['A', 'AAAA'] else 'prompts.enter_content'
+                await send_or_edit(update, context, get_text(prompt_text_key, lang, name=escape_html(text.strip())), parse_mode="HTML")
+        elif step == "content":
+            context.user_data["new_content"] = text
+            context.user_data.pop("add_step")
+            kb = [[InlineKeyboardButton("DNS Only", callback_data="add_proxied|false")], [InlineKeyboardButton("Proxied", callback_data="add_proxied|true")]]
+            await send_or_edit(update, context, get_text('prompts.choose_proxy', lang), InlineKeyboardMarkup(kb))
+
+    elif "edit" in context.user_data:
+        data = context.user_data.pop("edit")
+        record_id = data["id"]
+        context.user_data["confirm"] = {"id": record_id, "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
+        context.user_data['last_text_update'] = update
+        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
+              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{record_id}")]]
+        safe_old, safe_new = escape_html(data['old']), escape_html(text)
+        try:
+            await update.message.delete()
+            if context.user_data.get('last_callback_query'):
+                 await context.user_data.pop('last_callback_query').message.delete()
+        except Exception: pass
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔄 <code>{safe_old}</code> ➡️ <code>{safe_new}</code>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+    elif 'change_type_data' in context.user_data:
+        data = context.user_data.pop('change_type_data')
+        rid = data['rid']
+        new_type = data['new_type']
+        new_content = text
+
+        record = context.user_data.get("records", {}).get(rid)
+        if not record:
+            await send_or_edit(update, context, get_text('messages.internal_error', lang))
+            return
+
+        proxied = record.get('proxied', False)
+        if new_type not in ['A', 'AAAA', 'CNAME']:
+            proxied = False
+
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+        provider = get_current_provider(context)
+        updated_record = dict(record)
+        updated_record["type"] = new_type
+        updated_record["content"] = new_content
+        updated_record["proxied"] = proxied
+
+        res = await update_provider_record(provider, token, zone_id, updated_record, new_content)
+
+        if res.get("success"):
+            temp_msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])),
+                parse_mode="HTML"
+            )
+
+            context.user_data.pop('all_records', None)
+            context.user_data.pop('records_list_cache', None)
+
+            await asyncio.sleep(2)
+            try: await temp_msg.delete()
+            except Exception: pass
+
+            context.user_data['selected_record_id_for_view'] = rid
+
+            all_records = await get_provider_dns_records(get_current_provider(context), token, zone_id)
+            if all_records is not None:
+                context.user_data['all_records'] = all_records
+                context.user_data["records"] = {r['id']: r for r in all_records}
+
+            await select_callback(update, context, force_new_message=True)
+        else:
+            error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+            await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
+
+    elif context.user_data.get('is_bulk_ip_change'):
+        selected_ids = context.user_data.get('selected_records', [])
+        context.user_data.pop('is_bulk_ip_change')
+        context.user_data['bulk_ip_confirm_details'] = {'new_ip': text, 'record_ids': selected_ids}
+        kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="bulk_change_ip_execute")],
+              [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_cancel")]]
+        await send_or_edit(update, context, get_text('messages.bulk_confirm_change_ip', lang, count=len(selected_ids), new_ip=text), InlineKeyboardMarkup(kb))
+
+async def _handle_state_awaiting_clone_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles user input for a new policy clone name."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    try:
+        if 'clone_start_message_id' in context.user_data:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data.pop('clone_start_message_id'))
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        new_name = text
+        clone_info = context.user_data.pop('clone_info')
+        policy_type = clone_info['type']
+        policy_index = clone_info['index']
+
+        config = load_config()
+
+        all_names = [p.get('policy_name') for p in config.get('failover_policies', [])] + \
+                    [p.get('policy_name') for p in config.get('load_balancer_policies', [])]
+
+        if new_name in all_names:
+            back_callback = f"{policy_type}_policy_view|{policy_index}"
+            buttons = [[InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=back_callback)]]
+            error_text = f"{get_text('prompts.enter_clone_name', lang)}\n\n<b>{get_text('messages.clone_name_exists', lang)}</b>"
+            error_msg = await update.effective_chat.send_message(error_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+            context.user_data['clone_info'] = clone_info
+            context.user_data['state'] = 'awaiting_clone_name'
+            context.user_data['clone_start_message_id'] = error_msg.message_id
+            return
+
+        policy_list_key = "load_balancer_policies" if policy_type == 'lb' else "failover_policies"
+        original_policy = config[policy_list_key][policy_index]
+        cloned_policy = copy.deepcopy(original_policy)
+
+        original_name = cloned_policy.get('policy_name', 'N/A')
+        cloned_policy['policy_name'] = new_name
+        cloned_policy['enabled'] = False
+
+        config[policy_list_key].append(cloned_policy)
+        save_config(config)
+
+        context.user_data.pop('state', None)
+
+        success_text = get_text('messages.clone_success', lang, original_name=escape_html(original_name), new_name=escape_html(new_name))
+        back_callback = "settings_lb_policies" if policy_type == 'lb' else "settings_failover_policies"
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back_callback)]]
+
+        await update.effective_chat.send_message(success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    except (IndexError, KeyError):
+        await update.message.reply_text(get_text('messages.session_expired_error', lang))
+
+async def _handle_state_add_policy_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all text inputs for the multi-step process of adding a new policy."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    step = context.user_data['add_policy_step']
+    data = context.user_data['new_policy_data']
+    policy_type = context.user_data.get('add_policy_type')
+
+    if policy_type == 'failover':
+        if step == 'name':
+            data['policy_name'] = text
+            context.user_data['add_policy_step'] = 'account_nickname'
+            buttons = get_dns_accounts_for_buttons('failover_policy_set_account')
+            await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
+
+        elif step == 'primary_ip':
+            if not is_valid_ip(text):
+                await send_or_edit(update, context, get_text('messages.invalid_ip', lang))
+                return
+            data['primary_ip'] = text
+            context.user_data['add_policy_step'] = 'backup_ips'
+            await send_or_edit(update, context, get_text('prompts.enter_backup_ip', lang))
+
+        elif step == 'backup_ips':
+            ips = [ip.strip() for ip in text.split(',') if ip.strip() and is_valid_ip(ip.strip())]
+            if not ips:
+                await send_or_edit(update, context, get_text('messages.invalid_ip', lang))
+                return
+            data['backup_ips'] = ips
+            context.user_data['add_policy_step'] = 'check_port'
+            await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
+
+        elif step == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535):
+                await send_or_edit(update, context, get_text('messages.invalid_port', lang))
+                return
+            data['check_port'] = int(text)
+            context.user_data['add_policy_step'] = 'failover_minutes'
+            await send_or_edit(update, context, get_text('prompts.enter_failover_minutes', lang))
+
+        elif step == 'failover_minutes':
+            if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
+                await send_or_edit(update, context, get_text('messages.invalid_number', lang))
+                return
+            data['failover_minutes'] = float(text)
+            context.user_data['add_policy_step'] = 'record_names'
+            text_to_send = get_text('prompts.continue_to_record_selection', lang)
+            buttons = [[InlineKeyboardButton(get_text('buttons.select_records', lang), callback_data="add_policy_failover_select_records")]]
+            await send_or_edit(update, context, text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif policy_type == 'lb':
+        if step == 'name':
+            data['policy_name'] = text
+            context.user_data['add_policy_step'] = 'account_nickname'
+            buttons = get_dns_accounts_for_buttons('lb_policy_set_account')
+            await send_or_edit(update, context, get_text('prompts.choose_cf_account', lang), InlineKeyboardMarkup(buttons))
+
+        elif step == 'ips':
+            new_items_data = []
+            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in ip_entries:
+                value, weight = (entry.strip(), 1)
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    value, weight_str = parts[0].strip(), parts[1].strip()
+                    if not weight_str.isdigit() or int(weight_str) < 1:
+                        await send_or_edit(update, context, get_text('messages.invalid_weight_positive', lang, ip=value)); return
+                    weight = int(weight_str)
+
+                item_type = "ip" if is_valid_ip(value) else "hostname"
+                if item_type == "hostname" and '.' not in value:
+                    await send_or_edit(update, context, get_text('errors.invalid_hostname', lang, value=value, default=f'Invalid hostname: {value}')); return
+
+                new_items_data.append({"type": item_type, "value": value, "weight": weight, "enabled": True})
+
+            if not new_items_data:
+                await send_or_edit(update, context, get_text('messages.bulk_no_selection', lang)); return
+
+            data['ips'] = new_items_data
+            context.user_data['add_policy_step'] = 'rotation_interval_hours'
+            await send_or_edit(update, context, get_text('prompts.enter_lb_interval', lang))
+
+        elif step == 'rotation_interval_hours':
+            parts = [p.strip() for p in text.split(',')]
+            try:
+                if len(parts) == 1 and float(parts[0]) > 0: data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[0])})
+                elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]): data.update({'rotation_min_hours': float(parts[0]), 'rotation_max_hours': float(parts[1])})
+                else: raise ValueError()
+            except (ValueError, IndexError): await send_or_edit(update, context, get_text('messages.invalid_number_range', lang)); return
+            context.user_data['add_policy_step'] = 'check_port'
+            await send_or_edit(update, context, get_text('prompts.enter_check_port', lang))
+
+        elif step == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535):
+                await send_or_edit(update, context, get_text('messages.invalid_port', lang))
+                return
+            data['check_port'] = int(text)
+
+            context.user_data['add_policy_step'] = 'record_names'
+
+            text_to_send = get_text('prompts.continue_to_record_selection', lang, default="Great! Now, press the button below to select the records this policy will apply to.")
+            buttons = [[InlineKeyboardButton(get_text('buttons.select_records', lang, default="Select Records"), callback_data="add_policy_lb_select_records")]]
+
+            await send_or_edit(update, context, text_to_send, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def _handle_state_edit_policy_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for editing a specific field of a policy."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    field = context.user_data.pop('edit_policy_field')
+    policy_type = context.user_data.get('editing_policy_type')
+    policy_index = context.user_data.get('edit_policy_index')
+
+    if policy_index is None or not policy_type:
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang))
+        return
+
+    try:
+        value_to_save = None
+
+        if field == 'ips' and policy_type == 'lb':
+            new_ips_data = []
+            ip_entries = [entry.strip() for entry in text.split(',') if entry.strip()]
+            for entry in ip_entries:
+                ip, weight = entry.strip(), 1
+                if ':' in entry:
+                    parts = entry.split(':', 1)
+                    ip, weight_str = parts[0].strip(), parts[1].strip()
+                    if not weight_str.isdigit() or int(weight_str) < 1:
+                        raise ValueError(get_text('messages.invalid_weight_positive', lang, ip=ip))
+                    weight = int(weight_str)
+                if not is_valid_ip(ip):
+                    raise ValueError(get_text('messages.invalid_ip', lang))
+                new_ips_data.append({"ip": ip, "weight": weight})
+            if not new_ips_data:
+                raise ValueError(get_text('messages.bulk_no_selection', lang))
+            value_to_save = new_ips_data
+
+        elif field == 'rotation_interval_range':
+            parts = [p.strip() for p in text.split(',') if p.strip()]
+            min_h, max_h = 0, 0
+            if len(parts) == 1 and float(parts[0]) > 0:
+                min_h = max_h = float(parts[0])
+            elif len(parts) == 2 and float(parts[0]) > 0 and float(parts[1]) >= float(parts[0]):
+                min_h, max_h = float(parts[0]), float(parts[1])
+            else:
+                raise ValueError(get_text('messages.invalid_number_range', lang))
+
+            config = load_config()
+            policy = config['load_balancer_policies'][policy_index]
+            policy_name = policy.get('policy_name')
+            policy.update({'rotation_min_hours': min_h, 'rotation_max_hours': max_h})
+            save_config(config)
+
+            if policy_name and 'health_status' in context.bot_data and policy_name in context.bot_data['health_status']:
+                context.bot_data['health_status'][policy_name].pop('lb_next_rotation_time', None)
+                logger.info(f"Reset 'lb_next_rotation_time' for policy '{policy_name}' due to interval change.")
+
+            await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=get_text('field_names.rotation_interval_hours', lang)))
+            await lb_policy_view_callback(update, context, force_new_message=True)
+            return
+
+        elif field == 'backup_ips':
+            ips = [ip.strip() for ip in text.split(',') if ip.strip()]
+            if not ips or not all(is_valid_ip(ip) for ip in ips):
+                raise ValueError(get_text('messages.invalid_ip', lang))
+            value_to_save = ips
+
+        elif field == 'primary_ip':
+             if not is_valid_ip(text):
+                 raise ValueError(get_text('messages.invalid_ip', lang))
+             value_to_save = text
+
+        elif field == 'check_port':
+            if not text.isdigit() or not (1 <= int(text) <= 65535):
+                raise ValueError(get_text('messages.invalid_port', lang))
+            value_to_save = int(text)
+
+        elif field in ['failover_minutes', 'failback_minutes']:
+             if not text.replace('.', '', 1).isdigit() or float(text) <= 0:
+                 raise ValueError(get_text('messages.invalid_number', lang))
+             value_to_save = float(text)
+
+        else:
+            value_to_save = text
+
+        config = load_config()
+        policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
+        policy_to_update = config[policy_list_key][policy_index]
+        old_value = policy_to_update.get(field)
+        policy_to_update[field] = value_to_save
+
+        if policy_type == 'failover' and field == 'primary_ip' and old_value != value_to_save:
+            existing_pending = policy_to_update.get('pending_primary_change') or {}
+            policy_to_update['pending_primary_change'] = {
+                "from_ip": existing_pending.get('from_ip', old_value),
+                "to_ip": value_to_save,
+                "changed_at": datetime.now().isoformat(),
+                "requires_failback": False,
+            }
+        save_config(config)
+
+        if policy_type == 'failover' and field == 'primary_ip' and old_value != value_to_save:
+            policy_name = policy_to_update.get('policy_name', 'Unnamed')
+            reset_policy_health_status(context, policy_name)
+            logger.info(
+                f"Primary IP for policy '{policy_name}' changed from '{old_value}' "
+                f"to '{value_to_save}'. DNS sync is pending until the next valid health check."
+            )
+
+        field_name = get_text(f'field_names.{field}', lang)
+        await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=field_name))
+
+        view_callback = lb_policy_view_callback if policy_type == 'lb' else failover_policy_view_callback
+        await view_callback(update, context, force_new_message=True)
+
+    except (ValueError, IndexError) as e:
+        context.user_data['edit_policy_field'] = field
+        await send_or_edit(update, context, f"❌ {e}")
+        return
+
+async def _handle_state_group_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for a new monitoring group name."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    group_name = text
+    config = load_config()
+    if group_name in config.get("monitoring_groups", {}):
+        error_text = get_text('messages.group_add_prompt_name', lang) + f"\n\n<b>❌ {get_text('messages.group_name_exists', lang)}</b>"
+        if context.user_data.get('last_callback_query'):
+            await context.user_data['last_callback_query'].message.edit_text(error_text, parse_mode="HTML")
+        return
+
+    context.user_data.update({'new_group_name': group_name, 'editing_policy_type': 'group', 'policy_selected_nodes': []})
+    context.user_data.pop('group_add_step')
+    try: await update.message.delete()
+    except Exception: pass
+    if context.user_data.get('last_callback_query'): await context.user_data.pop('last_callback_query').message.delete()
+    await display_countries_for_selection(update, context, page=0)
+
+async def _handle_state_awaiting_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for the monitoring threshold value."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    if not text.isdigit() or int(text) < 1:
+        await send_or_edit(update, context, get_text('messages.threshold_invalid_message', lang))
+        return
+
+    threshold = int(text)
+    selected_nodes = context.user_data.get('policy_selected_nodes', [])
+
+    if not selected_nodes:
+        await send_or_edit(update, context, "No monitoring locations were selected. The process has been cancelled.")
+        for key in ['awaiting_threshold', 'editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes', 'is_wizard_manual_setup', 'new_group_name']:
+            context.user_data.pop(key, None)
+        return
+
+    if threshold > len(selected_nodes):
+        error_text = get_text('messages.nodes_updated_message', lang, count=len(selected_nodes), monitoring_type='selected') + \
+                     f"\n\n<b>❌ {get_text('messages.threshold_too_high_message', lang, threshold=threshold, count=len(selected_nodes))}</b>"
+        await send_or_edit(update, context, error_text, parse_mode="HTML")
+        context.user_data['awaiting_threshold'] = True
+        return
+
+    context.user_data.pop('awaiting_threshold')
+    config = load_config()
+
+    if context.user_data.get('editing_policy_type') == 'group':
+        group_name = context.user_data.pop('new_group_name')
+        config.setdefault("monitoring_groups", {})[group_name] = {"nodes": selected_nodes, "threshold": threshold}
+        save_config(config)
+
+        for key in ['editing_policy_type', 'policy_selected_nodes', 'last_callback_query']:
+            context.user_data.pop(key, None)
+
+        success_text = get_text('messages.group_created_success', lang, group_name=escape_html(group_name))
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="groups_menu")]]
+        await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    else:
+        is_wizard_flow = context.user_data.pop('is_wizard_manual_setup', False)
+        policy_type = context.user_data.get('editing_policy_type')
+        policy_index = context.user_data.get('edit_policy_index')
+        monitoring_type = context.user_data.get('monitoring_type')
+
+        if policy_type == 'lb':
+            config['load_balancer_policies'][policy_index]['monitoring_nodes'] = selected_nodes
+            config['load_balancer_policies'][policy_index]['threshold'] = threshold
+        elif policy_type == 'failover':
+            if is_wizard_flow or monitoring_type == 'primary':
+                config['failover_policies'][policy_index]['primary_monitoring_nodes'] = selected_nodes
+                config['failover_policies'][policy_index]['primary_threshold'] = threshold
+            if is_wizard_flow:
+                config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
+                config['failover_policies'][policy_index]['backup_threshold'] = threshold
+            elif monitoring_type == 'backup':
+                 config['failover_policies'][policy_index]['backup_monitoring_nodes'] = selected_nodes
+                 config['failover_policies'][policy_index]['backup_threshold'] = threshold
+
+        save_config(config)
+
+        for key in ['editing_policy_type', 'edit_policy_index', 'monitoring_type', 'policy_selected_nodes']:
+            context.user_data.pop(key, None)
+
+        if is_wizard_flow:
+            policy_data = context.user_data.pop('wizard_data', {})
+            text_msg = get_text('messages.wizard_rule_created', lang,
+                            type_display="Failover" if policy_type == 'failover' else "Load Balancer",
+                            policy_name=escape_html(policy_data.get('policy_name', 'N/A')))
+            buttons = [[InlineKeyboardButton(get_text('buttons.settings', lang), callback_data="go_to_settings")]]
+            await send_or_edit(update, context, text_msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        else:
+            type_text = get_text(f'messages.monitoring_type_{monitoring_type}', lang)
+            success_text = get_text('messages.threshold_updated_message', lang, monitoring_type=type_text, threshold=threshold)
+            back_callback = f"lb_policy_edit|{policy_index}" if policy_type == 'lb' else f"failover_policy_edit|{policy_index}"
+            buttons = [[InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=back_callback)]]
+            await send_or_edit(update, context, success_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+async def _handle_state_searching(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input for searching records by name or IP."""
+    text = update.message.text.strip()
+
+    if context.user_data.get('is_searching'):
+        context.user_data.pop('is_searching')
+        context.user_data.pop('search_ip_query', None)
+        context.user_data['search_query'] = text
+
+        if not context.user_data.get('selected_zone_id'):
+            context.user_data['pending_global_search'] = True
+            await display_account_list(update, context, force_new_message=True)
+            return
+
+        context.user_data['records_in_view'] = [
+            r for r in context.user_data.get('all_records', [])
+            if text.lower() in str(r.get('name', '')).lower()
+        ]
+        await display_records_list(update, context)
+
+    elif context.user_data.get('is_searching_ip'):
+        context.user_data.pop('is_searching_ip')
+        context.user_data.pop('search_query', None)
+        context.user_data['search_ip_query'] = text
+
+        if not context.user_data.get('selected_zone_id'):
+            context.user_data['pending_global_search'] = True
+            await display_account_list(update, context, force_new_message=True)
+            return
+
+        context.user_data['records_in_view'] = [
+            r for r in context.user_data.get('all_records', [])
+            if str(r.get('content', '')).strip() == text
+        ]
+        await display_records_list(update, context)
+
+async def _handle_state_change_record_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the final step of changing a record's type."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    data = context.user_data.pop('change_type_data')
+    rid = data['rid']
+    new_type = data['new_type']
+    new_content = text
+
+    record = context.user_data.get("records", {}).get(rid)
+    if not record:
+        await send_or_edit(update, context, get_text('messages.internal_error', lang))
+        return
+
+    proxied = record.get('proxied', False)
+    if new_type not in ['A', 'AAAA', 'CNAME']:
+        proxied = False
+
+    token = get_current_token(context)
+    zone_id = context.user_data.get('selected_zone_id')
+    provider = get_current_provider(context)
+    updated_record = dict(record)
+    updated_record["type"] = new_type
+    updated_record["content"] = new_content
+    updated_record["proxied"] = proxied
+
+    res = await update_provider_record(provider, token, zone_id, updated_record, new_content)
+
+    if res.get("success"):
+        temp_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=get_text('messages.record_updated_successfully', lang, record_name=escape_html(record['name'])),
+            parse_mode="HTML"
+        )
+
+        context.user_data.pop('all_records', None)
+        context.user_data.pop('records_list_cache', None)
+
+        await asyncio.sleep(2)
+        try: await temp_msg.delete()
+        except Exception: pass
+
+        context.user_data['selected_record_id_for_view'] = rid
+
+        all_records = await get_provider_dns_records(get_current_provider(context), token, zone_id)
+        if all_records is not None:
+            context.user_data['all_records'] = all_records
+            context.user_data["records"] = {r['id']: r for r in all_records}
+
+        await select_callback(update, context, force_new_message=True)
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await send_or_edit(update, context, get_text('messages.error_updating_record', lang, error=error_msg))
+
+async def _handle_state_edit_record_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the input for editing a record's value."""
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+
+    data = context.user_data.pop("edit")
+    record_id = data["id"]
+    context.user_data["confirm"] = {"id": record_id, "type": data["type"], "name": data["name"], "old": data["old"], "new": text}
+    context.user_data['last_text_update'] = update
+    kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="confirm_change")],
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{record_id}")]]
+    safe_old, safe_new = escape_html(data['old']), escape_html(text)
+    try:
+        await update.message.delete()
+        if context.user_data.get('last_callback_query'):
+             await context.user_data.pop('last_callback_query').message.delete()
+    except Exception: pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔄 <code>{safe_old}</code> ➡️ <code>{safe_new}</code>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+async def _create_dummy_update_from_text(update: Update, callback_data: str):
+    """Creates a dummy Update object with a CallbackQuery from a text message."""
+    async def dummy_answer(*args, **kwargs): return True
+    message_obj = update.message if hasattr(update, 'message') and update.message else update.callback_query.message
+
+    dummy_query = type('obj', (object,), {
+        'data': callback_data, 'answer': dummy_answer,
+        'message': message_obj, 'is_dummy': True
+    })
+    return type('obj', (object,), {
+        'callback_query': dummy_query, 'effective_user': update.effective_user,
+        'effective_chat': update.effective_chat
+    })
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles all non-command text messages by dispatching to the appropriate state handler.
+    """
+    if not is_admin(update):
+        return
+
+    state = context.user_data.get('state')
+
+    if 'add_policy_step' in context.user_data:
+        await _handle_state_add_policy_steps(update, context)
+        return
+
+    elif 'edit_policy_field' in context.user_data:
+        await _handle_state_edit_policy_field(update, context)
+        return
+
+    elif state in ['awaiting_lb_ip_address', 'awaiting_lb_ip_weight', 'awaiting_lb_new_ip']:
+        await _handle_state_lb_ip_management(update, context)
+        return
+
+    elif 'wizard_step' in context.user_data:
+        await _handle_state_wizard_steps(update, context)
+        return
+
+    elif 'monitor_add_step' in context.user_data or 'monitor_edit_step' in context.user_data:
+        await _handle_state_monitor_management(update, context)
+        return
+
+    elif context.user_data.get('awaiting_threshold'):
+        await _handle_state_awaiting_threshold(update, context)
+        return
+
+    elif context.user_data.get('group_add_step') == 'ask_name':
+        await _handle_state_group_add_name(update, context)
+        return
+
+    elif state == 'awaiting_clone_name':
+        await _handle_state_awaiting_clone_name(update, context)
+        return
+
+    elif state == 'awaiting_notification_recipient':
+        await _handle_state_notification_recipient(update, context)
+        return
+
+    elif state == 'awaiting_hcloud_create_server':
+        await _handle_state_hcloud_create_server(update, context)
+        return
+
+    elif state == 'awaiting_hcloud_create_server_name':
+        await _handle_state_hcloud_create_server_name(update, context)
+        return
+
+    elif state == 'awaiting_hcloud_rename_server':
+        await _handle_state_hcloud_rename_server(update, context)
+        return
+
+    elif 'awaiting_record_alias' in context.user_data or 'awaiting_zone_alias' in context.user_data:
+        await _handle_state_aliases(update, context)
+        return
+
+    elif context.user_data.get('awaiting_admin_id_to_add'):
+        await _handle_state_admin_management(update, context)
+        return
+
+    elif 'add_step' in context.user_data or context.user_data.get('is_bulk_ip_change'):
+        await _handle_state_record_management(update, context)
+        return
+
+    elif 'change_type_data' in context.user_data:
+        await _handle_state_change_record_type(update, context)
+        return
+
+    elif parse_health_interval_input(update.message.text.strip()) is not None and context.user_data.get('last_health_interval_prompt'):
+        await _handle_state_health_interval(update, context)
+        return
+
+    elif "edit" in context.user_data:
+        await _handle_state_edit_record_value(update, context)
+        return
+
+    elif context.user_data.get('is_searching') or context.user_data.get('is_searching_ip'):
+        await _handle_state_searching(update, context)
+        return
+
+    else:
+        logger.warning(
+            f"User {update.effective_user.id} sent text '{update.message.text.strip()}' but no active state was found to handle it."
+        )
+
+async def zones_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination for the zones list."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('|')[1])
+    await display_zones_list(update, context, page=page)
+
+async def select_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    provider, nickname = parse_provider_account_callback(query.data)
+
+    preserve_keys = ['language']
+    if context.user_data.get('search_query') or context.user_data.get('search_ip_query') or context.user_data.get('pending_global_search'):
+        preserve_keys.extend(['search_query', 'search_ip_query', 'pending_global_search'])
+
+    clear_state(context, preserve=preserve_keys)
+    context.user_data['selected_provider'] = provider
+    context.user_data['selected_account_nickname'] = nickname
+    await display_zones_list(update, context, page=0)
+
+async def back_to_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_state(context, preserve=[])
+    await display_account_list(update, context)
+
+async def refresh_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('records_list_cache', None)
+    context.user_data.pop('all_records', None)
+    context.user_data.pop('records_in_view', None)
+    context.user_data.pop('search_query', None)
+    context.user_data.pop('search_ip_query', None)
+    await display_records_list(update, context)
+
+async def select_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    zone_id = query.data.split('|')[1]
+    all_zones = context.user_data.get('all_zones', {})
+    zone = all_zones.get(zone_id)
+    if not zone:
+        await query.edit_message_text("Error: Zone not found."); return
+
+    preserve_keys = ['language', 'selected_provider', 'selected_account_nickname', 'all_zones']
+    if context.user_data.get('search_query') or context.user_data.get('search_ip_query') or context.user_data.get('pending_global_search'):
+        preserve_keys.extend(['search_query', 'search_ip_query', 'pending_global_search'])
+
+    clear_state(context, preserve=preserve_keys)
+    context.user_data['selected_zone_id'] = zone_id
+    context.user_data['selected_zone_name'] = zone['name']
+    await display_records_list(update, context)
+
+async def back_to_zones_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname'])
+    await display_zones_list(update, context, page=0)
+
+async def back_to_records_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_page = context.user_data.get('current_page', 0)
+    preserve_keys = ['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records']
+    clear_state(context, preserve=preserve_keys)
+    await display_records_list(update, context, page=current_page)
+
+async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE): await display_records_list(update, context, page=int(update.callback_query.data.split('|')[1]))
+
+async def select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    lang = get_user_lang(context)
+    query = update.callback_query
+
+    rid = None
+    if query and not getattr(query, 'is_dummy', False):
+        rid = query.data.split('|')[1]
+    elif 'selected_record_id_for_view' in context.user_data:
+        rid = context.user_data.pop('selected_record_id_for_view')
+
+    if not rid:
+        await send_or_edit(update, context, get_text('messages.session_expired_error', lang), force_new_message=force_new_message)
+        return
+
+    if "records" not in context.user_data:
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+        if token and zone_id:
+            all_records = await get_provider_dns_records(get_current_provider(context), token, zone_id)
+            if all_records is not None:
+                context.user_data['all_records'] = all_records
+                context.user_data["records"] = {r['id']: r for r in all_records}
+
+    record = context.user_data.get("records", {}).get(rid)
+    if not record:
+        await send_or_edit(update, context, get_text('messages.no_records_found', lang), force_new_message=force_new_message)
+        return
+
+    proxy_text = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
+
+    config = load_config()
+    zone_id = context.user_data.get('selected_zone_id')
+    alias_key = f"{record['type']}:{record['name']}"
+    alias = config.get('record_aliases', {}).get(zone_id, {}).get(alias_key)
+
+    if alias:
+        text = get_text('messages.record_details_with_alias', lang,
+                        alias=escape_html(alias),
+                        type=record['type'],
+                        name=escape_html(record['name']),
+                        content=escape_html(record['content']),
+                        proxy_status=proxy_text)
+    else:
+        text = get_text('messages.record_details', lang,
+                        type=record['type'],
+                        name=escape_html(record['name']),
+                        content=escape_html(record['content']),
+                        proxy_status=proxy_text)
+
+    kb = [
+        [InlineKeyboardButton(get_text('buttons.edit_value', lang), callback_data=f"edit|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.set_record_alias', lang), callback_data=f"set_record_alias_start|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.change_type', lang), callback_data=f"change_type|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.move_record', lang), callback_data=f"move_record_start|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.toggle_proxy', lang), callback_data=f"toggle_proxy|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.delete', lang), callback_data=f"delete|{rid}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]
+    ]
+
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(kb), force_new_message=force_new_message)
+
+async def move_record_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the record move/copy process."""
+    query = update.callback_query
+    await query.answer()
+
+    rid = query.data.split('|')[1]
+    context.user_data['move_record_rid'] = rid
+
+    provider = get_current_provider(context)
+    accounts = ARVAN_ACCOUNTS if provider == 'arvan' else CF_ACCOUNTS
+    if len(accounts) > 1:
+        lang = get_user_lang(context)
+        buttons = [[InlineKeyboardButton(nickname, callback_data=f"move_select_dest_account|{nickname}")] for nickname in accounts.keys()]
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+        text = get_text('prompts.choose_destination_account', lang)
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+    elif len(accounts) == 1:
+        single_account_nickname = list(accounts.keys())[0]
+        await display_destination_zones(update, context, single_account_nickname)
+    else:
+        await send_or_edit(update, context, get_text('messages.error_no_token', get_user_lang(context)))
+
+async def move_select_dest_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the selection of the destination account."""
+    query = update.callback_query
+    await query.answer()
+
+    dest_account_nickname = query.data.split('|')[1]
+    context.user_data['move_dest_account_nickname'] = dest_account_nickname
+    await display_destination_zones(update, context, dest_account_nickname)
+
+async def display_destination_zones(update: Update, context: ContextTypes.DEFAULT_TYPE, account_nickname: str):
+    """Fetches and displays the list of destination zones for the user to choose from."""
+    lang = get_user_lang(context)
+
+    provider = get_current_provider(context)
+    token = get_account_token(provider, account_nickname)
+    if not token:
+        await send_or_edit(update, context, get_text('messages.error_no_token', lang)); return
+
+    await send_or_edit(update, context, get_text('messages.fetching_zones', lang))
+
+    all_zones = await get_provider_zones(provider, token)
+
+    context.user_data['all_zones_for_move'] = all_zones
+
+    source_zone_id = context.user_data.get('selected_zone_id')
+    destination_zones = [zone for zone in all_zones if zone['id'] != source_zone_id]
+
+    if not destination_zones:
+        await send_or_edit(update, context, "No other zones found in this account to move the record to.")
+        return
+
+    buttons = [[InlineKeyboardButton(zone['name'], callback_data=f"move_select_dest_zone|{zone['id']}")] for zone in destination_zones]
+
+    rid = context.user_data.get('move_record_rid')
+    if rid:
+        buttons.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+
+    text = get_text('prompts.choose_destination_zone', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def move_select_dest_zone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the selection of the destination zone and performs the copy action."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        dest_zone_id = query.data.split('|')[1]
+        rid = context.user_data['move_record_rid']
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Source record not found")
+    except (IndexError, ValueError, KeyError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    await send_or_edit(update, context, get_text('messages.move_record_in_progress', lang))
+
+    provider = get_current_provider(context)
+    accounts = ARVAN_ACCOUNTS if provider == 'arvan' else CF_ACCOUNTS
+    dest_token = None
+    dest_account_nickname = context.user_data.get('move_dest_account_nickname')
+    if dest_account_nickname:
+        dest_token = get_account_token(provider, dest_account_nickname)
+    elif len(accounts) == 1:
+        dest_token = list(accounts.values())[0]
+
+    if not dest_token:
+        await send_or_edit(update, context, get_text('messages.error_no_token', lang)); return
+
+    source_zone_name = context.user_data.get('selected_zone_name')
+    short_name = get_short_name(record['name'], source_zone_name)
+
+    all_zones_in_dest_account = context.user_data.get('all_zones_for_move', [])
+    dest_zone = next((z for z in all_zones_in_dest_account if z['id'] == dest_zone_id), None)
+    if not dest_zone:
+        await send_or_edit(update, context, "Error: Destination zone not found in cache."); return
+    dest_zone_name = dest_zone['name']
+
+    new_record_name = dest_zone_name if short_name == '@' else f"{short_name}.{dest_zone_name}"
+
+    res = await create_provider_record(
+        provider=provider,
+        token=dest_token,
+        zone_identifier=dest_zone_id,
+        rtype=record['type'],
+        name=new_record_name,
+        content=record['content'],
+        proxied=record.get('proxied', False)
+    )
+
+    if res.get("success"):
+        await send_or_edit(update, context, get_text('messages.move_record_success', lang, dest_zone_name=dest_zone_name))
+        await asyncio.sleep(1)
+
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.action_delete_source', lang), callback_data=f"move_delete_source|{rid}")],
+            [InlineKeyboardButton(get_text('buttons.action_copy_only', lang), callback_data="move_copy_complete")]
+        ]
+        text = get_text('messages.move_record_ask_delete', lang, source_zone_name=source_zone_name)
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await send_or_edit(update, context, get_text('messages.error_creating_record', lang, error=error_msg))
+
+async def move_delete_source_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the original record after a successful copy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        rid = query.data.split('|')[1]
+        token = get_current_token(context)
+        zone_id = context.user_data.get('selected_zone_id')
+    except (IndexError, KeyError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    res = await delete_provider_record(get_current_provider(context), token, zone_id, rid)
+
+    if res.get("success"):
+        await send_or_edit(update, context, get_text('messages.move_record_source_deleted', lang))
+    else:
+        await send_or_edit(update, context, get_text('messages.error_deleting_record', lang))
+
+    for key in ['move_record_rid', 'move_dest_account_nickname']: context.user_data.pop(key, None)
+    context.user_data.pop('all_records', None)
+    await asyncio.sleep(2)
+    await display_records_list(update, context)
+
+async def move_copy_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finalizes the process when the user chooses to only copy."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    await send_or_edit(update, context, get_text('messages.move_record_copy_complete', lang))
+
+    for key in ['move_record_rid', 'move_dest_account_nickname']: context.user_data.pop(key, None)
+    context.user_data.pop('all_records', None)
+    await asyncio.sleep(2)
+    await display_records_list(update, context)
+
+async def change_record_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays a list of all possible DNS record types for the user to choose from."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        rid = query.data.split('|')[1]
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Record not found")
+    except (IndexError, ValueError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    buttons = [InlineKeyboardButton(t, callback_data=f"change_type_select|{rid}|{t}") for t in DNS_RECORD_TYPES]
+    buttons_in_rows = chunk_list(buttons, 3)
+    buttons_in_rows.append([InlineKeyboardButton(get_text('buttons.cancel', lang), callback_data=f"select|{rid}")])
+
+    text = get_text('prompts.choose_new_record_type', lang, record_name=escape_html(record['name']))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons_in_rows))
+
+async def change_record_type_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the user's selection of a new record type and prompts for the new content."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    try:
+        _, rid, new_type = query.data.split('|')
+        record = context.user_data.get("records", {}).get(rid)
+        if not record: raise ValueError("Record not found")
+    except (IndexError, ValueError):
+        await send_or_edit(update, context, get_text('messages.internal_error', lang)); return
+
+    context.user_data['change_type_data'] = {
+        "rid": rid,
+        "new_type": new_type
+    }
+
+    prompt_key = 'prompts.enter_new_content_for_record'
+    if new_type in ['A', 'AAAA']:
+        prompt_key = 'prompts.enter_new_ip_for_record'
+    elif new_type == 'CNAME':
+        prompt_key = 'prompts.enter_new_cname_for_record'
+
+    text = get_text(prompt_key, lang, record_name=escape_html(record['name']))
+    await send_or_edit(update, context, text)
+
+async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    rid = update.callback_query.data.split('|')[1]
+    record = context.user_data.get("records", {}).get(rid)
+    if not record:
+        await update.callback_query.message.reply_text(get_text('messages.internal_error', lang)); return
+    context.user_data["edit"] = {"id": record["id"], "type": record["type"], "name": record["name"], "old": record["content"]}
+    zone_name = context.user_data.get('selected_zone_name', '')
+    record_short_name = get_short_name(record['name'], zone_name)
+    prompt_key = 'prompts.enter_ip' if record['type'] in ['A', 'AAAA'] else 'prompts.enter_content'
+
+    safe_short_name = escape_html(record_short_name)
+    prompt_text = get_text(prompt_key, lang, name=f"<code>{safe_short_name}</code>")
+    await update.callback_query.message.reply_text(prompt_text, parse_mode="HTML")
+
+async def toggle_proxy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    rid = update.callback_query.data.split('|')[1]
+    record = context.user_data.get("records", {}).get(rid)
+    current_status = get_text('messages.proxy_status_active', lang) if record.get('proxied') else get_text('messages.proxy_status_inactive', lang)
+    new_status = get_text('messages.proxy_status_inactive', lang) if record.get('proxied') else get_text('messages.proxy_status_active', lang)
+    kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"toggle_proxy_confirm|{rid}")],
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]
+    safe_record_name = escape_html(record['name'])
+    text = get_text('messages.confirm_proxy_toggle', lang, record_name=f"<code>{safe_record_name}</code>", current_status=current_status, new_status=new_status)
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+async def toggle_proxy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    rid = update.callback_query.data.split('|')[1]
+    record = context.user_data.get("records", {}).get(rid)
+    new_proxied_status = not record.get('proxied', False)
+    provider = get_current_provider(context)
+    zone_id = context.user_data['selected_zone_id']
+    updated_record = dict(record)
+    updated_record["proxied"] = new_proxied_status
+    res = await update_provider_record(provider, token, zone_id, updated_record, record['content'])
+    if res.get("success"):
+        await update.callback_query.answer(get_text('messages.proxy_toggled_successfully', lang, record_name=record['name']), show_alert=True)
+        for i, r in enumerate(context.user_data['all_records']):
+            if r['id'] == rid: context.user_data['all_records'][i]['proxied'] = new_proxied_status; break
+        await select_callback(update, context)
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', get_text('messages.error_toggling_proxy', lang))
+        await update.callback_query.answer(error_msg, show_alert=True)
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    rid = update.callback_query.data.split('|')[1]
+    record = context.user_data.get("records", {}).get(rid)
+    kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"delete_confirm|{rid}")],
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"select|{rid}")]]
+    safe_record_name = escape_html(record['name'])
+    await update.callback_query.edit_message_text(
+        get_text('messages.confirm_delete_record', lang, record_name=f"<code>{safe_record_name}</code>"),
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML"
+    )
+
+async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    rid = update.callback_query.data.split('|')[1]
+    record = context.user_data.get("records", {}).get(rid, {})
+    res = await delete_provider_record(get_current_provider(context), token, context.user_data['selected_zone_id'], rid)
+    if res.get("success"):
+        safe_name = escape_html(record.get('name', 'N/A'))
+        await update.callback_query.edit_message_text(
+            get_text('messages.record_deleted_successfully', lang, record_name=f"<code>{safe_name}</code>"),
+            parse_mode="HTML"
+        )
+        context.user_data.pop('all_records', None)
+        await asyncio.sleep(1)
+        await display_records_list(update, context)
+    else:
+        await update.callback_query.edit_message_text(get_text('messages.error_deleting_record', lang))
+
+async def confirm_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    query = update.callback_query
+    info = context.user_data.pop("confirm", {})
+
+    record_id = info.get("id")
+    if not record_id:
+        await query.edit_message_text(get_text('messages.session_expired_error', lang))
+        return
+
+    original_record = context.user_data.get("records", {}).get(record_id, {})
+    proxied_status = original_record.get("proxied", False)
+
+    provider = get_current_provider(context)
+    zone_id = context.user_data['selected_zone_id']
+    updated_record = dict(original_record) if original_record else {
+        "id": record_id,
+        "type": info["type"],
+        "name": info["name"],
+        "content": info["new"],
+        "proxied": proxied_status,
+    }
+    updated_record["type"] = info["type"]
+    updated_record["name"] = info["name"]
+    updated_record["content"] = info["new"]
+    updated_record["proxied"] = proxied_status
+    res = await update_provider_record(provider, token, zone_id, updated_record, info["new"])
+
+    if res.get("success"):
+        safe_name = escape_html(info['name'])
+        await query.edit_message_text(
+            get_text('messages.record_updated_successfully', lang, record_name=f"<code>{safe_name}</code>"),
+            parse_mode="HTML"
+        )
+
+        context.user_data.pop('all_records', None)
+        context.user_data.pop('records_list_cache', None)
+        context.user_data.pop('records', None)
+
+        await asyncio.sleep(1)
+
+        original_update = context.user_data.pop('last_text_update', update)
+        context.user_data['selected_record_id_for_view'] = record_id
+
+        await select_callback(original_update, context, force_new_message=True)
+
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await query.edit_message_text(get_text('messages.error_updating_record', lang, error=error_msg))
+
+async def add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    lang = get_user_lang(context)
+    query = update.callback_query
+    message_source = query.message if query else update.message
+    zone_id = context.user_data.get('selected_zone_id')
+    if not zone_id:
+        msg = get_text('messages.no_zone_selected', lang)
+        if query: await query.answer(msg, show_alert=True)
+        else: await message_source.reply_text(msg)
+        return
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records'])
+    buttons = [InlineKeyboardButton(t, callback_data=f"add_type|{t}") for t in DNS_RECORD_TYPES]
+    buttons_3col = chunk_list(buttons, 3)
+    buttons_3col.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")])
+    reply_markup = InlineKeyboardMarkup(buttons_3col)
+    text = get_text('prompts.choose_record_type', lang)
+    if query: await query.edit_message_text(text, reply_markup=reply_markup)
+    else: await message_source.reply_text(text, reply_markup=reply_markup)
+
+async def add_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_type"] = update.callback_query.data.split('|')[1]
+    context.user_data["add_step"] = "name"
+    await update.callback_query.edit_message_text(get_text('prompts.enter_subdomain', get_user_lang(context)))
+
+async def add_proxied_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    proxied = update.callback_query.data.split('|')[1].lower() == "true"
+    rtype, name, content = context.user_data.pop("new_type"), context.user_data.pop("new_name"), context.user_data.pop("new_content")
+    res = await create_provider_record(get_current_provider(context), token, context.user_data['selected_zone_id'], rtype, name, content, proxied)
+    if res.get("success"):
+        safe_name = escape_html(name)
+        await update.callback_query.edit_message_text(
+            get_text('messages.record_added_successfully', lang, rtype=rtype, name=f"<code>{safe_name}</code>"),
+            parse_mode="HTML"
+        )
+        context.user_data.pop('all_records', None)
+        await asyncio.sleep(1)
+        await display_records_list(update, context)
+    else:
+        error_msg = res.get('errors', [{}])[0].get('message', 'Unknown error')
+        await update.callback_query.edit_message_text(get_text('messages.error_creating_record', lang, error=error_msg))
+
+async def add_retry_name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    context.user_data["add_step"] = "name"
+    await update.callback_query.edit_message_text(get_text('prompts.enter_subdomain', lang))
+
+async def search_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    query = update.callback_query
+    buttons = [[InlineKeyboardButton(get_text('buttons.search_by_name', lang), callback_data="search_by_name")],
+               [InlineKeyboardButton(get_text('buttons.search_by_ip', lang), callback_data="search_by_ip")],
+               [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+    await query.edit_message_text(get_text('messages.search_menu', lang), reply_markup=InlineKeyboardMarkup(buttons))
+
+async def search_by_name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    query = update.callback_query
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records'])
+    context.user_data['is_searching'] = True
+    text = get_text('prompts.enter_search_query', lang)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.cancel_search', lang), callback_data="back_to_records_list")]])
+    await query.edit_message_text(text, reply_markup=kb)
+
+async def search_by_ip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    query = update.callback_query
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records'])
+    context.user_data['is_searching_ip'] = True
+    text = get_text('prompts.enter_search_query_ip', lang)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.cancel_search', lang), callback_data="back_to_records_list")]])
+    await query.edit_message_text(text, reply_markup=kb)
+
+async def bulk_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_view = context.user_data.get('records_in_view')
+    preserve_keys = ['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records']
+    if current_view is not None:
+        preserve_keys.extend(['records_in_view', 'search_query', 'search_ip_query'])
+    clear_state(context, preserve=preserve_keys)
+    context.user_data['is_bulk_mode'] = True
+    context.user_data['selected_records'] = []
+    await display_records_list(update, context)
+
+async def bulk_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_page = context.user_data.get('current_page', 0)
+    preserve_keys = ['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name', 'all_records', 'records']
+    if context.user_data.get('records_in_view') is not None:
+        preserve_keys.extend(['records_in_view', 'search_query', 'search_ip_query'])
+    clear_state(context, preserve=preserve_keys)
+    await display_records_list(update, context, page=current_page)
+
+async def bulk_select_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    page = int(query.data.split('|')[1])
+    selected_records = context.user_data.get('selected_records', [])
+    records_in_view = context.user_data.get('records_in_view', context.user_data.get('all_records', []))
+    all_ids_in_view = {r['id'] for r in records_in_view}
+    current_selected_set = set(selected_records)
+    if all_ids_in_view.issubset(current_selected_set):
+        current_selected_set.difference_update(all_ids_in_view)
+    else:
+        current_selected_set.update(all_ids_in_view)
+    context.user_data['selected_records'] = list(current_selected_set)
+    await display_records_list(update, context, page=page)
+
+async def bulk_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rid, page = update.callback_query.data.split('|')[1], int(update.callback_query.data.split('|')[2])
+    selected = context.user_data.get('selected_records', [])
+    if rid in selected: selected.remove(rid)
+    else: selected.append(rid)
+    context.user_data['selected_records'] = selected
+    await display_records_list(update, context, page=page)
+
+async def bulk_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    selected_ids = context.user_data.get('selected_records', [])
+    if not selected_ids:
+        await update.callback_query.answer(get_text('messages.bulk_no_selection', lang), show_alert=True); return
+    kb = [[InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="bulk_delete_execute")],
+          [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="bulk_start")]]
+    await update.callback_query.edit_message_text(get_text('messages.bulk_confirm_delete', lang, count=len(selected_ids)),
+            reply_markup=InlineKeyboardMarkup(kb))
+
+async def bulk_delete_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    selected_ids = context.user_data.get('selected_records', [])
+    query = update.callback_query
+    await query.edit_message_text(get_text('messages.bulk_delete_progress', lang, count=len(selected_ids)))
+    success, fail = 0, 0
+    zone_id = context.user_data['selected_zone_id']
+    for rid in selected_ids:
+        res = await delete_provider_record(get_current_provider(context), token, zone_id, rid)
+        if res.get("success"): success += 1
+        else: fail += 1
+        await asyncio.sleep(0.3)
+    msg = get_text('messages.bulk_delete_report', lang, success=success, fail=fail)
+    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name'])
+
+async def bulk_change_ip_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    selected_ids = context.user_data.get('selected_records', [])
+    if not selected_ids:
+        await update.callback_query.answer(get_text('messages.bulk_no_selection', lang), show_alert=True); return
+    context.user_data['is_bulk_ip_change'] = True
+    await update.callback_query.edit_message_text(get_text('messages.bulk_change_ip_prompt', lang, count=len(selected_ids)))
+
+async def bulk_change_ip_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    token = get_current_token(context)
+    if not token: return
+    query = update.callback_query
+    details = context.user_data.pop('bulk_ip_confirm_details', {})
+    if not details:
+        await query.edit_message_text(get_text('messages.internal_error', lang)); return
+    new_ip, record_ids = details['new_ip'], details['record_ids']
+    safe_new_ip = escape_html(new_ip)
+    await query.edit_message_text(get_text('messages.bulk_change_ip_progress', lang, count=len(record_ids), new_ip=f"<code>{safe_new_ip}</code>"),
+                                  parse_mode="HTML")
+
+    success, fail, skipped = 0, 0, 0
+    all_records_map, zone_id = context.user_data.get("records", {}), context.user_data['selected_zone_id']
+    for rid in record_ids:
+        record = all_records_map.get(rid)
+        if not record: fail += 1; continue
+        if record['type'] in ['A', 'AAAA']:
+            provider = get_current_provider(context)
+            updated_record = dict(record)
+            updated_record["content"] = new_ip
+            res = await update_provider_record(provider, token, zone_id, updated_record, new_ip)
+            if res.get("success"): success += 1
+            else: fail += 1
+        else: skipped += 1
+        await asyncio.sleep(0.3)
+    msg = get_text('messages.bulk_change_ip_report', lang, success=success, skipped=skipped, fail=fail)
+    kb = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_records_list")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    clear_state(context, preserve=['language', 'selected_provider', 'selected_account_nickname', 'all_zones', 'selected_zone_id', 'selected_zone_name'])
+
+async def set_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang_code = update.callback_query.data.split('|')[1]
+    context.user_data['language'] = lang_code
+    await update.callback_query.edit_message_text(get_text('messages.language_changed', lang_code))
+    await asyncio.sleep(1)
+    await list_records_command(update, context)
+
+async def send_policy_edit_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, policy_index: int):
+    """Builds and sends the policy edit menu as a new message."""
+    user_data = await context.application.persistence.get_user_data()
+    lang = user_data.get(chat_id, {}).get('language', 'fa')
+
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+    lb_config = policy.get('load_balancer', {})
+    is_lb_enabled = lb_config.get('enabled', False)
+
+    lb_button_key = 'buttons.manage_load_balancer_on' if is_lb_enabled else 'buttons.manage_load_balancer_off'
+    lb_button_text = get_text(lb_button_key, lang)
+
+    buttons = [
+        [
+            InlineKeyboardButton(get_text('buttons.edit_policy_name', lang), callback_data=f"policy_edit_field|policy_name"),
+            InlineKeyboardButton(get_text('buttons.edit_policy_port', lang), callback_data=f"policy_edit_field|check_port")
+        ],
+        [
+            InlineKeyboardButton(get_text('buttons.edit_policy_primary_ip', lang), callback_data=f"policy_edit_field|primary_ip"),
+            InlineKeyboardButton(get_text('buttons.edit_policy_backup_ip', lang), callback_data=f"policy_edit_field|backup_ips")
+        ],
+        [
+            InlineKeyboardButton(get_text('buttons.edit_failover_minutes', lang), callback_data=f"policy_edit_field|failover_minutes"),
+            InlineKeyboardButton(get_text('buttons.edit_failback_minutes', lang), callback_data=f"policy_edit_field|failback_minutes")
+        ],
+        [InlineKeyboardButton(get_text('buttons.edit_policy_records', lang), callback_data=f"policy_edit_field|record_names")],
+        [InlineKeyboardButton(get_text('buttons.edit_primary_monitoring', lang), callback_data="policy_edit_nodes|primary")],
+        [InlineKeyboardButton(get_text('buttons.edit_backup_monitoring', lang), callback_data="policy_edit_nodes|backup")],
+        [InlineKeyboardButton(lb_button_text, callback_data=f"lb_menu|{policy_index}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"policy_view|{policy_index}")]
+    ]
+
+    text = get_text('messages.edit_policy_menu', lang)
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+async def send_lb_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, policy_index: int):
+    """Builds and sends the Load Balancer menu as a new message."""
+    user_data = await context.application.persistence.get_user_data()
+    lang = user_data.get(chat_id, {}).get('language', 'fa')
+
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+    lb_config = policy.get('load_balancer', {})
+
+    is_enabled = lb_config.get('enabled', False)
+    status_text = get_text('buttons.lb_status_enabled', lang) if is_enabled else get_text('buttons.lb_status_disabled', lang)
+
+    buttons = [
+        [InlineKeyboardButton(status_text, callback_data=f"lb_toggle_enabled|{policy_index}")],
+        [InlineKeyboardButton(get_text('buttons.lb_ips', lang), callback_data=f"lb_edit_field|ips")],
+        [InlineKeyboardButton(get_text('buttons.lb_interval', lang), callback_data=f"lb_edit_field|interval")],
+        [InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=f"policy_edit|{policy_index}")]
+    ]
+
+    header = get_text('messages.lb_menu_header', lang, name=policy.get('policy_name', 'N/A'))
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await context.bot.send_message(chat_id=chat_id, text=header, reply_markup=reply_markup)
+
+async def lb_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the Load Balancer management menu for a policy."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    if query and query.message:
+        await query.answer()
+
+    try:
+        policy_index = int(query.data.split('|')[1])
+        context.user_data['edit_policy_index'] = policy_index
+    except (IndexError, ValueError):
+        if query: await query.edit_message_text("Error: Policy not found."); return
+
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+    lb_config = policy.get('load_balancer', {})
+
+    is_enabled = lb_config.get('enabled', False)
+    status_text = get_text('buttons.lb_status_enabled', lang) if is_enabled else get_text('buttons.lb_status_disabled', lang)
+
+    buttons = [
+        [InlineKeyboardButton(status_text, callback_data=f"lb_toggle_enabled|{policy_index}")],
+        [InlineKeyboardButton(get_text('buttons.lb_ips', lang), callback_data=f"lb_edit_field|ips")],
+        [InlineKeyboardButton(get_text('buttons.lb_interval', lang), callback_data=f"lb_edit_field|interval")],
+        [InlineKeyboardButton(get_text('buttons.back_to_edit_menu_button', lang), callback_data=f"policy_edit|{policy_index}")]
+    ]
+
+    header = get_text('messages.lb_menu_header', lang, name=policy.get('policy_name', 'N/A'))
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    try:
+        if query and query.message:
+            await query.edit_message_text(header, reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=header, reply_markup=reply_markup)
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            logger.error(f"An error occurred in lb_menu_callback: {e}")
+
+async def lb_toggle_enabled_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the enabled status of the Load Balancer for a policy."""
+    query = update.callback_query
+    lang = get_user_lang(context)
+
+    policy_index = int(query.data.split('|')[1])
+    config = load_config()
+    policy = config['failover_policies'][policy_index]
+
+    if 'load_balancer' not in policy:
+        policy['load_balancer'] = {'enabled': False, 'ips': [], 'rotation_interval_hours': 6}
+
+    is_enabled = policy['load_balancer'].get('enabled', False)
+    policy['load_balancer']['enabled'] = not is_enabled
+    save_config(config)
+
+    status_key = "ON" if not is_enabled else "OFF"
+    await query.answer(get_text('messages.lb_status_changed', lang, status=status_key), show_alert=True)
+
+    await lb_menu_callback(update, context)
+
+async def lb_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the process of editing a Load Balancer field (IPs or interval)."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+
+    field = query.data.split('|')[1]
+    if field == 'ips':
+        context.user_data['awaiting_lb_ips'] = True
+        await query.edit_message_text(get_text('prompts.enter_lb_ips', lang))
+    elif field == 'interval':
+        context.user_data['awaiting_lb_interval'] = True
+        await query.edit_message_text(get_text('prompts.enter_lb_interval', lang))
+
+async def hcloud_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+
+    if not HETZNER_CLOUD_ACCOUNTS:
+        text = get_text('messages.hcloud_no_accounts', lang)
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")]]
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
+        return
+
+    buttons = []
+    for nickname in sorted(HETZNER_CLOUD_ACCOUNTS.keys()):
+        buttons.append([InlineKeyboardButton(f"🟧 {nickname}", callback_data=f"hcloud_account|{nickname}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="back_to_settings_main")])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_account', lang), InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
+
+async def hcloud_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    account = query.data.split('|', 1)[1]
+    context.user_data['hcloud_account'] = account
+    await hcloud_servers_callback(update, context)
+
+async def hcloud_servers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    if not token:
+        await hcloud_menu_callback(update, context)
+        return
+
+    page = 0
+    if query and query.data.startswith("hcloud_servers|"):
+        try:
+            page = int(query.data.split('|', 1)[1])
+        except Exception:
+            page = 0
+
+    servers = await hcloud_get_servers(token)
+    if not servers:
+        text = get_text('messages.hcloud_no_servers', lang, account=escape_html(account))
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="hcloud_menu")]]
+        await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+        return
+
+    page_items, page, total_pages = hcloud_paginate(servers, page)
+    buttons = []
+    lines = [get_text('messages.hcloud_servers_header', lang, account=escape_html(account))]
+    if total_pages > 1:
+        lines.append(get_text('messages.hcloud_page_indicator', lang, page=page + 1, total=total_pages))
+    for server in page_items:
+        sid = str(server.get('id'))
+        name = server.get('name', sid)
+        status = server.get('status', '-')
+        ipv4 = (((server.get('public_net') or {}).get('ipv4') or {}).get('ip')) or '-'
+        emoji = '🟢' if status == 'running' else ('🔴' if status == 'off' else '🟡')
+        lock = ' 🔒' if hcloud_server_delete_protected(server) else ''
+        lines.append(get_text('messages.hcloud_server_line', lang, emoji=emoji, name=escape_html(name), status=escape_html(status), ip=escape_html(ipv4)) + lock)
+        buttons.append([InlineKeyboardButton(f"{emoji} {name}{lock} · {ipv4}", callback_data=f"hcloud_server|{sid}")])
+    buttons += hcloud_pagination_buttons("hcloud_servers", page, total_pages, lang)
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_create_server', lang), callback_data="hcloud_create_server_start")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_floating_ips', lang), callback_data="hcloud_fips"), InlineKeyboardButton(get_text('buttons.hcloud_primary_ips', lang), callback_data="hcloud_primary_ips")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_snapshots', lang), callback_data="hcloud_snapshots"), InlineKeyboardButton(get_text('buttons.hcloud_firewalls', lang), callback_data="hcloud_firewalls")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_usage', lang), callback_data="hcloud_usage")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data=f"hcloud_servers|{page}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_accounts', lang), callback_data="hcloud_menu")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    server_id = query.data.split('|', 1)[1]
+    server = await hcloud_get_server(token, server_id)
+    if not server:
+        await send_or_edit(update, context, get_text('errors.hcloud_server_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]]))
+        return
+
+    name = server.get('name', server_id)
+    status = server.get('status', '-')
+    server_type = ((server.get('server_type') or {}).get('name')) or '-'
+    primary_ips = await hcloud_get_primary_ips(token)
+    assigned_primary = [p for p in primary_ips if str(p.get('assignee_id')) == str(server_id)]
+    datacenter, location = hcloud_server_location_info(server, assigned_primary)
+    image = ((server.get('image') or {}).get('description')) or ((server.get('image') or {}).get('name')) or '-'
+    created = server.get('created', '-')
+    price = hcloud_server_type_price(server)
+    month_cost = hcloud_format_eur(hcloud_server_month_cost_estimate(server), 2)
+    protection_icon = '🔒' if hcloud_server_delete_protected(server) else '🔓'
+    protection_text = get_text('messages.hcloud_server_protection_line', lang, delete_status=(get_text('messages.status_enabled', lang) if hcloud_server_delete_protected(server) else get_text('messages.status_disabled', lang)), rebuild_status=(get_text('messages.status_enabled', lang) if hcloud_server_rebuild_protected(server) else get_text('messages.status_disabled', lang)))
+    if assigned_primary:
+        primary_ip_text = "\n".join([f"• <code>{escape_html(p.get('ip', '-'))}</code> · <code>{escape_html(p.get('type', '-'))}</code>" for p in assigned_primary])
+    else:
+        primary_ip_text = get_text('messages.hcloud_no_primary_ip_on_server', lang)
+    traffic = await hcloud_estimate_server_traffic(token, server_id)
+    traffic_text = get_text('messages.hcloud_traffic_unavailable', lang)
+    if traffic.get('total') is not None:
+        alert_settings = load_config().setdefault("hcloud_traffic_alerts", {"enabled": True, "quota_tb": 20, "threshold_percent": 85})
+        quota_tb = alert_settings.get("quota_tb", 20)
+        pct = hcloud_traffic_percent(traffic.get('in'), quota_tb)
+        base_traffic = get_text('messages.hcloud_traffic_line', lang, incoming=hcloud_human_gb(traffic.get('in')), outgoing=hcloud_human_gb(traffic.get('out')), total=hcloud_human_gb(traffic.get('total')))
+        traffic_text = base_traffic
+        if pct is not None:
+            traffic_text += "\n" + get_text('messages.hcloud_traffic_percent_line', lang, percent=f"{pct:.1f}%", quota=f"{float(quota_tb):g} TB")
+
+    text = get_text('messages.hcloud_server_details', lang,
+                    name=escape_html(name), server_id=escape_html(server_id), status=escape_html(status),
+                    server_type=escape_html(server_type), datacenter=escape_html(datacenter), location=escape_html(location),
+                    image=escape_html(image), created=escape_html(created), ips=hcloud_public_ips(server),
+                    price=escape_html(price), month_cost=escape_html(month_cost), traffic=traffic_text, primary_ips=primary_ip_text, protection=protection_icon + " " + protection_text)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.hcloud_poweron', lang), callback_data=f"hcloud_confirm|poweron|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_reboot', lang), callback_data=f"hcloud_confirm|reboot|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_shutdown', lang), callback_data=f"hcloud_confirm|shutdown|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_poweroff', lang), callback_data=f"hcloud_confirm|poweroff|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_reset', lang), callback_data=f"hcloud_confirm|reset|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_reset_password', lang), callback_data=f"hcloud_confirm|reset_password|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_rescue', lang), callback_data=f"hcloud_confirm|enable_rescue|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_rescue_reset', lang), callback_data=f"hcloud_confirm|rescue_reset|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_rename_server', lang), callback_data=f"hcloud_rename_server_start|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_change_primary_ip', lang), callback_data=f"hcloud_server_primary_ips|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_snapshot_manager', lang), callback_data=f"hcloud_server_snapshots|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_firewall_manager', lang), callback_data=f"hcloud_server_firewalls|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_create_snapshot', lang), callback_data=f"hcloud_confirm|snapshot|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_rebuild_server', lang), callback_data=f"hcloud_rebuild_select|{server_id}|0")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_rescale_server', lang), callback_data=f"hcloud_rescale_select|{server_id}|0"), InlineKeyboardButton(get_text('buttons.hcloud_enable_backups', lang), callback_data=f"hcloud_confirm|enable_backup|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_disable_backups', lang), callback_data=f"hcloud_confirm|disable_backup|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_protect_on', lang), callback_data=f"hcloud_confirm|protect_on|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_protect_off', lang), callback_data=f"hcloud_confirm|protect_off|{server_id}"), InlineKeyboardButton(get_text('buttons.hcloud_delete_server', lang), callback_data=f"hcloud_delete_confirm|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_rename_server_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    server_id = query.data.split('|', 1)[1]
+    context.user_data['state'] = 'awaiting_hcloud_rename_server'
+    context.user_data['hcloud_rename_server_id'] = server_id
+    await send_or_edit(update, context, get_text('prompts.hcloud_rename_server', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]]))
+
+async def _handle_state_hcloud_rename_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    new_name = update.message.text.strip()
+    server_id = context.user_data.get('hcloud_rename_server_id')
+    if not server_id or not new_name:
+        await update.message.reply_text(get_text('errors.invalid_input', lang), parse_mode="HTML")
+        return
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_update_server(token, server_id, name=new_name)
+    context.user_data.pop('state', None)
+    context.user_data.pop('hcloud_rename_server_id', None)
+    if res.get('success'):
+        await update.message.reply_text(get_text('messages.hcloud_rename_success', lang, name=escape_html(new_name)), parse_mode="HTML")
+    else:
+        await update.message.reply_text(get_text('messages.hcloud_rename_failed', lang, error=escape_html(res.get('error', 'Unknown error'))), parse_mode="HTML")
+
+async def hcloud_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, action, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    server = await hcloud_get_server(token, server_id)
+    server_name = escape_html((server or {}).get('name', server_id))
+    action_name = escape_html(hcloud_action_label(action, lang))
+    warning_key = 'messages.hcloud_rescue_reset_confirm' if action == 'rescue_reset' else 'messages.hcloud_action_confirm'
+    if action in {'poweroff', 'reset', 'reset_password', 'protect_off', 'disable_backup'}:
+        warning_key = 'messages.hcloud_danger_action_confirm'
+    text = get_text(warning_key, lang, action=action_name, server=server_name)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_action|{action}|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, action, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_server_action(token, server_id, action)
+    action_name = escape_html(hcloud_action_label(action, lang))
+    if res.get('success'):
+        root_password = res.get('root_password') or ((res.get('raw') or {}).get('root_password'))
+        extra = ""
+        if root_password:
+            extra = get_text('messages.hcloud_root_password', lang, password=escape_html(root_password))
+        if res.get('reset_warning'):
+            extra += "\n" + get_text('messages.hcloud_action_warning', lang, warning=escape_html(res.get('reset_warning')))
+        text = get_text('messages.hcloud_action_success', lang, action=action_name) + extra
+    else:
+        text = get_text('messages.hcloud_action_failed', lang, action=action_name, error=escape_html(res.get('error', 'Unknown error')))
+    buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")]]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    server_id = query.data.split('|', 1)[1]
+    server = await hcloud_get_server(token, server_id)
+    server_name = escape_html((server or {}).get('name', server_id))
+    if server and hcloud_server_delete_protected(server):
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.hcloud_disable_server_protection', lang), callback_data=f"hcloud_server_unprotect_delete|{server_id}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+        ]
+        await send_or_edit(update, context, get_text('messages.hcloud_delete_server_protected', lang, server=server_name), InlineKeyboardMarkup(buttons))
+        return
+    text = get_text('messages.hcloud_delete_server_confirm', lang, server=server_name)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.hcloud_delete_server_confirm', lang), callback_data=f"hcloud_delete_server|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_unprotect_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    server_id = query.data.split('|', 1)[1]
+    res = await hcloud_change_protection(token, server_id, False)
+    if res.get('success'):
+        server = await hcloud_get_server(token, server_id)
+        server_name = escape_html((server or {}).get('name', server_id))
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.hcloud_delete_server_confirm', lang), callback_data=f"hcloud_delete_server|{server_id}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+        ]
+        await send_or_edit(update, context, get_text('messages.hcloud_server_unprotect_delete_success', lang, server=server_name), InlineKeyboardMarkup(buttons))
+    else:
+        await send_or_edit(update, context, get_text('messages.hcloud_server_unprotect_delete_failed', lang, error=escape_html(res.get('error', 'Unknown error'))), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")]]))
+
+async def hcloud_delete_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    server_id = query.data.split('|', 1)[1]
+
+    server = await hcloud_get_server(token, server_id)
+    if server and hcloud_server_delete_protected(server):
+        server_name = escape_html(server.get('name', server_id))
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.hcloud_disable_server_protection', lang), callback_data=f"hcloud_server_unprotect_delete|{server_id}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+        ]
+        await send_or_edit(update, context, get_text('messages.hcloud_delete_server_protected', lang, server=server_name), InlineKeyboardMarkup(buttons))
+        return
+
+    res = await hcloud_delete_server(token, server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_delete_server_success', lang)
+        back = 'hcloud_servers'
+    else:
+        err = str(res.get('error', 'Unknown error'))
+        if 'protect' in err.lower():
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.hcloud_disable_server_protection', lang), callback_data=f"hcloud_server_unprotect_delete|{server_id}")],
+                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+            ]
+            await send_or_edit(update, context, get_text('messages.hcloud_delete_server_protected', lang, server=escape_html(server_id)), InlineKeyboardMarkup(buttons))
+            return
+        text = get_text('messages.hcloud_delete_server_failed', lang, error=escape_html(err))
+        back = f'hcloud_server|{server_id}'
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back)]]))
+
+async def hcloud_rebuild_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    parts = query.data.split('|')
+    server_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+    token, _ = hcloud_account_token(context)
+    images = await hcloud_get_images(token)
+    preferred = []
+    names_seen = set()
+    order = ['ubuntu-24.04', 'ubuntu-22.04', 'debian-12', 'debian-11', 'rocky-9', 'alma-9', 'fedora-40', 'centos-stream-9']
+    for wanted in order:
+        for img in images:
+            if img.get('name') == wanted and wanted not in names_seen:
+                preferred.append(img); names_seen.add(wanted)
+    for img in images:
+        n = img.get('name')
+        if n and n not in names_seen and len(preferred) < 30:
+            preferred.append(img); names_seen.add(n)
+    per_page = 8
+    total_pages = max((len(preferred) + per_page - 1) // per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+    buttons = []
+    for img in preferred[page*per_page:(page+1)*per_page]:
+        image_id = img.get('name') or img.get('id')
+        buttons.append([InlineKeyboardButton(hcloud_short_image_label(img), callback_data=f"hcloud_rebuild_confirm|{server_id}|{image_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton('⬅️', callback_data=f"hcloud_rebuild_select|{server_id}|{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton('➡️', callback_data=f"hcloud_rebuild_select|{server_id}|{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")])
+    await send_or_edit(update, context, get_text('messages.hcloud_rebuild_select_image', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_rebuild_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, image = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    server = await hcloud_get_server(token, server_id)
+    server_name = escape_html((server or {}).get('name', server_id))
+    text = get_text('messages.hcloud_rebuild_confirm', lang, server=server_name, image=escape_html(image))
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_rebuild|{server_id}|{image}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_rebuild_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, image = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_rebuild_server(token, server_id, image)
+    if res.get('success'):
+        root_password = res.get('root_password') or '-'
+        text = get_text('messages.hcloud_rebuild_success', lang, password=escape_html(root_password))
+    else:
+        text = get_text('messages.hcloud_rebuild_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")]]))
+
+async def hcloud_rescale_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    parts = query.data.split('|')
+    server_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+    token, _ = hcloud_account_token(context)
+    server_types = [x for x in await hcloud_get_server_types(token) if x.get('name')]
+    per_page = 8
+    total_pages = max((len(server_types) + per_page - 1) // per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+    buttons = []
+    for st in server_types[page*per_page:(page+1)*per_page]:
+        st_name = st.get('name')
+        buttons.append([InlineKeyboardButton(hcloud_server_type_button_label(st)[:80], callback_data=f"hcloud_rescale_confirm|{server_id}|{st_name}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton('⬅️', callback_data=f"hcloud_rescale_select|{server_id}|{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton('➡️', callback_data=f"hcloud_rescale_select|{server_id}|{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")])
+    await send_or_edit(update, context, get_text('messages.hcloud_rescale_select_type', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_rescale_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, server_type = query.data.split('|', 2)
+    text = get_text('messages.hcloud_rescale_confirm', lang, server_type=escape_html(server_type))
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.hcloud_rescale_keep_disk', lang), callback_data=f"hcloud_rescale|{server_id}|{server_type}|0")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_rescale_upgrade_disk', lang), callback_data=f"hcloud_rescale|{server_id}|{server_type}|1")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server|{server_id}")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_rescale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, server_type, upgrade_disk = query.data.split('|', 3)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_change_server_type(token, server_id, server_type, upgrade_disk == '1')
+    if res.get('success'):
+        text = get_text('messages.hcloud_rescale_success', lang, server_type=escape_html(server_type))
+    else:
+        text = get_text('messages.hcloud_rescale_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")]]))
+
+async def hcloud_snapshots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    page = 0
+    if query and query.data.startswith("hcloud_snapshots|"):
+        try: page = int(query.data.split('|', 1)[1])
+        except Exception: page = 0
+    snapshots = await hcloud_get_snapshots(token)
+    page_items, page, total_pages = hcloud_paginate(snapshots, page)
+    lines = [get_text('messages.hcloud_snapshots_header', lang, account=escape_html(account))]
+    if total_pages > 1:
+        lines.append(get_text('messages.hcloud_page_indicator', lang, page=page + 1, total=total_pages))
+    buttons = []
+    if not snapshots:
+        lines.append(get_text('messages.hcloud_no_snapshots', lang))
+    for img in page_items:
+        iid = str(img.get('id'))
+        desc = img.get('description') or img.get('name') or iid
+        created = img.get('created') or '-'
+        created_from = img.get('created_from') or {}
+        source = created_from.get('name') or created_from.get('id') or '-'
+        size = hcloud_format_gb(img.get('image_size') or img.get('disk_size'))
+        protected = ' 🔒' if hcloud_image_delete_protected(img) else ''
+        lines.append(get_text('messages.hcloud_snapshot_line', lang, desc=escape_html(str(desc)), source=escape_html(str(source)), created=escape_html(str(created)), size=escape_html(str(size)), protected=protected))
+        buttons.append([InlineKeyboardButton(f"📸 {str(desc)[:42]}{protected}", callback_data=f"hcloud_snapshot|{iid}|0")])
+    buttons += hcloud_pagination_buttons("hcloud_snapshots", page, total_pages, lang)
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data=f"hcloud_snapshots|{page}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_snapshots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    parts = query.data.split('|')
+    server_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+    token, _ = hcloud_account_token(context)
+    server = await hcloud_get_server(token, server_id)
+    server_name = (server or {}).get('name', server_id)
+    snapshots = await hcloud_get_snapshots(token, server_id)
+    page_items, page, total_pages = hcloud_paginate(snapshots, page)
+    lines = [get_text('messages.hcloud_server_snapshots_header', lang, server=escape_html(str(server_name)))]
+    if total_pages > 1:
+        lines.append(get_text('messages.hcloud_page_indicator', lang, page=page + 1, total=total_pages))
+    buttons = [[InlineKeyboardButton(get_text('buttons.hcloud_create_snapshot_now', lang), callback_data=f"hcloud_snapshot_create|{server_id}")]]
+    if not snapshots:
+        lines.append(get_text('messages.hcloud_no_server_snapshots', lang))
+    for img in page_items:
+        iid = str(img.get('id'))
+        desc = img.get('description') or img.get('name') or iid
+        created = img.get('created') or '-'
+        size = hcloud_format_gb(img.get('image_size') or img.get('disk_size'))
+        protected = ' 🔒' if hcloud_image_delete_protected(img) else ''
+        lines.append(get_text('messages.hcloud_server_snapshot_line', lang, desc=escape_html(str(desc)), created=escape_html(str(created)), size=escape_html(str(size)), protected=protected))
+        buttons.append([InlineKeyboardButton(f"📸 {str(desc)[:42]}{protected}", callback_data=f"hcloud_snapshot|{iid}|{server_id}")])
+    buttons += hcloud_pagination_buttons(f"hcloud_server_snapshots|{server_id}", page, total_pages, lang)
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data=f"hcloud_server_snapshots|{server_id}|{page}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_snapshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, image_id, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    img = await hcloud_get_image(token, image_id)
+    back = "hcloud_snapshots" if server_id == "0" else f"hcloud_server_snapshots|{server_id}"
+    if not img:
+        await send_or_edit(update, context, get_text('errors.hcloud_snapshot_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back)]]))
+        return
+    desc = img.get('description') or img.get('name') or image_id
+    created = img.get('created') or '-'
+    created_from = img.get('created_from') or {}
+    source = created_from.get('name') or created_from.get('id') or '-'
+    size = hcloud_format_gb(img.get('image_size') or img.get('disk_size'))
+    prot = hcloud_image_delete_protected(img)
+    protection = get_text('messages.status_enabled', lang) if prot else get_text('messages.status_disabled', lang)
+    text = get_text('messages.hcloud_snapshot_details', lang, desc=escape_html(str(desc)), image_id=escape_html(str(image_id)), source=escape_html(str(source)), created=escape_html(str(created)), size=escape_html(str(size)), protection=escape_html(protection))
+    buttons = []
+    if prot:
+        buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_disable_snapshot_protection', lang), callback_data=f"hcloud_snapshot_protect|{image_id}|{server_id}|0")])
+    else:
+        buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_enable_snapshot_protection', lang), callback_data=f"hcloud_snapshot_protect|{image_id}|{server_id}|1")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_delete_snapshot', lang), callback_data=f"hcloud_snapshot_delete_confirm|{image_id}|{server_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back)])
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_snapshot_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    server_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_server_snapshot(token, server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_snapshot_create_success', lang)
+    else:
+        text = get_text('messages.hcloud_snapshot_create_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_snapshots|{server_id}")]]))
+
+async def hcloud_snapshot_delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, image_id, server_id = query.data.split('|', 2)
+    back = "hcloud_snapshots" if server_id == "0" else f"hcloud_server_snapshots|{server_id}"
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_snapshot_delete|{image_id}|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=back)]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_snapshot_delete_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_snapshot_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, image_id, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    back = "hcloud_snapshots" if server_id == "0" else f"hcloud_server_snapshots|{server_id}"
+
+    image = await hcloud_get_image(token, image_id)
+    if image and hcloud_image_delete_protected(image):
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.hcloud_disable_snapshot_protection', lang), callback_data=f"hcloud_snapshot_unprotect|{image_id}|{server_id}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=back)]
+        ]
+        await send_or_edit(update, context, get_text('messages.hcloud_snapshot_delete_protected', lang), InlineKeyboardMarkup(buttons))
+        return
+
+    res = await hcloud_delete_image(token, image_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_snapshot_delete_success', lang)
+    else:
+        err = str(res.get('error', 'Unknown error'))
+        if 'protect' in err.lower():
+            buttons = [
+                [InlineKeyboardButton(get_text('buttons.hcloud_disable_snapshot_protection', lang), callback_data=f"hcloud_snapshot_unprotect|{image_id}|{server_id}")],
+                [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=back)]
+            ]
+            await send_or_edit(update, context, get_text('messages.hcloud_snapshot_delete_protected', lang), InlineKeyboardMarkup(buttons))
+            return
+        text = get_text('messages.hcloud_snapshot_delete_failed', lang, error=escape_html(err))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back)]]))
+
+async def hcloud_snapshot_unprotect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, image_id, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    back = "hcloud_snapshots" if server_id == "0" else f"hcloud_server_snapshots|{server_id}"
+
+    res = await hcloud_change_image_protection(token, image_id, False)
+    if res.get('success'):
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_snapshot_delete|{image_id}|{server_id}")],
+            [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=back)]
+        ]
+        text = get_text('messages.hcloud_snapshot_unprotect_success', lang)
+    else:
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back)]]
+        text = get_text('messages.hcloud_snapshot_unprotect_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_snapshot_protect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, image_id, server_id, enabled = query.data.split('|', 3)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_change_image_protection(token, image_id, enabled == '1')
+    if res.get('success'):
+        text = get_text('messages.hcloud_snapshot_protection_success', lang, status=(get_text('messages.status_enabled', lang) if enabled == '1' else get_text('messages.status_disabled', lang)))
+    else:
+        text = get_text('messages.hcloud_snapshot_protection_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_snapshot|{image_id}|{server_id}")]]))
+
+async def hcloud_firewalls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    page = 0
+    if query and query.data.startswith("hcloud_firewalls|"):
+        try: page = int(query.data.split('|', 1)[1])
+        except Exception: page = 0
+    firewalls = await hcloud_get_firewalls(token)
+    page_items, page, total_pages = hcloud_paginate(firewalls, page)
+    lines = [get_text('messages.hcloud_firewalls_header', lang, account=escape_html(account))]
+    if total_pages > 1:
+        lines.append(get_text('messages.hcloud_page_indicator', lang, page=page + 1, total=total_pages))
+    buttons = []
+    if not firewalls:
+        lines.append(get_text('messages.hcloud_no_firewalls', lang))
+    for fw in page_items:
+        fid = str(fw.get('id'))
+        name = fw.get('name') or fid
+        applied_count = len(fw.get('applied_to', []) or [])
+        rules_count = len(fw.get('rules', []) or [])
+        lines.append(get_text('messages.hcloud_firewall_line', lang, name=escape_html(str(name)), applied=applied_count, rules=rules_count))
+        buttons.append([InlineKeyboardButton(f"🛡 {name}", callback_data=f"hcloud_firewall|{fid}")])
+    buttons += hcloud_pagination_buttons("hcloud_firewalls", page, total_pages, lang)
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data=f"hcloud_firewalls|{page}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_firewall_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    firewall_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    fw = await hcloud_get_firewall(token, firewall_id)
+    if not fw:
+        await send_or_edit(update, context, get_text('errors.hcloud_firewall_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_firewalls")]]))
+        return
+    name = fw.get('name') or firewall_id
+    applied = fw.get('applied_to', []) or []
+    applied_names = []
+    for item in applied[:20]:
+        if item.get('type') == 'server':
+            srv = item.get('server') or {}
+            applied_names.append(str(srv.get('name') or srv.get('id') or '-'))
+    applied_text = ', '.join(applied_names) if applied_names else '-'
+    rules = escape_html(hcloud_firewall_rules_summary(fw))
+    text = get_text('messages.hcloud_firewall_details', lang, name=escape_html(str(name)), applied=escape_html(applied_text), rules=rules)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.hcloud_attach_firewall', lang), callback_data=f"hcloud_firewall_attach_select|{firewall_id}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_firewalls")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_firewalls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    server_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    server = await hcloud_get_server(token, server_id)
+    server_name = (server or {}).get('name', server_id)
+    firewalls = await hcloud_get_firewalls(token)
+    attached = [fw for fw in firewalls if hcloud_firewall_applies_to_server(fw, server_id)]
+    lines = [get_text('messages.hcloud_server_firewalls_header', lang, server=escape_html(str(server_name)))]
+    buttons = [[InlineKeyboardButton(get_text('buttons.hcloud_attach_firewall', lang), callback_data=f"hcloud_server_firewall_attach_select|{server_id}")]]
+    if not attached:
+        lines.append(get_text('messages.hcloud_no_server_firewalls', lang))
+    for fw in attached:
+        fid = str(fw.get('id'))
+        name = fw.get('name') or fid
+        lines.append(get_text('messages.hcloud_server_firewall_line', lang, name=escape_html(str(name)), rules=len(fw.get('rules', []) or [])))
+        buttons.append([InlineKeyboardButton(f"🧹 Detach {name}", callback_data=f"hcloud_server_firewall_detach_confirm|{server_id}|{fid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data=f"hcloud_server_firewalls|{server_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_firewall_attach_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    server_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    firewalls = await hcloud_get_firewalls(token)
+    available = [fw for fw in firewalls if not hcloud_firewall_applies_to_server(fw, server_id)]
+    buttons = []
+    if available:
+        for fw in available[:30]:
+            fid = str(fw.get('id'))
+            name = fw.get('name') or fid
+            buttons.append([InlineKeyboardButton(f"🛡 {name}", callback_data=f"hcloud_server_firewall_attach_confirm|{server_id}|{fid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server_firewalls|{server_id}")])
+    text = get_text('messages.hcloud_select_firewall_to_attach', lang) if available else get_text('messages.hcloud_no_firewalls_to_attach', lang)
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_firewall_attach_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    firewall_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    servers = await hcloud_get_servers(token)
+    fw = await hcloud_get_firewall(token, firewall_id)
+    buttons = []
+    for server in servers[:40]:
+        sid = str(server.get('id'))
+        if fw and hcloud_firewall_applies_to_server(fw, sid):
+            continue
+        name = server.get('name') or sid
+        ipv4 = (((server.get('public_net') or {}).get('ipv4') or {}).get('ip')) or '-'
+        buttons.append([InlineKeyboardButton(f"{name} · {ipv4}", callback_data=f"hcloud_server_firewall_attach_confirm|{sid}|{firewall_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_firewall|{firewall_id}")])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_server_for_firewall', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_firewall_attach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, firewall_id = query.data.split('|', 2)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_server_firewall_attach|{server_id}|{firewall_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server_firewalls|{server_id}")]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_firewall_attach_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_firewall_attach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, firewall_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_apply_firewall_to_server(token, firewall_id, server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_firewall_attach_success', lang)
+    else:
+        text = get_text('messages.hcloud_firewall_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_firewalls|{server_id}")]]))
+
+async def hcloud_server_firewall_detach_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, firewall_id = query.data.split('|', 2)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_server_firewall_detach|{server_id}|{firewall_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server_firewalls|{server_id}")]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_firewall_detach_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_firewall_detach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, firewall_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_remove_firewall_from_server(token, firewall_id, server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_firewall_detach_success', lang)
+    else:
+        text = get_text('messages.hcloud_firewall_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_firewalls|{server_id}")]]))
+
+async def hcloud_fips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    fips = await hcloud_get_floating_ips(token)
+    buttons = []
+    lines = [get_text('messages.hcloud_fips_header', lang, account=escape_html(account))]
+    if not fips:
+        lines.append(get_text('messages.hcloud_no_fips', lang))
+    for fip in fips[:30]:
+        fid = str(fip.get('id'))
+        ip = fip.get('ip', '-')
+        desc = fip.get('description') or '-'
+        server = (fip.get('server') or {})
+        assigned = server.get('name') or server.get('id') or '-'
+        lines.append(get_text('messages.hcloud_fip_line', lang, ip=escape_html(ip), desc=escape_html(desc), assigned=escape_html(str(assigned))))
+        buttons.append([InlineKeyboardButton(f"{ip} → {assigned}", callback_data=f"hcloud_fip|{fid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_create_fip', lang), callback_data="hcloud_create_fip_start")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data="hcloud_fips")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_fip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    floating_ip_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    fips = await hcloud_get_floating_ips(token)
+    fip = next((x for x in fips if str(x.get('id')) == str(floating_ip_id)), None)
+    if not fip:
+        await send_or_edit(update, context, get_text('errors.hcloud_fip_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
+        return
+    ip = fip.get('ip', '-')
+    desc = fip.get('description') or '-'
+    server = (fip.get('server') or {})
+    assigned = server.get('name') or server.get('id') or '-'
+    text = get_text('messages.hcloud_fip_details', lang, ip=escape_html(ip), desc=escape_html(desc), assigned=escape_html(str(assigned)))
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.hcloud_assign_fip', lang), callback_data=f"hcloud_fip_assign_select|{floating_ip_id}")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_unassign_fip', lang), callback_data=f"hcloud_fip_unassign_confirm|{floating_ip_id}")],
+        [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_fip_assign_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    floating_ip_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    servers = await hcloud_get_servers(token)
+    buttons = []
+    for server in servers[:40]:
+        sid = str(server.get('id'))
+        name = server.get('name', sid)
+        ipv4 = (((server.get('public_net') or {}).get('ipv4') or {}).get('ip')) or '-'
+        buttons.append([InlineKeyboardButton(f"{name} ({ipv4})", callback_data=f"hcloud_fip_assign_confirm|{floating_ip_id}|{sid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_fip|{floating_ip_id}")])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_fip_target', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_fip_assign_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, floating_ip_id, server_id = query.data.split('|', 2)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_fip_assign|{floating_ip_id}|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_fip|{floating_ip_id}")]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_fip_assign_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_fip_assign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, floating_ip_id, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_floating_ip_action(token, floating_ip_id, 'assign', server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_fip_assign_success', lang)
+    else:
+        text = get_text('messages.hcloud_fip_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
+
+async def hcloud_fip_unassign_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    floating_ip_id = query.data.split('|', 1)[1]
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_fip_unassign|{floating_ip_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_fip|{floating_ip_id}")]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_fip_unassign_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_fip_unassign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    floating_ip_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_floating_ip_action(token, floating_ip_id, 'unassign')
+    if res.get('success'):
+        text = get_text('messages.hcloud_fip_unassign_success', lang)
+    else:
+        text = get_text('messages.hcloud_fip_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
+
+async def hcloud_primary_ips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    primary_ips = await hcloud_get_primary_ips(token)
+    servers = await hcloud_get_servers(token)
+    buttons = []
+    lines = [get_text('messages.hcloud_primary_ips_header', lang, account=escape_html(account))]
+    if not primary_ips:
+        lines.append(get_text('messages.hcloud_no_primary_ips', lang))
+    for item in primary_ips[:30]:
+        pid = str(item.get('id'))
+        ip = item.get('ip', '-')
+        ip_type = item.get('type', '-')
+        dc = hcloud_location_text(item.get('datacenter') or {})
+        assignee = hcloud_primary_ip_assignee_label(item, servers)
+        name = item.get('name') or '-'
+        lock = ' 🔒' if hcloud_primary_ip_delete_protected(item) else ''
+        lines.append(get_text('messages.hcloud_primary_ip_line', lang, ip=escape_html(ip), ip_type=escape_html(ip_type), name=escape_html(name), datacenter=escape_html(dc), assignee=escape_html(str(assignee))) + lock)
+        buttons.append([InlineKeyboardButton(f"{ip} · {ip_type}{lock}", callback_data=f"hcloud_primary_ip|{pid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_create_primary_ip', lang), callback_data="hcloud_create_primary_start")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data="hcloud_primary_ips")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_primary_ip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    primary_ip_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    primary_ips = await hcloud_get_primary_ips(token)
+    item = next((x for x in primary_ips if str(x.get('id')) == str(primary_ip_id)), None)
+    if not item:
+        await send_or_edit(update, context, get_text('errors.hcloud_primary_ip_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_primary_ips")]]))
+        return
+    dc = hcloud_location_text(item.get('datacenter') or {})
+    servers = await hcloud_get_servers(token)
+    assignee = hcloud_primary_ip_assignee_label(item, servers)
+    protected = hcloud_primary_ip_delete_protected(item)
+    protection = get_text('messages.status_enabled', lang) if protected else get_text('messages.status_disabled', lang)
+    text = get_text('messages.hcloud_primary_ip_details', lang,
+                    ip=escape_html(item.get('ip', '-')), ip_type=escape_html(item.get('type', '-')),
+                    name=escape_html(item.get('name') or '-'), datacenter=escape_html(dc),
+                    assignee=escape_html(str(assignee)), auto_delete=escape_html(str(item.get('auto_delete', '-'))),
+                    protection=escape_html(protection))
+    buttons = []
+    if item.get('assignee_id'):
+        buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_unassign_primary_ip', lang), callback_data=f"hcloud_primary_unassign_confirm|{primary_ip_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_assign_primary_ip', lang), callback_data=f"hcloud_primary_assign_select|{primary_ip_id}")])
+    if protected:
+        buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_disable_primary_protection', lang), callback_data=f"hcloud_primary_protect|{primary_ip_id}|0")])
+    else:
+        buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_enable_primary_protection', lang), callback_data=f"hcloud_primary_protect|{primary_ip_id}|1")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_primary_ips")])
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_server_primary_ips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    server_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    server = await hcloud_get_server(token, server_id)
+    if not server:
+        await send_or_edit(update, context, get_text('errors.hcloud_server_not_found', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]]))
+        return
+    primary_ips = await hcloud_get_primary_ips(token)
+    assigned = [p for p in primary_ips if str(p.get('assignee_id')) == str(server_id)]
+    available = [p for p in primary_ips if not p.get('assignee_id')]
+    lines = [get_text('messages.hcloud_server_primary_header', lang, server=escape_html(server.get('name', server_id)))]
+    if assigned:
+        lines.append(get_text('messages.hcloud_server_primary_assigned_header', lang))
+        for p in assigned:
+            lock = ' 🔒' if hcloud_primary_ip_delete_protected(p) else ''
+            lines.append(f"• <code>{escape_html(p.get('ip', '-'))}</code> · <code>{escape_html(p.get('type', '-'))}</code>{lock}")
+    else:
+        lines.append(get_text('messages.hcloud_no_primary_ip_on_server', lang))
+    if available:
+        lines.append(get_text('messages.hcloud_server_primary_available_header', lang))
+        for p in available[:10]:
+            lock = ' 🔒' if hcloud_primary_ip_delete_protected(p) else ''
+            lines.append(f"• <code>{escape_html(p.get('ip', '-'))}</code> · <code>{escape_html(p.get('type', '-'))}</code>{lock}")
+    buttons = []
+    for p in assigned[:10]:
+        buttons.append([InlineKeyboardButton(f"Detach {p.get('ip', '-')}", callback_data=f"hcloud_primary_unassign_confirm|{p.get('id')}|{server_id}")])
+    for p in available[:10]:
+        buttons.append([InlineKeyboardButton(f"Assign {p.get('ip', '-')}", callback_data=f"hcloud_primary_assign_confirm|{p.get('id')}|{server_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_create_primary_for_server', lang), callback_data=f"hcloud_create_primary_for_server_start|{server_id}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")])
+    await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_primary_assign_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    primary_ip_id = query.data.split('|', 1)[1]
+    token, _ = hcloud_account_token(context)
+    servers = await hcloud_get_servers(token)
+    buttons = []
+    for server in servers[:40]:
+        sid = str(server.get('id'))
+        name = server.get('name', sid)
+        ipv4 = (((server.get('public_net') or {}).get('ipv4') or {}).get('ip')) or '-'
+        buttons.append([InlineKeyboardButton(f"{name} · {ipv4}", callback_data=f"hcloud_primary_assign_confirm|{primary_ip_id}|{sid}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_primary_ip|{primary_ip_id}")])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_primary_target', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_primary_assign_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, primary_ip_id, server_id = query.data.split('|', 2)
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_primary_assign|{primary_ip_id}|{server_id}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=f"hcloud_server_primary_ips|{server_id}")]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_primary_assign_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_primary_assign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, primary_ip_id, server_id = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_primary_ip_action(token, primary_ip_id, 'assign', server_id)
+    if res.get('success'):
+        text = get_text('messages.hcloud_primary_assign_success', lang)
+    else:
+        text = get_text('messages.hcloud_primary_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_primary_ips|{server_id}")]]))
+
+async def hcloud_primary_unassign_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    parts = query.data.split('|')
+    primary_ip_id = parts[1]
+    server_id = parts[2] if len(parts) > 2 else None
+    cancel_callback = f"hcloud_server_primary_ips|{server_id}" if server_id else f"hcloud_primary_ip|{primary_ip_id}"
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data=f"hcloud_primary_unassign|{primary_ip_id}|{server_id or ''}")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=cancel_callback)]
+    ]
+    await send_or_edit(update, context, get_text('messages.hcloud_primary_unassign_confirm', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_primary_unassign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    parts = query.data.split('|')
+    primary_ip_id = parts[1]
+    server_id = parts[2] if len(parts) > 2 and parts[2] else None
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_primary_ip_action(token, primary_ip_id, 'unassign')
+    if res.get('success'):
+        text = get_text('messages.hcloud_primary_unassign_success', lang)
+    else:
+        text = get_text('messages.hcloud_primary_action_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    back_callback = f"hcloud_server_primary_ips|{server_id}" if server_id else "hcloud_primary_ips"
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=back_callback)]]))
+
+async def hcloud_primary_protect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, primary_ip_id, enabled = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_change_primary_ip_protection(token, primary_ip_id, enabled == '1')
+    if res.get('success'):
+        text = get_text('messages.hcloud_primary_protection_success', lang, status=(get_text('messages.status_enabled', lang) if enabled == '1' else get_text('messages.status_disabled', lang)))
+    else:
+        text = get_text('messages.hcloud_primary_protection_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_primary_ip|{primary_ip_id}")]]))
+
+async def hcloud_traffic_alert_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    config = load_config()
+    settings = config.setdefault("hcloud_traffic_alerts", {"enabled": True, "quota_tb": 20, "threshold_percent": 85, "notified": {}})
+    settings['enabled'] = not settings.get('enabled', True)
+    save_config(config)
+    await hcloud_usage_callback(update, context)
+
+async def hcloud_usage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        try: await query.answer()
+        except Exception: pass
+    lang = get_user_lang(context)
+    token, account = hcloud_account_token(context)
+    if not token:
+        await hcloud_menu_callback(update, context)
+        return
+    servers = await hcloud_get_servers(token)
+    fips = await hcloud_get_floating_ips(token)
+    primary_ips = await hcloud_get_primary_ips(token)
+    ratio = hcloud_month_progress_ratio()
+    server_est = sum(hcloud_server_month_cost_estimate(s) for s in servers)
+    fip_est = 0.0
+    primary_est = 0.0
+    for fip in fips:
+        ip_type = (fip.get('type') or '').lower()
+        monthly = 3.0 if ip_type == 'ipv4' else 1.0
+        fip_est += monthly * ratio
+    for pip in primary_ips:
+        if (pip.get('type') or '').lower() == 'ipv4':
+            primary_est += 0.50 * ratio
+    total = server_est + fip_est + primary_est
+    lines = [get_text('messages.hcloud_usage_header', lang, account=escape_html(account), progress=f"{ratio*100:.1f}%")]
+    lines.append(get_text('messages.hcloud_usage_costs', lang, servers=f"€{server_est:.2f}", floating_ips=f"€{fip_est:.2f}", primary_ips=f"€{primary_est:.2f}", total=f"€{total:.2f}"))
+    alert_settings = config.setdefault("hcloud_traffic_alerts", {"enabled": True, "quota_tb": 20, "threshold_percent": 85, "notified": {}})
+    alert_status = get_text('messages.status_enabled', lang) if alert_settings.get('enabled', True) else get_text('messages.status_disabled', lang)
+    lines.append(get_text('messages.hcloud_usage_alert_line', lang, status=alert_status, threshold=f"{float(alert_settings.get('threshold_percent', 85)):g}%", quota=f"{float(alert_settings.get('quota_tb', 20)):g} TB"))
+    lines.append(get_text('messages.hcloud_usage_note', lang))
+    for server in servers[:20]:
+        sid = str(server.get('id'))
+        traffic = await hcloud_estimate_server_traffic(token, sid)
+        traffic_text = get_text('messages.hcloud_traffic_unavailable', lang)
+        if traffic.get('total') is not None:
+            traffic_text = get_text('messages.hcloud_traffic_line', lang, incoming=hcloud_human_gb(traffic.get('in')), outgoing=hcloud_human_gb(traffic.get('out')), total=hcloud_human_gb(traffic.get('total')))
+        lines.append(get_text('messages.hcloud_usage_server_line', lang, name=escape_html(server.get('name', sid)), price=escape_html(hcloud_server_type_price(server)), traffic=traffic_text))
+    toggle_text = get_text('buttons.hcloud_disable_traffic_alerts', lang) if config.get("hcloud_traffic_alerts", {}).get('enabled', True) else get_text('buttons.hcloud_enable_traffic_alerts', lang)
+    buttons = [[InlineKeyboardButton(toggle_text, callback_data="hcloud_traffic_alert_toggle")], [InlineKeyboardButton(get_text('buttons.refresh', lang), callback_data="hcloud_usage")], [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]]
+    await send_or_edit(update, context, "\n\n".join(lines), InlineKeyboardMarkup(buttons))
+
+async def hcloud_create_server_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    context.user_data['state'] = 'awaiting_hcloud_create_server_name'
+    context.user_data.pop('hcloud_create', None)
+    await send_or_edit(update, context, get_text('prompts.hcloud_create_server_name', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_servers")]]))
+
+async def _handle_state_hcloud_create_server_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    name = update.message.text.strip()
+
+    parts = [x.strip() for x in name.split('|')]
+    if len(parts) == 4 and all(parts):
+        await _handle_state_hcloud_create_server(update, context)
+        return
+    if not name or len(name) > 64:
+        await update.message.reply_text(get_text('errors.invalid_input', lang), parse_mode="HTML")
+        return
+    context.user_data['hcloud_create'] = {'name': name}
+    context.user_data.pop('state', None)
+    await hcloud_create_location_page(update, context, force_new_message=True)
+
+async def hcloud_create_server_type_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0, force_new_message: bool = False):
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    create_data = context.user_data.setdefault('hcloud_create', {})
+    selected_location = create_data.get('location')
+    server_types = await hcloud_get_server_types(token)
+    server_types = [x for x in server_types if x.get('name') and hcloud_server_type_available_in_location(x, selected_location)]
+    server_types.sort(key=lambda x: (str((x.get('architecture') or 'x86')), float(x.get('memory') or 0), int(x.get('cores') or 0), str(x.get('name') or '')))
+    per_page = 8
+    total_pages = max((len(server_types) + per_page - 1) // per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+    buttons = []
+    for st in server_types[page*per_page:(page+1)*per_page]:
+        buttons.append([InlineKeyboardButton(hcloud_server_type_button_label(st)[:80], callback_data=f"hcloud_create_type|{st.get('name')}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"hcloud_create_type_page|{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"hcloud_create_type_page|{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(get_text('buttons.hcloud_change_location', lang), callback_data="hcloud_create_location_retry")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_servers")])
+    prompt = get_text('prompts.hcloud_create_select_type', lang)
+    if selected_location:
+        prompt += "\n\n" + get_text('messages.hcloud_selected_location_line', lang, location=escape_html(selected_location))
+    await send_or_edit(update, context, prompt, InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
+
+async def hcloud_create_server_type_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('|', 1)[1])
+    await hcloud_create_server_type_page(update, context, page)
+
+async def hcloud_create_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    server_type = query.data.split('|', 1)[1]
+    context.user_data.setdefault('hcloud_create', {})['server_type'] = server_type
+    await hcloud_create_image_page(update, context, 0)
+
+async def hcloud_create_image_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    images = await hcloud_get_images(token)
+    preferred = []
+    names_seen = set()
+    order = ['ubuntu-24.04', 'ubuntu-22.04', 'debian-12', 'debian-11', 'rocky-9', 'alma-9', 'fedora-40', 'centos-stream-9']
+    for wanted in order:
+        for img in images:
+            if img.get('name') == wanted and wanted not in names_seen:
+                preferred.append(img); names_seen.add(wanted)
+    for img in images:
+        n = img.get('name')
+        if n and n not in names_seen and len(preferred) < 30:
+            preferred.append(img); names_seen.add(n)
+    per_page = 8
+    total_pages = max((len(preferred) + per_page - 1) // per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+    buttons = []
+    for img in preferred[page*per_page:(page+1)*per_page]:
+        buttons.append([InlineKeyboardButton(hcloud_short_image_label(img), callback_data=f"hcloud_create_image|{img.get('name') or img.get('id')}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"hcloud_create_image_page|{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"hcloud_create_image_page|{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, get_text('prompts.hcloud_create_select_image', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_create_image_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('|', 1)[1])
+    await hcloud_create_image_page(update, context, page)
+
+async def hcloud_create_image_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    image = query.data.split('|', 1)[1]
+    data = context.user_data.setdefault('hcloud_create', {})
+    data['image'] = image
+    text = get_text('messages.hcloud_create_review', lang,
+                    name=escape_html(data.get('name','-')), server_type=escape_html(data.get('server_type','-')),
+                    image=escape_html(data.get('image','-')), location=escape_html(data.get('location','-')))
+    buttons = [
+        [InlineKeyboardButton(get_text('buttons.confirm_action', lang), callback_data="hcloud_create_confirm")],
+        [InlineKeyboardButton(get_text('buttons.hcloud_change_location', lang), callback_data="hcloud_create_location_retry")],
+        [InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_servers")]
+    ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def hcloud_create_location_page(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    locations = await hcloud_get_locations(token)
+    buttons = []
+    for loc in locations[:30]:
+        name = loc.get('name')
+        buttons.append([InlineKeyboardButton(hcloud_location_button_label(loc)[:80], callback_data=f"hcloud_create_location|{name}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_servers")])
+    await send_or_edit(update, context, get_text('prompts.hcloud_create_select_location', lang), InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
+
+async def hcloud_create_location_retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await hcloud_create_location_page(update, context)
+
+async def hcloud_create_location_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    location = query.data.split('|', 1)[1]
+    data = context.user_data.setdefault('hcloud_create', {})
+    data['location'] = location
+
+    await hcloud_create_server_type_page(update, context, 0)
+
+async def hcloud_create_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    data = context.user_data.get('hcloud_create') or {}
+    required = ['name', 'server_type', 'image', 'location']
+    if not all(data.get(k) for k in required):
+        await send_or_edit(update, context, get_text('errors.hcloud_create_server_format', lang), InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]]))
+        return
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_server(token, data['name'], data['server_type'], data['image'], data['location'])
+    if res.get('success'):
+        context.user_data.pop('hcloud_create', None)
+        server = res.get('server') or {}
+        root_password = res.get('root_password') or '-'
+        text = get_text('messages.hcloud_create_server_success', lang, name=escape_html(server.get('name', data['name'])), server_id=escape_html(str(server.get('id', '-'))), root_password=escape_html(root_password))
+        buttons = [[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]]
+    else:
+        err = res.get('error', 'Unknown error')
+        text = get_text('messages.hcloud_create_failed', lang, error=escape_html(err))
+        if 'placement' in str(err).lower() or 'resource_unavailable' in str(err).lower():
+            text += "\n\n" + get_text('messages.hcloud_placement_error_hint', lang)
+        buttons = [
+            [InlineKeyboardButton(get_text('buttons.hcloud_try_another_location', lang), callback_data="hcloud_create_location_retry")],
+            [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]
+        ]
+    await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+async def _handle_state_hcloud_create_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(context)
+    text = update.message.text.strip()
+    parts = [x.strip() for x in text.split('|')]
+    if len(parts) != 4 or not all(parts):
+        await update.message.reply_text(get_text('errors.hcloud_create_server_format', lang), parse_mode="HTML")
+        return
+    name, server_type, image, location = parts
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_server(token, name, server_type, image, location)
+    context.user_data.pop('state', None)
+    if res.get('success'):
+        server = res.get('server') or {}
+        root_password = res.get('root_password') or '-'
+        await update.message.reply_text(get_text('messages.hcloud_create_server_success', lang, name=escape_html(server.get('name', name)), server_id=escape_html(str(server.get('id', '-'))), root_password=escape_html(root_password)), parse_mode="HTML")
+    else:
+        err = res.get('error', 'Unknown error')
+        msg = get_text('messages.hcloud_create_failed', lang, error=escape_html(err))
+        if 'placement' in str(err).lower() or 'resource_unavailable' in str(err).lower():
+            msg += "\n\n" + get_text('messages.hcloud_placement_error_hint', lang)
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+async def hcloud_create_fip_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    locations = await hcloud_get_locations(token)
+    buttons = []
+    for loc in locations[:20]:
+        name = loc.get('name')
+        label = hcloud_location_text(loc)
+        buttons.append([InlineKeyboardButton(f"IPv4 · {label}", callback_data=f"hcloud_create_fip|ipv4|{name}"), InlineKeyboardButton(f"IPv6 · {label}", callback_data=f"hcloud_create_fip|ipv6|{name}")])
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data="hcloud_fips")])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_fip_location', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_create_fip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, ip_type, location = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_floating_ip(token, ip_type, location, description=f"Created by Telegram Bot ({location})")
+    if res.get('success'):
+        fip = res.get('floating_ip') or {}
+        text = get_text('messages.hcloud_create_fip_success', lang, ip=escape_html(fip.get('ip', '-')), ip_type=escape_html(ip_type), location=escape_html(location))
+    else:
+        text = get_text('messages.hcloud_create_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
+
+async def hcloud_create_primary_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    token, _ = hcloud_account_token(context)
+    server_id = None
+    if query.data.startswith('hcloud_create_primary_for_server_start|'):
+        server_id = query.data.split('|', 1)[1]
+    datacenters = await hcloud_get_datacenters(token)
+    buttons = []
+    for dc in datacenters[:20]:
+        name = dc.get('name')
+        label = hcloud_location_text(dc)
+        if server_id:
+            buttons.append([InlineKeyboardButton(f"IPv4 · {label}", callback_data=f"hcloud_create_primary_for_server|{server_id}|ipv4|{name}"), InlineKeyboardButton(f"IPv6 · {label}", callback_data=f"hcloud_create_primary_for_server|{server_id}|ipv6|{name}")])
+        else:
+            buttons.append([InlineKeyboardButton(f"IPv4 · {label}", callback_data=f"hcloud_create_primary|ipv4|{name}"), InlineKeyboardButton(f"IPv6 · {label}", callback_data=f"hcloud_create_primary|ipv6|{name}")])
+    cancel_callback = f"hcloud_server_primary_ips|{server_id}" if server_id else "hcloud_primary_ips"
+    buttons.append([InlineKeyboardButton(get_text('buttons.cancel_action', lang), callback_data=cancel_callback)])
+    await send_or_edit(update, context, get_text('messages.hcloud_select_primary_datacenter', lang), InlineKeyboardMarkup(buttons))
+
+async def hcloud_create_primary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, ip_type, datacenter = query.data.split('|', 2)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_primary_ip(token, ip_type, datacenter, name=f"bot-{ip_type}-{datacenter}")
+    if res.get('success'):
+        pip = res.get('primary_ip') or {}
+        text = get_text('messages.hcloud_create_primary_success', lang, ip=escape_html(pip.get('ip', '-')), ip_type=escape_html(ip_type), datacenter=escape_html(datacenter))
+    else:
+        text = get_text('messages.hcloud_create_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_primary_ips")]]))
+
+async def hcloud_create_primary_for_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    _, server_id, ip_type, datacenter = query.data.split('|', 3)
+    token, _ = hcloud_account_token(context)
+    res = await hcloud_create_primary_ip(token, ip_type, datacenter, name=f"bot-{ip_type}-{datacenter}", assignee_id=server_id)
+    if res.get('success'):
+        pip = res.get('primary_ip') or {}
+        text = get_text('messages.hcloud_create_primary_success', lang, ip=escape_html(pip.get('ip', '-')), ip_type=escape_html(ip_type), datacenter=escape_html(datacenter))
+    else:
+        text = get_text('messages.hcloud_create_failed', lang, error=escape_html(res.get('error', 'Unknown error')))
+    await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_primary_ips|{server_id}")]]))
+
 def build_health_interval_menu(lang: str):
     """Builds the Health Check interval settings text and keyboard."""
     config = load_config() or {}
@@ -7164,6 +14781,7 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
             InlineKeyboardButton(get_text('buttons.reporting_and_stats', lang), callback_data="reporting_menu")
         ],
         [InlineKeyboardButton(get_text('buttons.manage_notifications', lang), callback_data="settings_notifications")],
+        [InlineKeyboardButton(get_text('buttons.hetzner_cloud_manager', lang), callback_data="hcloud_menu")],
     ]
 
     if is_super_admin(update):
@@ -9614,6 +17232,11 @@ async def debug_show_logs_command(update: Update, context: ContextTypes.DEFAULT_
 
     await send_or_edit(update, context, "\n".join(message_parts))
 
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+
 def main():
     """Starts the bot."""
     load_translations()
@@ -9664,6 +17287,7 @@ def main():
     application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("restore", restore_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("hetzner", hcloud_menu_callback))
     application.add_handler(CommandHandler("debuglogs", debug_show_logs_command))
 
     application.add_handler(CallbackQueryHandler(lb_policy_change_algo_callback, pattern="^lb_policy_change_algo\|"))
@@ -9838,6 +17462,73 @@ def main():
     application.add_handler(CallbackQueryHandler(policy_select_record_callback, pattern="^policy_select_record\|"))
     application.add_handler(CallbackQueryHandler(policy_confirm_records_callback, pattern="^policy_confirm_records$"))
     application.add_handler(CallbackQueryHandler(policy_set_failback_callback, pattern="^policy_set_failback\|"))
+
+    application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
+    application.add_handler(CallbackQueryHandler(hcloud_menu_callback, pattern="^hcloud_menu$"))
+    application.add_handler(CallbackQueryHandler(hcloud_account_callback, pattern="^hcloud_account\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_servers_callback, pattern="^hcloud_servers(\|\d+)?$"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_callback, pattern="^hcloud_server\|[^|]+$"))
+    application.add_handler(CallbackQueryHandler(hcloud_confirm_callback, pattern="^hcloud_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_action_callback, pattern="^hcloud_action\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_delete_confirm_callback, pattern="^hcloud_delete_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_unprotect_delete_callback, pattern="^hcloud_server_unprotect_delete\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_delete_server_callback, pattern="^hcloud_delete_server\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rebuild_select_callback, pattern="^hcloud_rebuild_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rebuild_confirm_callback, pattern="^hcloud_rebuild_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rebuild_callback, pattern="^hcloud_rebuild\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rescale_select_callback, pattern="^hcloud_rescale_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rescale_confirm_callback, pattern="^hcloud_rescale_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rescale_callback, pattern="^hcloud_rescale\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_rename_server_start_callback, pattern="^hcloud_rename_server_start\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshots_callback, pattern="^hcloud_snapshots(\|\d+)?$"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_snapshots_callback, pattern="^hcloud_server_snapshots\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_callback, pattern="^hcloud_snapshot\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_create_callback, pattern="^hcloud_snapshot_create\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_delete_confirm_callback, pattern="^hcloud_snapshot_delete_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_delete_callback, pattern="^hcloud_snapshot_delete\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_unprotect_callback, pattern="^hcloud_snapshot_unprotect\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_snapshot_protect_callback, pattern="^hcloud_snapshot_protect\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_firewalls_callback, pattern="^hcloud_firewalls(\|\d+)?$"))
+    application.add_handler(CallbackQueryHandler(hcloud_firewall_attach_select_callback, pattern="^hcloud_firewall_attach_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_firewall_callback, pattern="^hcloud_firewall\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewalls_callback, pattern="^hcloud_server_firewalls\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_select_callback, pattern="^hcloud_server_firewall_attach_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_confirm_callback, pattern="^hcloud_server_firewall_attach_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_callback, pattern="^hcloud_server_firewall_attach\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_detach_confirm_callback, pattern="^hcloud_server_firewall_detach_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_detach_callback, pattern="^hcloud_server_firewall_detach\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fips_callback, pattern="^hcloud_fips$"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_callback, pattern="^hcloud_fip\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_select_callback, pattern="^hcloud_fip_assign_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_confirm_callback, pattern="^hcloud_fip_assign_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_callback, pattern="^hcloud_fip_assign\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_unassign_confirm_callback, pattern="^hcloud_fip_unassign_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_fip_unassign_callback, pattern="^hcloud_fip_unassign\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_ips_callback, pattern="^hcloud_primary_ips$"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_ip_callback, pattern="^hcloud_primary_ip\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_server_primary_ips_callback, pattern="^hcloud_server_primary_ips\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_select_callback, pattern="^hcloud_primary_assign_select\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_confirm_callback, pattern="^hcloud_primary_assign_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_callback, pattern="^hcloud_primary_assign\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_unassign_confirm_callback, pattern="^hcloud_primary_unassign_confirm\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_unassign_callback, pattern="^hcloud_primary_unassign\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_primary_protect_callback, pattern="^hcloud_primary_protect\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_usage_callback, pattern="^hcloud_usage$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_server_start_callback, pattern="^hcloud_create_server_start$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_server_type_page_callback, pattern="^hcloud_create_type_page\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_type_callback, pattern="^hcloud_create_type\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_image_page_callback, pattern="^hcloud_create_image_page\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_image_callback, pattern="^hcloud_create_image\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_location_retry_callback, pattern="^hcloud_create_location_retry$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_location_callback, pattern="^hcloud_create_location\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_confirm_callback, pattern="^hcloud_create_confirm$"))
+    application.add_handler(CallbackQueryHandler(hcloud_traffic_alert_toggle_callback, pattern="^hcloud_traffic_alert_toggle$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_fip_start_callback, pattern="^hcloud_create_fip_start$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_fip_callback, pattern="^hcloud_create_fip\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_primary_start_callback, pattern="^hcloud_create_primary_start$"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_primary_start_callback, pattern="^hcloud_create_primary_for_server_start\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_primary_for_server_callback, pattern="^hcloud_create_primary_for_server\|"))
+    application.add_handler(CallbackQueryHandler(hcloud_create_primary_callback, pattern="^hcloud_create_primary\|"))
 
     application.add_handler(CallbackQueryHandler(settings_backup_menu_callback, pattern="^settings_backup_menu$"))
     application.add_handler(CallbackQueryHandler(settings_export_callback, pattern="^settings_export$"))
