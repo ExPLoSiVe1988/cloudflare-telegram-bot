@@ -12932,7 +12932,26 @@ async def lb_edit_field_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['awaiting_lb_interval'] = True
         await query.edit_message_text(get_text('prompts.enter_lb_interval', lang))
 
+def _hcloud_admin_check(func):
+    """Decorator to check if user is admin before executing hcloud callback."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not is_admin(update):
+            lang = get_user_lang(context)
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+                except Exception:
+                    pass
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
 async def hcloud_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message: bool = False):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -12952,6 +12971,7 @@ async def hcloud_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_or_edit(update, context, get_text('messages.hcloud_select_account', lang), InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
 
 async def hcloud_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
     query = update.callback_query
     await query.answer()
     account = query.data.split('|', 1)[1]
@@ -12959,6 +12979,7 @@ async def hcloud_account_callback(update: Update, context: ContextTypes.DEFAULT_
     await hcloud_servers_callback(update, context)
 
 async def hcloud_servers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -13007,6 +13028,7 @@ async def hcloud_servers_callback(update: Update, context: ContextTypes.DEFAULT_
     await send_or_edit(update, context, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
 async def hcloud_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -13063,6 +13085,34 @@ async def hcloud_server_callback(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_servers")]
     ]
     await send_or_edit(update, context, text, InlineKeyboardMarkup(buttons))
+
+def _hcloud_admin_check(func):
+    """Decorator to check if user is admin before executing hcloud callback."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not is_admin(update):
+            lang = get_user_lang(context)
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+                except Exception:
+                    pass
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def create_hcloud_handler(original_handler):
+    """Factory to create admin-checked hcloud callback handlers."""
+    async def wrapped_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            lang = get_user_lang(context)
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+                except Exception:
+                    pass
+            return
+        return await original_handler(update, context)
+    return wrapped_handler
 
 async def hcloud_rename_server_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -13322,6 +13372,11 @@ async def hcloud_rescale_callback(update: Update, context: ContextTypes.DEFAULT_
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server|{server_id}")]]))
 
 async def hcloud_snapshots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -13505,6 +13560,11 @@ async def hcloud_snapshot_protect_callback(update: Update, context: ContextTypes
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_snapshot|{image_id}|{server_id}")]]))
 
 async def hcloud_firewalls_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -13670,6 +13730,11 @@ async def hcloud_server_firewall_detach_callback(update: Update, context: Contex
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_server_firewalls|{server_id}")]]))
 
 async def hcloud_fips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -13782,6 +13847,11 @@ async def hcloud_fip_unassign_callback(update: Update, context: ContextTypes.DEF
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
 
 async def hcloud_primary_ips_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -13960,6 +14030,11 @@ async def hcloud_primary_protect_callback(update: Update, context: ContextTypes.
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data=f"hcloud_primary_ip|{primary_ip_id}")]]))
 
 async def hcloud_traffic_alert_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     config = load_config()
@@ -13969,6 +14044,11 @@ async def hcloud_traffic_alert_toggle_callback(update: Update, context: ContextT
     await hcloud_usage_callback(update, context)
 
 async def hcloud_usage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     if query:
         try: await query.answer()
@@ -14011,6 +14091,11 @@ async def hcloud_usage_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await send_or_edit(update, context, "\n\n".join(lines), InlineKeyboardMarkup(buttons))
 
 async def hcloud_create_server_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -14140,6 +14225,11 @@ async def hcloud_create_location_page(update: Update, context: ContextTypes.DEFA
     await send_or_edit(update, context, get_text('prompts.hcloud_create_select_location', lang), InlineKeyboardMarkup(buttons), force_new_message=force_new_message)
 
 async def hcloud_create_location_retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     await hcloud_create_location_page(update, context)
@@ -14154,6 +14244,11 @@ async def hcloud_create_location_callback(update: Update, context: ContextTypes.
     await hcloud_create_server_type_page(update, context, 0)
 
 async def hcloud_create_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -14204,6 +14299,11 @@ async def _handle_state_hcloud_create_server(update: Update, context: ContextTyp
         await update.message.reply_text(msg, parse_mode="HTML")
 
 async def hcloud_create_fip_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -14232,6 +14332,11 @@ async def hcloud_create_fip_callback(update: Update, context: ContextTypes.DEFAU
     await send_or_edit(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton(get_text('buttons.back_to_list', lang), callback_data="hcloud_fips")]]))
 
 async def hcloud_create_primary_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): 
+        lang = get_user_lang(context)
+        if update.callback_query:
+            await update.callback_query.answer(get_text('messages.not_a_super_admin', lang), show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     lang = get_user_lang(context)
@@ -17464,71 +17569,80 @@ def main():
     application.add_handler(CallbackQueryHandler(policy_set_failback_callback, pattern="^policy_set_failback\|"))
 
     application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
-    application.add_handler(CallbackQueryHandler(hcloud_menu_callback, pattern="^hcloud_menu$"))
-    application.add_handler(CallbackQueryHandler(hcloud_account_callback, pattern="^hcloud_account\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_servers_callback, pattern="^hcloud_servers(\|\d+)?$"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_callback, pattern="^hcloud_server\|[^|]+$"))
-    application.add_handler(CallbackQueryHandler(hcloud_confirm_callback, pattern="^hcloud_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_action_callback, pattern="^hcloud_action\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_delete_confirm_callback, pattern="^hcloud_delete_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_unprotect_delete_callback, pattern="^hcloud_server_unprotect_delete\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_delete_server_callback, pattern="^hcloud_delete_server\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rebuild_select_callback, pattern="^hcloud_rebuild_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rebuild_confirm_callback, pattern="^hcloud_rebuild_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rebuild_callback, pattern="^hcloud_rebuild\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rescale_select_callback, pattern="^hcloud_rescale_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rescale_confirm_callback, pattern="^hcloud_rescale_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rescale_callback, pattern="^hcloud_rescale\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_rename_server_start_callback, pattern="^hcloud_rename_server_start\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshots_callback, pattern="^hcloud_snapshots(\|\d+)?$"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_snapshots_callback, pattern="^hcloud_server_snapshots\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_callback, pattern="^hcloud_snapshot\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_create_callback, pattern="^hcloud_snapshot_create\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_delete_confirm_callback, pattern="^hcloud_snapshot_delete_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_delete_callback, pattern="^hcloud_snapshot_delete\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_unprotect_callback, pattern="^hcloud_snapshot_unprotect\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_snapshot_protect_callback, pattern="^hcloud_snapshot_protect\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_firewalls_callback, pattern="^hcloud_firewalls(\|\d+)?$"))
-    application.add_handler(CallbackQueryHandler(hcloud_firewall_attach_select_callback, pattern="^hcloud_firewall_attach_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_firewall_callback, pattern="^hcloud_firewall\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewalls_callback, pattern="^hcloud_server_firewalls\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_select_callback, pattern="^hcloud_server_firewall_attach_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_confirm_callback, pattern="^hcloud_server_firewall_attach_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_attach_callback, pattern="^hcloud_server_firewall_attach\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_detach_confirm_callback, pattern="^hcloud_server_firewall_detach_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_firewall_detach_callback, pattern="^hcloud_server_firewall_detach\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fips_callback, pattern="^hcloud_fips$"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_callback, pattern="^hcloud_fip\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_select_callback, pattern="^hcloud_fip_assign_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_confirm_callback, pattern="^hcloud_fip_assign_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_assign_callback, pattern="^hcloud_fip_assign\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_unassign_confirm_callback, pattern="^hcloud_fip_unassign_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_fip_unassign_callback, pattern="^hcloud_fip_unassign\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_ips_callback, pattern="^hcloud_primary_ips$"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_ip_callback, pattern="^hcloud_primary_ip\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_server_primary_ips_callback, pattern="^hcloud_server_primary_ips\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_select_callback, pattern="^hcloud_primary_assign_select\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_confirm_callback, pattern="^hcloud_primary_assign_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_assign_callback, pattern="^hcloud_primary_assign\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_unassign_confirm_callback, pattern="^hcloud_primary_unassign_confirm\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_unassign_callback, pattern="^hcloud_primary_unassign\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_primary_protect_callback, pattern="^hcloud_primary_protect\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_usage_callback, pattern="^hcloud_usage$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_server_start_callback, pattern="^hcloud_create_server_start$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_server_type_page_callback, pattern="^hcloud_create_type_page\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_type_callback, pattern="^hcloud_create_type\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_image_page_callback, pattern="^hcloud_create_image_page\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_image_callback, pattern="^hcloud_create_image\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_location_retry_callback, pattern="^hcloud_create_location_retry$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_location_callback, pattern="^hcloud_create_location\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_confirm_callback, pattern="^hcloud_create_confirm$"))
-    application.add_handler(CallbackQueryHandler(hcloud_traffic_alert_toggle_callback, pattern="^hcloud_traffic_alert_toggle$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_fip_start_callback, pattern="^hcloud_create_fip_start$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_fip_callback, pattern="^hcloud_create_fip\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_primary_start_callback, pattern="^hcloud_create_primary_start$"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_primary_start_callback, pattern="^hcloud_create_primary_for_server_start\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_primary_for_server_callback, pattern="^hcloud_create_primary_for_server\|"))
-    application.add_handler(CallbackQueryHandler(hcloud_create_primary_callback, pattern="^hcloud_create_primary\|"))
+    
+    hcloud_callbacks = [
+        (hcloud_menu_callback, "^hcloud_menu$"),
+        (hcloud_account_callback, "^hcloud_account\|"),
+        (hcloud_servers_callback, "^hcloud_servers(\|\d+)?$"),
+        (hcloud_server_callback, "^hcloud_server\|[^|]+$"),
+        (hcloud_confirm_callback, "^hcloud_confirm\|"),
+        (hcloud_action_callback, "^hcloud_action\|"),
+        (hcloud_delete_confirm_callback, "^hcloud_delete_confirm\|"),
+        (hcloud_server_unprotect_delete_callback, "^hcloud_server_unprotect_delete\|"),
+        (hcloud_delete_server_callback, "^hcloud_delete_server\|"),
+        (hcloud_rebuild_select_callback, "^hcloud_rebuild_select\|"),
+        (hcloud_rebuild_confirm_callback, "^hcloud_rebuild_confirm\|"),
+        (hcloud_rebuild_callback, "^hcloud_rebuild\|"),
+        (hcloud_rescale_select_callback, "^hcloud_rescale_select\|"),
+        (hcloud_rescale_confirm_callback, "^hcloud_rescale_confirm\|"),
+        (hcloud_rescale_callback, "^hcloud_rescale\|"),
+        (hcloud_rename_server_start_callback, "^hcloud_rename_server_start\|"),
+        (hcloud_snapshots_callback, "^hcloud_snapshots(\|\d+)?$"),
+        (hcloud_server_snapshots_callback, "^hcloud_server_snapshots\|"),
+        (hcloud_snapshot_callback, "^hcloud_snapshot\|"),
+        (hcloud_snapshot_create_callback, "^hcloud_snapshot_create\|"),
+        (hcloud_snapshot_delete_confirm_callback, "^hcloud_snapshot_delete_confirm\|"),
+        (hcloud_snapshot_delete_callback, "^hcloud_snapshot_delete\|"),
+        (hcloud_snapshot_unprotect_callback, "^hcloud_snapshot_unprotect\|"),
+        (hcloud_snapshot_protect_callback, "^hcloud_snapshot_protect\|"),
+        (hcloud_firewalls_callback, "^hcloud_firewalls(\|\d+)?$"),
+        (hcloud_firewall_attach_select_callback, "^hcloud_firewall_attach_select\|"),
+        (hcloud_firewall_callback, "^hcloud_firewall\|"),
+        (hcloud_server_firewalls_callback, "^hcloud_server_firewalls\|"),
+        (hcloud_server_firewall_attach_select_callback, "^hcloud_server_firewall_attach_select\|"),
+        (hcloud_server_firewall_attach_confirm_callback, "^hcloud_server_firewall_attach_confirm\|"),
+        (hcloud_server_firewall_attach_callback, "^hcloud_server_firewall_attach\|"),
+        (hcloud_server_firewall_detach_confirm_callback, "^hcloud_server_firewall_detach_confirm\|"),
+        (hcloud_server_firewall_detach_callback, "^hcloud_server_firewall_detach\|"),
+        (hcloud_fips_callback, "^hcloud_fips$"),
+        (hcloud_fip_callback, "^hcloud_fip\|"),
+        (hcloud_fip_assign_select_callback, "^hcloud_fip_assign_select\|"),
+        (hcloud_fip_assign_confirm_callback, "^hcloud_fip_assign_confirm\|"),
+        (hcloud_fip_assign_callback, "^hcloud_fip_assign\|"),
+        (hcloud_fip_unassign_confirm_callback, "^hcloud_fip_unassign_confirm\|"),
+        (hcloud_fip_unassign_callback, "^hcloud_fip_unassign\|"),
+        (hcloud_primary_ips_callback, "^hcloud_primary_ips$"),
+        (hcloud_primary_ip_callback, "^hcloud_primary_ip\|"),
+        (hcloud_server_primary_ips_callback, "^hcloud_server_primary_ips\|"),
+        (hcloud_primary_assign_select_callback, "^hcloud_primary_assign_select\|"),
+        (hcloud_primary_assign_confirm_callback, "^hcloud_primary_assign_confirm\|"),
+        (hcloud_primary_assign_callback, "^hcloud_primary_assign\|"),
+        (hcloud_primary_unassign_confirm_callback, "^hcloud_primary_unassign_confirm\|"),
+        (hcloud_primary_unassign_callback, "^hcloud_primary_unassign\|"),
+        (hcloud_primary_protect_callback, "^hcloud_primary_protect\|"),
+        (hcloud_usage_callback, "^hcloud_usage$"),
+        (hcloud_create_server_start_callback, "^hcloud_create_server_start$"),
+        (hcloud_create_server_type_page_callback, "^hcloud_create_type_page\|"),
+        (hcloud_create_type_callback, "^hcloud_create_type\|"),
+        (hcloud_create_image_page_callback, "^hcloud_create_image_page\|"),
+        (hcloud_create_image_callback, "^hcloud_create_image\|"),
+        (hcloud_create_location_retry_callback, "^hcloud_create_location_retry$"),
+        (hcloud_create_location_callback, "^hcloud_create_location\|"),
+        (hcloud_create_confirm_callback, "^hcloud_create_confirm$"),
+        (hcloud_traffic_alert_toggle_callback, "^hcloud_traffic_alert_toggle$"),
+        (hcloud_create_fip_start_callback, "^hcloud_create_fip_start$"),
+        (hcloud_create_fip_callback, "^hcloud_create_fip\|"),
+        (hcloud_create_primary_start_callback, "^hcloud_create_primary_start$"),
+        (hcloud_create_primary_for_server_callback, "^hcloud_create_primary_for_server\|"),
+        (hcloud_create_primary_callback, "^hcloud_create_primary\|"),
+    ]
+    
+    for callback_func, pattern in hcloud_callbacks:
+        wrapped_handler = create_hcloud_handler(callback_func)
+        application.add_handler(CallbackQueryHandler(wrapped_handler, pattern=pattern))
+    
+    wrapped_handler = create_hcloud_handler(hcloud_create_primary_start_callback)
+    application.add_handler(CallbackQueryHandler(wrapped_handler, pattern="^hcloud_create_primary_for_server_start\|"))
 
     application.add_handler(CallbackQueryHandler(settings_backup_menu_callback, pattern="^settings_backup_menu$"))
     application.add_handler(CallbackQueryHandler(settings_export_callback, pattern="^settings_export$"))
