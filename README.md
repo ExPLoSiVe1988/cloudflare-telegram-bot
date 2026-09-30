@@ -201,12 +201,6 @@ Manage Server Provider Accounts
 
 <div dir="rtl">
 
-| آدرس | نوع ارز |
-|---:|:---|
-| **اتریوم (ETH - ERC20)** 🔷 | `0x157F3Eb423A241ccefb2Ddc120eF152ce4a736eF` |
-| **ترون (TRX - TRC20)** 🔴 | `TEdu5VsNNvwjCRJpJJ7zhjXni8Y6W5qAqk` |
-| **تتر (USDT - BEP20)** 🟢 | `0x78C406B501c4895627CC22F6653AD66163294D60` |
-
 </div>
 
 🙏 از حمایت شما سپاسگزارم! 🚀
