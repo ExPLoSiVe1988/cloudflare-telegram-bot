@@ -4,3 +4,5 @@ bot_data.pickle
 __pycache__/
 *.pyc
 .dockerignore
+hcloud_cost_history.json
+hcloud_cost_history.json.tmp
