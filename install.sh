@@ -21,6 +21,47 @@ ENV_FILE="$PROJECT_DIR/.env"
 CONFIG_FILE="$PROJECT_DIR/config.json"
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
 COMPOSE_CMD=""
+LAST_DATA_BACKUP=""
+
+validate_project_files() {
+    local required_file
+    local missing=0
+    for required_file in bot.py hcloud_features.py helpers.py check_host.py fa.json en.json requirements.txt Dockerfile docker-compose.yml; do
+        if [ ! -s "$PROJECT_DIR/$required_file" ]; then
+            echo -e "${RED}Required project file missing or empty: $required_file${NC}"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ]
+}
+
+backup_bot_data() {
+    local backup_root="${PROJECT_DIR%/*}/${PROJECT_DIR_NAME}-backups"
+    local backup_dir data_file
+    LAST_DATA_BACKUP=""
+    if ! mkdir -p -m 700 -- "$backup_root" || ! chmod 700 -- "$backup_root"; then
+        echo -e "${RED}Could not create the data backup directory. No data will be reset.${NC}"
+        return 1
+    fi
+    backup_dir=$(mktemp -d "$backup_root/backup-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX") || return 1
+    for data_file in .env config.json bot_data.pickle hcloud_cost_history.json; do
+        if [ -f "$PROJECT_DIR/$data_file" ]; then
+            if ! cp -- "$PROJECT_DIR/$data_file" "$backup_dir/$data_file" || ! chmod 600 -- "$backup_dir/$data_file"; then
+                echo -e "${RED}Backup failed for $data_file. Partial backup: $backup_dir${NC}"
+                return 1
+            fi
+        fi
+    done
+    LAST_DATA_BACKUP="$backup_dir"
+    echo -e "${GREEN}Configuration, bot state and Hetzner cost history backed up: $backup_dir${NC}"
+}
+
+resume_existing_bot() {
+    if ! $COMPOSE_CMD start; then
+        echo -e "${RED}Could not resume the existing bot. Check Docker Compose logs.${NC}"
+        return 1
+    fi
+}
 
 detect_compose_command() {
     if command -v docker &> /dev/null && sudo docker compose version &> /dev/null; then
@@ -474,19 +515,26 @@ install_bot() {
 
     if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${YELLOW}Cloning repository into $PROJECT_DIR...${NC}"
-        git clone "$REPO_URL" "$PROJECT_DIR"
+        if ! git clone "$REPO_URL" "$PROJECT_DIR"; then
+            echo -e "${RED}Repository download failed. Installation stopped.${NC}"
+            return 1
+        fi
     fi
 
+    if ! validate_project_files; then
+        echo -e "${RED}Installation stopped. Put all release files in the project directory first.${NC}"
+        return 1
+    fi
+
+    local do_reinstall_backup=false
     if [ -f "$CONFIG_FILE" ]; then
         echo -e "\n${RED}WARNING: An existing installation was found.${NC}"
         echo -e "${YELLOW}The 'Install/Reinstall' option performs a CLEAN installation.${NC}"
         echo -e "${RED}This will ERASE your existing rules and settings (config.json).${NC}"
 
-        read -p "Do you want to back up your current config.json and .env first? (y/n): " backup_confirm
+        read -p "Back up configuration, bot state and Hetzner cost history first? (y/n): " backup_confirm
         if [[ "$backup_confirm" == "y" || "$backup_confirm" == "Y" ]]; then
-            cp "$CONFIG_FILE" "$PROJECT_DIR/config.json.bak.$(date +%Y%m%d-%H%M%S)"
-            backup_env_file
-            echo -e "${GREEN}Backup completed.${NC}"
+            do_reinstall_backup=true
         fi
 
         read -p "Are you sure you want to proceed with a clean reinstallation? (y/n): " reinstall_confirm
@@ -498,7 +546,14 @@ install_bot() {
     fi
 
     echo -e "\n${YELLOW}Stopping any existing bot instance...${NC}"
-    $COMPOSE_CMD down --remove-orphans
+    if ! $COMPOSE_CMD stop --timeout 30; then
+        echo -e "${RED}Could not stop the bot. Installation stopped without resetting data.${NC}"
+        return 1
+    fi
+    if [ "$do_reinstall_backup" = true ] && ! backup_bot_data; then
+        resume_existing_bot
+        return 1
+    fi
 
     local original_dir
     original_dir=$(pwd)
@@ -572,8 +627,10 @@ EOF
     cd "$original_dir"
 
     echo -e "\n${GREEN}Pulling, building, and starting the bot...${NC}"
-    $COMPOSE_CMD pull
-    $COMPOSE_CMD up -d --build --remove-orphans
+    if ! $COMPOSE_CMD up -d --build --remove-orphans; then
+        echo -e "${RED}Bot startup failed. Check Docker Compose logs.${NC}"
+        return 1
+    fi
 
     echo -e "\n${GREEN}--- Installation Complete! ---${NC}"
     echo "The bot is now running in the background."
@@ -640,28 +697,54 @@ update_bot() {
         return
     fi
 
+    if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo -e "${RED}This directory is not a Git checkout. Apply the release files manually and restart the bot.${NC}"
+        return 1
+    fi
     echo -e "${YELLOW}Fetching latest changes from GitHub...${NC}"
-    (cd "$PROJECT_DIR" && git pull origin main)
-    echo -e "${GREEN}Local repository updated successfully.${NC}"
+    if ! git -C "$PROJECT_DIR" fetch origin main; then
+        echo -e "${RED}Download failed. The running bot and data have not been changed.${NC}"
+        return 1
+    fi
+    local required_file
+    for required_file in bot.py hcloud_features.py helpers.py check_host.py fa.json en.json requirements.txt Dockerfile docker-compose.yml; do
+        if ! git -C "$PROJECT_DIR" cat-file -e "FETCH_HEAD:$required_file"; then
+            echo -e "${RED}Downloaded release is incomplete ($required_file). The running bot has not been stopped.${NC}"
+            return 1
+        fi
+    done
 
+    echo -e "\n${YELLOW}Stopping the bot and backing up its data...${NC}"
+    if ! $COMPOSE_CMD stop --timeout 30; then
+        echo -e "${RED}Could not stop the bot. Update cancelled without changing data.${NC}"
+        return 1
+    fi
+    if ! backup_bot_data; then
+        resume_existing_bot
+        return 1
+    fi
+    if ! git -C "$PROJECT_DIR" merge --ff-only FETCH_HEAD; then
+        echo -e "${RED}Could not apply the update. Local edits will not be overwritten. Backup: $LAST_DATA_BACKUP${NC}"
+        resume_existing_bot
+        return 1
+    fi
+    if ! validate_project_files; then
+        echo -e "${RED}Startup cancelled because release files are missing. Data backup: $LAST_DATA_BACKUP${NC}"
+        return 1
+    fi
     echo -e "\n${YELLOW}Checking .env for new required variables...${NC}"
     update_env_for_new_versions
 
-    echo -e "\n${YELLOW}Preparing for a clean restart...${NC}"
-    echo "Stopping the current bot instance..."
-    $COMPOSE_CMD down
-
-    echo "Cleaning up runtime cache files (your rules in config.json will be preserved)..."
-    rm -f "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"
-    touch "$PROJECT_DIR/bot_data.pickle" "$PROJECT_DIR/nodes_cache.json"
-    echo -e "${GREEN}Cleanup complete.${NC}"
-
-    echo -e "\n${YELLOW}Pulling latest Docker image, rebuilding, and restarting bot...${NC}"
-    $COMPOSE_CMD pull
-    $COMPOSE_CMD up -d --build --remove-orphans
+    echo "Preserving configuration, bot state, Hetzner cost history and node cache."
+    echo -e "\n${YELLOW}Building and restarting the bot...${NC}"
+    if ! $COMPOSE_CMD up -d --build --remove-orphans; then
+        echo -e "${RED}Build/start failed. Your data and backup are preserved: $LAST_DATA_BACKUP${NC}"
+        return 1
+    fi
 
     echo -e "\n${GREEN}--- Bot has been updated and restarted successfully! ---${NC}"
-    echo "Your .env, config.json, rules, and policies have been preserved."
+    echo "Your .env, config.json, bot_data.pickle and hcloud_cost_history.json have been preserved."
+    echo "Data backup: $LAST_DATA_BACKUP"
 }
 
 main_menu() {
@@ -724,4 +807,6 @@ main_menu() {
     done
 }
 
-main_menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main_menu
+fi
